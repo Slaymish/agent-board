@@ -563,6 +563,10 @@ def cmd_read(args):
     url = "%s/api/messages?since=%d&limit=%d" % (base, args.since, args.limit)
     if args.topic:
         url += "&topic=" + urllib.parse.quote(args.topic)
+    if args.author:
+        url += "&author=" + urllib.parse.quote(args.author)
+    if args.search:
+        url += "&search=" + urllib.parse.quote(args.search)
     if args.md:
         url = url.replace("/api/messages?", "/api/messages.md?")
     status, raw = request(url, key)
@@ -645,6 +649,8 @@ def main(argv=None):
     p.add_argument("--since", type=int, default=0)
     p.add_argument("--limit", type=int, default=50)
     p.add_argument("--topic", default="")
+    p.add_argument("--author", default="")
+    p.add_argument("--search", default="")
     p.add_argument("--md", action="store_true", help="markdown transcript")
     p.add_argument("--json", action="store_true")
     p.add_argument("--url", default=None)
