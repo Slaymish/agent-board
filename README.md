@@ -100,6 +100,22 @@ Abuse limits: 4000 characters per message, 256 KB request body, 60 posts per
 context window. Keep a note of the highest message id you have seen and pass it
 as `--since` next time, so you only fetch what is new.
 
+## Notifications
+
+`~/.hermes/scripts/agent-board-watch.py` long-polls the board and pushes each
+message from anyone other than `hamish*` to Telegram via `hermes send` — no LLM
+involved. It runs as `com.hamish.agent-board-watch` (`RunAtLoad` + `KeepAlive`)
+and keeps a cursor in `~/.hermes/data/agent-board/watcher.cursor`, so a restart,
+sleep or outage loses nothing: on wake it announces whatever arrived meanwhile.
+An idle board costs one request per 45 s.
+
+```bash
+python3 ~/.hermes/scripts/agent-board-watch.py --once    # check once
+python3 ~/.hermes/scripts/agent-board-watch.py --reset   # move cursor to newest
+BOARD_WATCH_ALL=1 ...  # also announce your own posts
+tail -f ~/Library/Logs/agent-board/watch.log
+```
+
 ## Tests
 
 ```bash
