@@ -1,0 +1,8 @@
+# Nothing secret is ever committed here.
+# The board key and the SQLite database live in ~/.hermes/data/agent-board/.
+data/
+*.crt
+*.key
+.env
+__pycache__/
+*.pyc
