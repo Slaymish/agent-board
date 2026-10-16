@@ -350,6 +350,25 @@ $('#composer').addEventListener('submit', async (e) => {
 """
 
 
+def make_server(address, handler):
+    return BoardServer(address, handler)
+
+
+class BoardServer(ThreadingHTTPServer):
+    """Threaded HTTP server that does not shout about clients going away."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        # A client that is still writing when we reject its request (an
+        # oversized body, say) gets a reset. That is the client's doing, not a
+        # fault in this server, and a traceback per occurrence is just noise.
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+            return
+        ThreadingHTTPServer.handle_error(self, request, client_address)
+
+
 def make_handler(board, key, name):
     class Handler(BaseHTTPRequestHandler):
         server_version = "agent-board/" + VERSION
@@ -373,8 +392,10 @@ def make_handler(board, key, name):
             self.end_headers()
             self.wfile.write(body)
 
-        def _err(self, code, message):
-            self._send(code, {"error": message}, extra=None)
+        def _err(self, code, message, close=False):
+            if close:
+                self.close_connection = True
+            self._send(code, {"error": message}, extra={"Connection": "close"} if close else None)
 
         def _query(self):
             parsed = urllib.parse.urlparse(self.path)
@@ -396,11 +417,8 @@ def make_handler(board, key, name):
                 return not key
             return board.public_read and not key
 
-        def _body(self):
-            length = int(self.headers.get("Content-Length") or 0)
-            if length > MAX_BODY:
-                return None
-            raw = self.rfile.read(length) if length else b""
+        @staticmethod
+        def _parse_body(raw):
             try:
                 data = json.loads(raw.decode("utf-8") or "{}")
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -468,6 +486,15 @@ def make_handler(board, key, name):
 
         def do_POST(self):
             qs, path = self._query()
+            # Read the whole body before deciding anything. A rejection that
+            # leaves bytes in the socket corrupts connection reuse: the next
+            # request on that connection starts mid-JSON and fails with a
+            # spurious 400. When the body is too big to read we close instead.
+            length = int(self.headers.get("Content-Length") or 0)
+            if length < 0 or length > MAX_BODY:
+                self._err(413, "body must be under %d bytes" % MAX_BODY, close=True)
+                return
+            raw = self.rfile.read(length) if length else b""
             if path != "/api/messages":
                 self._err(404, "no such path: " + path)
                 return
@@ -478,7 +505,7 @@ def make_handler(board, key, name):
             if not board.rate_ok(ip):
                 self._err(429, "rate limit: %d messages per %d minutes" % (RATE_MAX, RATE_WINDOW // 60))
                 return
-            data = self._body()
+            data = self._parse_body(raw)
             if data is None:
                 self._err(400, "body must be a JSON object under %d bytes" % MAX_BODY)
                 return
@@ -532,8 +559,7 @@ def cmd_serve(args):
         print("board key written to %s" % path, file=sys.stderr)
     board = Board(os.path.join(data, "board.db"), public_read=args.public_read)
     handler = make_handler(board, key, args.name)
-    httpd = ThreadingHTTPServer((args.host, args.port), handler)
-    httpd.daemon_threads = True
+    httpd = make_server((args.host, args.port), handler)
     print("agent-board %s listening on http://%s:%d  (data: %s, %d messages)"
           % (VERSION, args.host, args.port, data, board.count()), file=sys.stderr)
     print("key file: %s   (print it with: board.py key)" % key_path(data), file=sys.stderr)

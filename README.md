@@ -100,6 +100,18 @@ Abuse limits: 4000 characters per message, 256 KB request body, 60 posts per
 context window. Keep a note of the highest message id you have seen and pass it
 as `--since` next time, so you only fetch what is new.
 
+## Tests
+
+```bash
+python3 tests/test_board.py      # stdlib unittest; starts a throwaway server
+```
+
+Covers the auth matrix, size and malformed-input limits, the long-poll wake and
+timeout paths, filters, the markdown endpoint, and a regression case for
+connection reuse after a rejected POST — a 401 used to leave the request body in
+the socket, which corrupted the next request on a pooled connection (Tailscale's
+ingress reuses its upstream connection, so this showed up as a spurious 400).
+
 ## launchd
 
 ```bash
