@@ -17,9 +17,12 @@ Auth:    a single shared key, sent as X-Board-Key, ?key= or Bearer token.
 """
 
 import argparse
+import hashlib
 import hmac
 import json
+import mimetypes
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -37,10 +40,58 @@ MAX_TEXT = 4000
 MAX_AUTHOR = 64
 MAX_TOPIC = 48
 MAX_BODY = 256 * 1024
+MAX_FILE = int(os.environ.get("BOARD_MAX_FILE") or 8 * 1024 * 1024)
+MAX_NAME = 120
 RATE_WINDOW = 300.0
 RATE_MAX = 60
 MAX_WAIT = 60.0
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+
+# Served inline; anything else is forced to a download so this board can never
+# be used to host markup that a browser would execute in the site's origin.
+INLINE_TYPES = {
+    "image/png", "image/jpeg", "image/gif", "image/webp",
+    "text/plain", "text/markdown", "application/pdf", "application/json",
+}
+CTYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*$")
+
+# mimetypes does not know these on every platform, and guessing
+# application/octet-stream for a text file makes downloads unreadable in a browser.
+TEXT_TYPES = {
+    ".md": "text/markdown", ".markdown": "text/markdown", ".txt": "text/plain",
+    ".py": "text/plain", ".sh": "text/plain", ".log": "text/plain", ".rst": "text/plain",
+    ".yml": "text/plain", ".yaml": "text/plain", ".toml": "text/plain", ".ts": "text/plain",
+    ".tsx": "text/plain", ".js": "text/plain", ".jsx": "text/plain", ".css": "text/plain",
+    ".sql": "text/plain", ".rs": "text/plain", ".go": "text/plain", ".rb": "text/plain",
+    ".json": "application/json", ".csv": "text/csv",
+}
+
+
+def looks_like_text(blob, probe=4096):
+    """Is this plausibly a text file? Used only when nothing else says what it is.
+    The callers gate it on the name having no extension, so it never overrides one.
+
+    Without this, an extensionless script (a `decide`, a `hermes-skill-runner`)
+    uploads as application/octet-stream and downloads instead of rendering. Text is
+    inline-safe: a browser shows it as literal text and cannot execute it.
+    """
+    head = blob[:probe]
+    if b"\x00" in head:
+        return False
+    try:
+        head.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return bool(head.strip())
+
+
+def guess_ctype(name):
+    """Explicit map first: it decides inline vs download, so it should not vary
+    with whatever mime table the host happens to have installed."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in TEXT_TYPES:
+        return TEXT_TYPES[ext]
+    return mimetypes.guess_type(name)[0] or "application/octet-stream"
 
 
 # ---------------------------------------------------------------- storage ----
@@ -56,6 +107,36 @@ def iso_to_epoch(text):
     return datetime.fromisoformat(text).timestamp()
 
 
+def safe_name(name):
+    """A display name that cannot escape a directory or smuggle control bytes."""
+    name = (name or "").replace("\\", "/").split("/")[-1]
+    name = "".join(ch for ch in name if ch.isprintable() and ch not in '"\\')
+    name = name.strip().strip(".") or "file"
+    return name[:MAX_NAME]
+
+
+def clean_ctype(ctype):
+    ctype = (ctype or "").split(";")[0].strip().lower()
+    return ctype if CTYPE_RE.match(ctype) else "application/octet-stream"
+
+
+def fts_query(text):
+    """Turn free text into a safe FTS5 MATCH expression: quoted prefix terms ANDed.
+
+    FTS5 MATCH parses its own grammar, so raw user input with a quote or a paren
+    is a syntax error. Only word characters survive; everything else is a separator.
+    """
+    terms = re.findall(r"\w+", text or "")
+    return " AND ".join('"%s"*' % t for t in terms[:12])
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return "%.0f %s" % (n, unit) if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+
+
 class Board:
     """SQLite-backed message store. One lock guards both the db and the waiters."""
 
@@ -64,7 +145,9 @@ class Board:
         self.public_read = public_read
         self.cond = threading.Condition(threading.RLock())
         self.rates = defaultdict(deque)
+        self.files_dir = os.path.join(os.path.dirname(db_path), "files")
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        os.makedirs(self.files_dir, exist_ok=True)
         with self._db() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute(
@@ -76,6 +159,68 @@ class Board:
                        text TEXT NOT NULL
                    )"""
             )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS files (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       epoch REAL NOT NULL,
+                       name TEXT NOT NULL,
+                       ctype TEXT NOT NULL DEFAULT 'application/octet-stream',
+                       size INTEGER NOT NULL,
+                       sha256 TEXT NOT NULL,
+                       uploader TEXT NOT NULL DEFAULT '',
+                       path TEXT NOT NULL
+                   )"""
+            )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS message_files (
+                       message_id INTEGER NOT NULL,
+                       file_id INTEGER NOT NULL,
+                       PRIMARY KEY (message_id, file_id)
+                   )"""
+            )
+            # Indexes that stop mattering at 100 messages and start mattering at 10,000.
+            db.execute("CREATE INDEX IF NOT EXISTS idx_messages_topic ON messages(topic, id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_messages_author ON messages(author, id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_messages_epoch ON messages(epoch)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_files_sha ON files(sha256)")
+            self._ensure_fts(db)
+
+    def _ensure_fts(self, db):
+        """Full-text index over message bodies, kept in sync by triggers.
+
+        External-content FTS5: the index stores no copy of the text, so it cannot
+        drift from the row it describes as long as the triggers exist. The rebuild
+        on count mismatch repairs a database written before the index did.
+        """
+        db.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5("
+            "text, content='messages', content_rowid='id', tokenize='porter unicode61')"
+        )
+        db.execute("""CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+                        INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
+                      END""")
+        db.execute("""CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+                        INSERT INTO messages_fts(messages_fts, rowid, text)
+                        VALUES ('delete', old.id, old.text);
+                      END""")
+        db.execute("""CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+                        INSERT INTO messages_fts(messages_fts, rowid, text)
+                        VALUES ('delete', old.id, old.text);
+                        INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
+                      END""")
+        try:
+            indexed = db.execute("SELECT COUNT(*) AS c FROM messages_fts").fetchone()["c"]
+            present = db.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"]
+            if indexed != present:
+                db.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        except sqlite3.DatabaseError:
+            pass
+
+    def reindex(self):
+        with self.cond:
+            with self._db() as db:
+                db.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        return self.count()
 
     def _db(self):
         db = sqlite3.connect(self.db_path, timeout=15)
@@ -83,7 +228,19 @@ class Board:
         return db
 
     @staticmethod
-    def _row(row):
+    def _file_row(row):
+        return {
+            "id": row["id"],
+            "ts": now_iso(row["epoch"]),
+            "name": row["name"],
+            "ctype": row["ctype"],
+            "size": row["size"],
+            "sha256": row["sha256"],
+            "uploader": row["uploader"],
+            "url": "/api/files/%d" % row["id"],
+        }
+
+    def _row(self, row, files=None):
         return {
             "id": row["id"],
             "ts": now_iso(row["epoch"]),
@@ -91,6 +248,7 @@ class Board:
             "author": row["author"],
             "topic": row["topic"],
             "text": row["text"],
+            "files": files or [],
         }
 
     def rate_ok(self, ip):
@@ -104,7 +262,7 @@ class Board:
             q.append(time.time())
             return True
 
-    def post(self, author, text, topic=""):
+    def post(self, author, text, topic="", file_ids=None):
         epoch = time.time()
         with self.cond:
             with self._db() as db:
@@ -113,7 +271,14 @@ class Board:
                     (epoch, author, topic, text),
                 )
                 mid = cur.lastrowid
+                for fid in file_ids or []:
+                    db.execute(
+                        "INSERT OR IGNORE INTO message_files (message_id, file_id) VALUES (?,?)",
+                        (mid, fid),
+                    )
             self.cond.notify_all()
+            with self._db() as db:
+                linked = self._files_for(db, {mid}).get(mid, [])
         return {
             "id": mid,
             "ts": now_iso(epoch),
@@ -121,7 +286,79 @@ class Board:
             "author": author,
             "topic": topic,
             "text": text,
+            "files": linked,
         }
+
+    # -- attachments ---------------------------------------------------
+
+    def _files_for(self, db, ids):
+        """Attachments for a set of message ids, in one query rather than N."""
+        if not ids:
+            return {}
+        rows = db.execute(
+            "SELECT mf.message_id AS mid, f.* FROM message_files mf "
+            "JOIN files f ON f.id = mf.file_id "
+            "WHERE mf.message_id BETWEEN ? AND ? ORDER BY f.id",
+            (min(ids), max(ids)),
+        ).fetchall()
+        out = defaultdict(list)
+        for r in rows:
+            if r["mid"] in ids:
+                out[r["mid"]].append(self._file_row(r))
+        return out
+
+    def store_file(self, name, ctype, data, uploader=""):
+        """Content-addressed upload: identical bytes are stored once on disk."""
+        digest = hashlib.sha256(data).hexdigest()
+        name, ctype = safe_name(name), clean_ctype(ctype)
+        sub = os.path.join(self.files_dir, digest[:2])
+        os.makedirs(sub, exist_ok=True)
+        path = os.path.join(sub, digest)
+        if not os.path.exists(path):
+            tmp = path + ".part"
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, path)
+        epoch = time.time()
+        with self.cond:
+            with self._db() as db:
+                cur = db.execute(
+                    "INSERT INTO files (epoch, name, ctype, size, sha256, uploader, path) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (epoch, name, ctype, len(data), digest, uploader[:MAX_AUTHOR], path),
+                )
+                fid = cur.lastrowid
+        return {"id": fid, "ts": now_iso(epoch), "epoch": epoch, "name": name, "ctype": ctype,
+                "size": len(data), "sha256": digest, "uploader": uploader[:MAX_AUTHOR],
+                "url": "/api/files/%d" % fid}
+
+    def get_file(self, fid):
+        with self.cond:
+            with self._db() as db:
+                row = db.execute("SELECT * FROM files WHERE id = ?", (fid,)).fetchone()
+        return dict(row) if row else None
+
+    def list_files(self, limit=100, name=None):
+        sql, args = "SELECT * FROM files", []
+        if name:
+            sql += " WHERE name LIKE ?"
+            args.append("%" + name + "%")
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        with self.cond:
+            with self._db() as db:
+                rows = db.execute(sql, args).fetchall()
+        return [self._file_row(r) for r in rows]
+
+    def attach(self, message_id, file_ids):
+        with self.cond:
+            with self._db() as db:
+                for fid in file_ids:
+                    db.execute(
+                        "INSERT OR IGNORE INTO message_files (message_id, file_id) VALUES (?,?)",
+                        (message_id, fid),
+                    )
+                return self._files_for(db, {message_id}).get(message_id, [])
 
     def latest_id(self):
         with self.cond:
@@ -135,24 +372,150 @@ class Board:
                 row = db.execute("SELECT COUNT(*) AS c FROM messages").fetchone()
         return row["c"]
 
-    def fetch(self, since=0, limit=100, topic=None, search=None, author=None):
-        sql = "SELECT * FROM messages WHERE id > ?"
-        args = [since]
+    def fetch(self, since=0, limit=100, topic=None, search=None, author=None, before=None):
+        # A search term goes through the FTS index: LIKE scans every row and
+        # cannot rank, which is the difference between a usable board archive
+        # and a linear scan once there are tens of thousands of messages.
+        if search:
+            match = fts_query(search)
+            if not match:
+                return []
+            sql = ("SELECT * FROM messages WHERE id IN "
+                   "(SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
+            args = [match]
+        else:
+            sql, args = "SELECT * FROM messages WHERE 1=1", []
+        if before:
+            sql += " AND id < ?"
+            args.append(before)
+        elif since:
+            sql += " AND id > ?"
+            args.append(since)
         if topic:
             sql += " AND topic = ?"
             args.append(topic)
         if author:
             sql += " AND author = ?"
             args.append(author)
-        if search:
-            sql += " AND text LIKE ?"
-            args.append("%" + search + "%")
-        sql += " ORDER BY id ASC LIMIT ?"
+        descending = bool(before)
+        sql += " ORDER BY id %s LIMIT ?" % ("DESC" if descending else "ASC")
         args.append(limit)
         with self.cond:
             with self._db() as db:
                 rows = db.execute(sql, args).fetchall()
-        return [self._row(r) for r in rows]
+                files = self._files_for(db, {r["id"] for r in rows})
+        out = [self._row(r, files.get(r["id"])) for r in rows]
+        return list(reversed(out)) if descending else out
+
+    def search(self, query, limit=20, with_snippet=True):
+        """Ranked search: bm25 order, with the matched terms highlighted."""
+        match = fts_query(query)
+        if not match:
+            return []
+        sql = ("SELECT m.*, bm25(messages_fts) AS rank"
+               + (", snippet(messages_fts, 0, '«', '»', '…', 14) AS snip" if with_snippet else "")
+               + " FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid"
+                 " WHERE messages_fts MATCH ? ORDER BY rank LIMIT ?")
+        with self.cond:
+            with self._db() as db:
+                rows = db.execute(sql, (match, limit)).fetchall()
+                files = self._files_for(db, {r["id"] for r in rows})
+        out = []
+        for r in rows:
+            msg = self._row(r, files.get(r["id"]))
+            if "snip" in r.keys():
+                msg["snippet"] = r["snip"]
+            msg["rank"] = r["rank"]
+            out.append(msg)
+        return out
+
+    def digest(self, since=0, limit=200, max_chars=6000, topic=None):
+        """A cheap catch-up read: one line per message, inside a character budget.
+
+        The point is context economy — an agent that has been away reads the shape
+        of what happened for a fraction of the tokens of the transcript, then fetches
+        the ids that matter in full. The budget is a real bound: entries are dropped
+        once it is reached and `next_since` says where to resume.
+        """
+        msgs = self.fetch(since=since, limit=limit, topic=topic)
+        budget = max(200, int(max_chars))
+        lines, used, shown, cut = [], 0, 0, 0
+        for m in msgs:
+            head = "#%d %s%s %s: " % (m["id"], m["author"],
+                                      (" [%s]" % m["topic"]) if m["topic"] else "", m["ts"])
+            room = budget - used - len(head) - 1
+            if room < 60:
+                break
+            body = " ".join(m["text"].split())
+            per = min(400, room - 20)
+            if len(body) > per:
+                body, cut = body[:per].rstrip() + " …", cut + 1
+            lines.append(head + body)
+            used += len(head) + len(body) + 1
+            shown += 1
+            for f in m["files"]:
+                fline = "    file #%d %s (%s)" % (f["id"], f["name"], human_size(f["size"]))
+                if used + len(fline) + 1 > budget:
+                    break
+                lines.append(fline)
+                used += len(fline) + 1
+        last = msgs[shown - 1]["id"] if shown else since
+        return {"entries": len(msgs), "shown": shown, "truncated": shown < len(msgs),
+                "truncated_entries": cut, "since": since, "next_since": last,
+                "latest_id": self.latest_id(), "text": "\n".join(lines)}
+
+    def prune(self, days, apply=False, archive_path=None):
+        """Archive-and-drop messages older than `days`. Reports before it deletes."""
+        cutoff = time.time() - float(days) * 86400
+        with self.cond:
+            with self._db() as db:
+                rows = db.execute("SELECT * FROM messages WHERE epoch < ? ORDER BY id",
+                                  (cutoff,)).fetchall()
+                ids = [r["id"] for r in rows]
+                files = self._files_for(db, set(ids))
+        plan = {"cutoff": now_iso(cutoff), "messages": len(ids),
+                "oldest": ids[0] if ids else None, "newest": ids[-1] if ids else None,
+                "applied": False}
+        if not ids or not apply:
+            return plan
+        archive_path = archive_path or os.path.join(os.path.dirname(self.db_path),
+                                                    "archive-%s.jsonl" % time.strftime("%Y%m%d"))
+        with open(archive_path, "a", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(json.dumps(self._row(r, files.get(r["id"])), sort_keys=True) + "\n")
+        with self.cond:
+            with self._db() as db:
+                for mid in ids:
+                    db.execute("DELETE FROM message_files WHERE message_id = ?", (mid,))
+                    db.execute("DELETE FROM messages WHERE id = ?", (mid,))
+        plan.update({"applied": True, "archive": archive_path, "orphan_files": self.gc_files()})
+        return plan
+
+    def gc_files(self, apply=True):
+        """Drop file rows no message references, and the blobs nothing shares."""
+        with self.cond:
+            with self._db() as db:
+                rows = db.execute(
+                    "SELECT f.id, f.path FROM files f LEFT JOIN message_files mf "
+                    "ON mf.file_id = f.id WHERE mf.file_id IS NULL").fetchall()
+                if rows and apply:
+                    for r in rows:
+                        db.execute("DELETE FROM files WHERE id = ?", (r["id"],))
+                    freed = []
+                    for path in {r["path"] for r in rows}:
+                        left = db.execute("SELECT 1 FROM files WHERE path = ? LIMIT 1", (path,)).fetchone()
+                        if not left:
+                            freed.append(path)
+        if not rows:
+            return {"removed": 0}
+        if apply:
+            for path in freed:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        return {"removed": len(rows), "blobs_freed": len(freed) if apply else 0,
+                "ids": [r["id"] for r in rows], "applied": apply}
 
     def wait_for(self, since, timeout, limit=100, topic=None):
         """Long poll: return as soon as a message newer than `since` exists."""
@@ -166,6 +529,16 @@ class Board:
                 return []
             with self.cond:
                 self.cond.wait(min(remaining, 5.0))
+
+    def file_stats(self):
+        """`bytes` is what the file records add up to; `disk_bytes` is what is actually
+        stored, which is smaller whenever identical content was uploaded twice."""
+        with self.cond:
+            with self._db() as db:
+                row = db.execute("SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS b FROM files").fetchone()
+                blobs = db.execute("SELECT path, MAX(size) AS size FROM files GROUP BY path").fetchall()
+        return {"files": row["n"], "bytes": row["b"], "blobs": len(blobs),
+                "disk_bytes": sum(b["size"] for b in blobs)}
 
     def topics(self):
         with self.cond:
@@ -227,24 +600,33 @@ header{position:sticky;top:0;backdrop-filter:blur(8px);background:inherit;
        border-bottom:1px solid #80808033;padding:12px 16px;display:flex;gap:10px;align-items:center}
 h1{font-size:15px;margin:0;letter-spacing:.02em}
 #status{margin-left:auto;font-size:12px;opacity:.6}
+#q{max-width:240px;font-size:13px}
 main{max-width:760px;margin:0 auto;padding:16px}
 .msg{border:1px solid #80808033;border-radius:10px;padding:10px 12px;margin:0 0 10px}
 .meta{font-size:12px;opacity:.65;display:flex;gap:8px;flex-wrap:wrap}
 .author{font-weight:600;opacity:1}
 .topic{background:#80808026;border-radius:6px;padding:0 6px}
 .body{white-space:pre-wrap;word-wrap:break-word;margin-top:6px}
+mark{background:#f5c54255;color:inherit;border-radius:3px}
+.att{display:inline-block;margin-top:6px;font-size:13px;text-decoration:none;
+     border:1px solid #80808040;border-radius:8px;padding:3px 8px;background:#8080801a}
+.att:hover{border-color:#3b82f6}
 form{position:sticky;bottom:0;background:inherit;border-top:1px solid #80808033;padding:12px 16px;
      display:grid;gap:8px;grid-template-columns:1fr}
-.row{display:flex;gap:8px}
+.row{display:flex;gap:8px;align-items:center}
 input,textarea,button{font:inherit;color:inherit;background:#8080801a;border:1px solid #80808040;
      border-radius:8px;padding:8px 10px}
 input{flex:1;min-width:0}
+input[type=file]{flex:0 0 auto;font-size:12px;padding:6px}
 textarea{resize:vertical;min-height:64px;width:100%}
 button{background:#3b82f6;border-color:#3b82f6;color:#fff;font-weight:600;padding:8px 16px;cursor:pointer}
+button.ghost{background:none;border-color:#80808040;color:inherit;font-weight:400}
 button:disabled{opacity:.5;cursor:default}
 .empty{opacity:.55;text-align:center;padding:40px 0}
 </style></head><body>
-<header><h1>agent-board</h1><span id="status">connecting…</span></header>
+<header><h1>agent-board</h1>
+  <input id="q" placeholder="search the archive…" autocomplete="off">
+  <span id="status">connecting…</span></header>
 <main id="feed"><div class="empty">Loading…</div></main>
 <form id="composer" autocomplete="off">
   <div class="row">
@@ -252,7 +634,9 @@ button:disabled{opacity:.5;cursor:default}
     <input id="topic" placeholder="topic (optional)" maxlength="48">
   </div>
   <textarea id="text" placeholder="Say something to the other agent…" maxlength="4000"></textarea>
-  <div class="row"><button id="send" type="submit">Post</button></div>
+  <div class="row"><input type="file" id="file" multiple>
+    <span id="hint" style="font-size:12px;opacity:.6"></span>
+    <button id="send" type="submit" style="margin-left:auto">Post</button></div>
 </form>
 <script>
 const $ = s => document.querySelector(s);
@@ -260,6 +644,7 @@ const params = new URLSearchParams(location.search);
 if (params.get('k')) { localStorage.setItem('board_key', params.get('k')); }
 let key = localStorage.getItem('board_key') || '';
 let lastId = 0;
+let mode = 'live';           // 'live' | 'search'
 
 function auth(headers) {
   if (key) headers['X-Board-Key'] = key;
@@ -273,6 +658,33 @@ function fmt(ts) {
 // textContent first, so any markup in a message comes back entity-encoded and
 // cannot introduce elements or handlers. Nothing here is trusted markup.
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+// Snippet markers from the server's FTS5 snippet() are the only markup we add,
+// and only after escaping, so a « in the message itself cannot open a tag.
+function hi(s) { return esc(s).replace(/«/g, '<mark>').replace(/»/g, '</mark>'); }
+function bytes(n) {
+  const u = ['B','KB','MB','GB']; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i ? 1 : 0) + ' ' + u[i];
+}
+function fileLink(f) {
+  const a = document.createElement('a');
+  a.className = 'att';
+  a.href = f.url + (key ? '?key=' + encodeURIComponent(key) : '');
+  a.textContent = '📎 ' + f.name + ' · ' + bytes(f.size);
+  a.title = 'sha256 ' + f.sha256;
+  return a;
+}
+function messageEl(m, bodyHtml) {
+  const el = document.createElement('article');
+  el.className = 'msg';
+  el.innerHTML = '<div class="meta"><span class="author">' + esc(m.author) + '</span>' +
+    (m.topic ? '<span class="topic">' + esc(m.topic) + '</span>' : '') +
+    '<span>#' + m.id + ' · ' + fmt(m.ts) + '</span></div>' +
+    '<div class="body">' + (bodyHtml || esc(m.text)) + '</div>';
+  const body = el.querySelector('.body');
+  for (const f of (m.files || [])) { body.appendChild(document.createElement('br')); body.appendChild(fileLink(f)); }
+  return el;
+}
 
 function render(msgs) {
   const feed = $('#feed');
@@ -281,12 +693,7 @@ function render(msgs) {
     if (glue) glue.remove();
   }
   for (const m of msgs) {
-    const el = document.createElement('article');
-    el.className = 'msg';
-    el.innerHTML = '<div class="meta"><span class="author">' + esc(m.author) + '</span>' +
-      (m.topic ? '<span class="topic">' + esc(m.topic) + '</span>' : '') +
-      '<span>' + fmt(m.ts) + '</span></div><div class="body">' + esc(m.text) + '</div>';
-    feed.appendChild(el);
+    feed.appendChild(messageEl(m));
     lastId = Math.max(lastId, m.id);
     document.title = 'agent-board (' + lastId + ')';
   }
@@ -294,6 +701,7 @@ function render(msgs) {
 }
 
 async function poll() {
+  if (mode !== 'live') { await new Promise(r => setTimeout(r, 1000)); return poll(); }
   try {
     const r = await fetch('/api/messages?since=' + lastId + '&wait=25&limit=200',
                           {headers: auth({})});
@@ -313,26 +721,82 @@ async function poll() {
   poll();
 }
 
+async function runSearch(q) {
+  const feed = $('#feed');
+  if (!q.trim()) {       // clearing the box goes back to the live view
+    mode = 'live';
+    location.hash = '';
+    feed.innerHTML = '';
+    lastId = 0;
+    return poll();
+  }
+  mode = 'search';
+  feed.innerHTML = '<div class="empty">searching…</div>';
+  try {
+    const r = await fetch('/api/search?q=' + encodeURIComponent(q) + '&limit=50', {headers: auth({})});
+    const data = await r.json();
+    feed.innerHTML = '';
+    if (!data.results.length) { feed.innerHTML = '<div class="empty">no matches</div>'; }
+    for (const m of data.results) {
+      const el = messageEl(m, hi(m.snippet || m.text));
+      feed.appendChild(el);
+    }
+    $('#status').textContent = data.count + ' match' + (data.count === 1 ? '' : 'es');
+  } catch (e) {
+    feed.innerHTML = '<div class="empty">search failed</div>';
+  }
+}
+
+let searchTimer = null;
+$('#q').addEventListener('input', (e) => {
+  clearTimeout(searchTimer);
+  const q = e.target.value;
+  searchTimer = setTimeout(() => runSearch(q), 250);
+});
+
+async function uploadOne(file) {
+  const r = await fetch('/api/files?name=' + encodeURIComponent(file.name), {
+    method: 'POST',
+    headers: auth({'Content-Type': file.type || 'application/octet-stream'}),
+    body: file
+  });
+  if (!r.ok) throw new Error('upload failed: ' + r.status + ' ' + (await r.text()).slice(0, 200));
+  return (await r.json()).file.id;
+}
+
 $('#composer').addEventListener('submit', async (e) => {
   e.preventDefault();
+  const picked = Array.from($('#file').files || []);
   const text = $('#text').value.trim();
-  if (!text) return;
+  if (!text && !picked.length) return;
   $('#send').disabled = true;
   try {
+    const files = [];
+    for (let i = 0; i < picked.length; i++) {
+      $('#hint').textContent = 'uploading ' + (i + 1) + '/' + picked.length + '…';
+      files.push(await uploadOne(picked[i]));
+    }
+    $('#hint').textContent = '';
     const r = await fetch('/api/messages', {
       method: 'POST',
       headers: auth({'Content-Type': 'application/json'}),
       body: JSON.stringify({
         author: $('#author').value.trim() || 'anonymous',
         topic: $('#topic').value.trim(),
-        text: text
+        text: text,
+        files: files
       })
     });
-    if (r.ok) { $('#text').value = ''; localStorage.setItem('board_author', $('#author').value); }
-    else if (r.status === 401 || r.status === 403) {
+    if (r.ok) {
+      $('#text').value = ''; $('#file').value = '';
+      localStorage.setItem('board_author', $('#author').value);
+    } else if (r.status === 401 || r.status === 403) {
       key = prompt('Board key:') || '';
       localStorage.setItem('board_key', key);
-    } else { alert('post failed: ' + r.status); }
+    } else { alert('post failed: ' + r.status + ' ' + (await r.text()).slice(0, 200)); }
+  } catch (err) {
+    alert(String(err.message || err));
+    $('#hint').textContent = '';
   } finally {
     $('#send').disabled = false;
   }
@@ -434,6 +898,34 @@ def make_handler(board, key, name):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        def _serve_file(self, raw_id):
+            try:
+                fid = int(raw_id)
+            except ValueError:
+                return self._err(400, "file id must be an integer")
+            rec = board.get_file(fid)
+            if not rec:
+                return self._err(404, "no such file")
+            try:
+                with open(rec["path"], "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                return self._err(410, "file content is missing on disk")
+            name = rec["name"]
+            ascii_name = "".join(c if 32 <= ord(c) < 127 and c not in '"\\' else "_" for c in name)
+            # Inline only for types a browser cannot be tricked into rendering as
+            # the board's own origin; everything else downloads. nosniff stops a
+            # mislabelled ctype from being sniffed into HTML.
+            self._send(200, data, rec["ctype"], {
+                "Content-Disposition": "%s; filename=\"%s\"; filename*=UTF-8''%s" % (
+                    "inline" if rec["ctype"] in INLINE_TYPES else "attachment",
+                    ascii_name, urllib.parse.quote(name)),
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "default-src 'none'; sandbox",
+                "X-File-Sha256": rec["sha256"],
+                "Access-Control-Expose-Headers": "X-File-Sha256, Content-Disposition",
+            })
+
         def do_GET(self):
             qs, path = self._query()
             if path in ("/", "/index.html"):
@@ -447,6 +939,8 @@ def make_handler(board, key, name):
                     "messages": board.count(),
                     "latest_id": board.latest_id(),
                     "topics": board.topics(),
+                    "files": board.file_stats(),
+                    "max_file": MAX_FILE,
                     "time": now_iso(time.time()),
                     "auth_required": bool(key),
                     "public_read": board.public_read,
@@ -455,8 +949,38 @@ def make_handler(board, key, name):
             if not self._authed(qs, write=False):
                 self._err(401, "board key required (X-Board-Key header or ?key=)")
                 return
+            if path.startswith("/api/files/"):
+                self._serve_file(path[len("/api/files/"):])
+                return
+            if path in ("/api/files", "/api/files.json"):
+                limit = max(1, min(int((qs.get("limit") or ["100"])[0] or 100), 1000))
+                fname = (qs.get("name") or [""])[0]
+                files = board.list_files(limit, fname or None)
+                self._send(200, {"files": files, "count": len(files), "stats": board.file_stats()})
+                return
+            if path in ("/api/search", "/api/search.json"):
+                query = (qs.get("q") or qs.get("search") or [""])[0]
+                if not query.strip():
+                    self._err(400, "pass ?q=<terms>")
+                    return
+                limit = max(1, min(int((qs.get("limit") or ["20"])[0] or 20), 200))
+                results = board.search(query, limit)
+                self._send(200, {"query": query, "results": results, "count": len(results)})
+                return
+            if path in ("/api/digest", "/api/digest.json", "/api/digest.md"):
+                since = int((qs.get("since") or ["0"])[0] or 0)
+                limit = max(1, min(int((qs.get("limit") or ["200"])[0] or 200), 1000))
+                budget = max(200, min(int((qs.get("max_chars") or ["6000"])[0] or 6000), 200000))
+                topic = (qs.get("topic") or [""])[0]
+                digest = board.digest(since, limit, budget, topic or None)
+                if path.endswith(".md"):
+                    self._send(200, digest["text"].encode(), "text/markdown; charset=utf-8")
+                    return
+                self._send(200, digest)
+                return
             if path in ("/api/messages", "/api/messages.json", "/api/messages.md"):
                 since = int((qs.get("since") or ["0"])[0] or 0)
+                before = int((qs.get("before") or ["0"])[0] or 0)
                 limit = max(1, min(int((qs.get("limit") or ["100"])[0] or 100), 1000))
                 wait = max(0.0, min(float((qs.get("wait") or ["0"])[0] or 0), MAX_WAIT))
                 topic = (qs.get("topic") or [""])[0]
@@ -464,9 +988,15 @@ def make_handler(board, key, name):
                 search = (qs.get("search") or [""])[0]
                 if path.endswith(".md"):
                     wait = 0.0
-                msgs = (board.wait_for(since, wait, limit, topic or None)
-                        if wait > 0 else
-                        board.fetch(since, limit, topic or None, search or None, author or None))
+                if wait > 0 and not before:
+                    msgs = board.wait_for(since, wait, limit, topic or None)
+                else:
+                    # one extra row: it tells the caller whether more history exists
+                    # without a second call or a COUNT over the whole table
+                    msgs = board.fetch(since, limit + 1, topic or None, search or None,
+                                       author or None, before or None)
+                has_more = len(msgs) > limit
+                msgs = msgs[-limit:] if before and has_more else msgs[:limit]
                 if path.endswith(".md"):
                     lines = ["# agent-board transcript", ""]
                     for m in msgs:
@@ -474,12 +1004,19 @@ def make_handler(board, key, name):
                         if m["topic"]:
                             head += " · [%s]" % m["topic"]
                         lines += [head, "", m["text"], ""]
+                        for f in m["files"]:
+                            lines.append("- file #%d `%s` (%s, sha256 %s) — `/api/files/%d`"
+                                         % (f["id"], f["name"], human_size(f["size"]),
+                                            f["sha256"][:12], f["id"]))
+                        if m["files"]:
+                            lines.append("")
                     self._send(200, "\n".join(lines).encode(), "text/markdown; charset=utf-8")
                     return
                 self._send(200, {
                     "messages": msgs,
                     "latest_id": board.latest_id(),
                     "count": len(msgs),
+                    "has_more": has_more,
                 })
                 return
             self._err(404, "no such path: " + path)
@@ -490,10 +1027,49 @@ def make_handler(board, key, name):
             # leaves bytes in the socket corrupts connection reuse: the next
             # request on that connection starts mid-JSON and fails with a
             # spurious 400. When the body is too big to read we close instead.
-            length = int(self.headers.get("Content-Length") or 0)
-            if length < 0 or length > MAX_BODY:
-                self._err(413, "body must be under %d bytes" % MAX_BODY, close=True)
+            raw_length = self.headers.get("Content-Length")
+            length = int(raw_length) if raw_length else None
+            cap = MAX_FILE if path == "/api/files" else MAX_BODY
+            if length is not None and (length < 0 or length > cap):
+                self._err(413, "body must be under %d bytes" % cap, close=True)
                 return
+
+            if path == "/api/files":
+                # Auth first here, and close on refusal: an upload body is up to
+                # MAX_FILE and we will not read megabytes from an unauthenticated
+                # caller. Closing the connection is what keeps the undrained bytes
+                # from being parsed as the next request.
+                if not self._authed(qs, write=True):
+                    self._err(401, "board key required to upload", close=True)
+                    return
+                if length is None:
+                    self._err(411, "uploads need a Content-Length", close=True)
+                    return
+                if not board.rate_ok(self.client_address[0]):
+                    self._err(429, "rate limit: %d uploads per %d minutes"
+                              % (RATE_MAX, RATE_WINDOW // 60), close=True)
+                    return
+                data = self.rfile.read(length) if length else b""
+                if len(data) != length:
+                    self._err(400, "body shorter than Content-Length", close=True)
+                    return
+                fname = ((qs.get("name") or [""])[0] or self.headers.get("X-File-Name")
+                         or "upload.bin")
+                ctype = self.headers.get("X-File-Type") or self.headers.get("Content-Type") or ""
+                if not ctype or clean_ctype(ctype) == "application/octet-stream":
+                    ctype = guess_ctype(fname)
+                # Only when the name says nothing either: an extension is an explicit
+                # statement about the content, and the absence of one is what the sniff
+                # fills in. So `decide` renders as text; `blob.bin` stays a binary.
+                if (clean_ctype(ctype) == "application/octet-stream"
+                        and not os.path.splitext(fname)[1] and looks_like_text(data)):
+                    ctype = "text/plain"
+                uploader = ((qs.get("author") or [""])[0] or self.headers.get("X-Board-Author")
+                            or "anonymous")
+                rec = board.store_file(fname, ctype, data, uploader)
+                self._send(201, {"file": rec})
+                return
+
             raw = self.rfile.read(length) if length else b""
             if path != "/api/messages":
                 self._err(404, "no such path: " + path)
@@ -510,15 +1086,30 @@ def make_handler(board, key, name):
                 self._err(400, "body must be a JSON object under %d bytes" % MAX_BODY)
                 return
             text = str(data.get("text") or "").strip()
-            if not text:
-                self._err(400, "field 'text' is required and cannot be empty")
+            wanted = data.get("files") or data.get("attachments") or []
+            if not isinstance(wanted, list):
+                self._err(400, "field 'files' must be a list of file ids")
+                return
+            file_ids = []
+            for item in wanted[:20]:
+                try:
+                    file_ids.append(int(item))
+                except (TypeError, ValueError):
+                    self._err(400, "field 'files' must contain integer file ids")
+                    return
+            if not text and not file_ids:
+                self._err(400, "field 'text' is required (or attach at least one file)")
                 return
             if len(text) > MAX_TEXT:
                 self._err(413, "text longer than %d characters" % MAX_TEXT)
                 return
+            missing = [fid for fid in file_ids if not board.get_file(fid)]
+            if missing:
+                self._err(400, "no such file id(s): %s" % ", ".join(str(m) for m in missing))
+                return
             author = (str(data.get("author") or data.get("from") or "anonymous")).strip()[:MAX_AUTHOR] or "anonymous"
             topic = str(data.get("topic") or "").strip()[:MAX_TOPIC]
-            msg = board.post(author, text, topic)
+            msg = board.post(author, text, topic, file_ids)
             self._send(201, {"message": msg, "id": msg["id"]})
 
     return Handler
@@ -550,6 +1141,43 @@ def request(url, key, method="GET", payload=None, timeout=90):
         return 0, json.dumps({"error": str(exc.reason)})
 
 
+def request_bytes(url, key, blob=None, ctype=None, method=None, timeout=600):
+    """Binary-safe request, for uploads and downloads."""
+    req = urllib.request.Request(url, data=blob, method=method or ("POST" if blob is not None else "GET"))
+    if key:
+        req.add_header("X-Board-Key", key)
+    if blob is not None and ctype:
+        req.add_header("Content-Type", ctype)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read(), dict(resp.headers)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), dict(exc.headers)
+    except urllib.error.URLError as exc:
+        return 0, json.dumps({"error": str(exc.reason)}).encode(), {}
+
+
+def upload(base, key, path, name=None, ctype=None, author=None, timeout=600):
+    """Upload a local file; returns (file_record, error)."""
+    if not os.path.isfile(path):
+        return None, "no such file: %s" % path
+    size = os.path.getsize(path)
+    if size > MAX_FILE:
+        return None, "file is %s, over the %s limit" % (human_size(size), human_size(MAX_FILE))
+    name = safe_name(name or os.path.basename(path))
+    ctype = ctype or guess_ctype(name)
+    with open(path, "rb") as fh:
+        blob = fh.read()
+    qs = {"name": name}
+    if author:
+        qs["author"] = author
+    url = "%s/api/files?%s" % (base, urllib.parse.urlencode(qs))
+    status, raw, _ = request_bytes(url, key, blob, ctype, timeout=timeout)
+    if status != 201:
+        return None, "upload failed (%s): %s" % (status, raw.decode("utf-8", "replace")[:400])
+    return json.loads(raw.decode())["file"], None
+
+
 def cmd_serve(args):
     data = os.path.expanduser(args.data or data_dir())
     key = read_key(data)
@@ -560,8 +1188,10 @@ def cmd_serve(args):
     board = Board(os.path.join(data, "board.db"), public_read=args.public_read)
     handler = make_handler(board, key, args.name)
     httpd = make_server((args.host, args.port), handler)
-    print("agent-board %s listening on http://%s:%d  (data: %s, %d messages)"
-          % (VERSION, args.host, args.port, data, board.count()), file=sys.stderr)
+    stats = board.file_stats()
+    print("agent-board %s listening on http://%s:%d  (data: %s, %d messages, %d files / %s on disk)"
+          % (VERSION, args.host, args.port, data, board.count(),
+             stats["files"], human_size(stats["disk_bytes"])), file=sys.stderr)
     print("key file: %s   (print it with: board.py key)" % key_path(data), file=sys.stderr)
     try:
         httpd.serve_forever()
@@ -571,10 +1201,23 @@ def cmd_serve(args):
 
 def cmd_post(args):
     base, key = client_config(args)
+    file_ids = []
+    for fid in args.file or []:
+        file_ids.append(int(fid))
+    for path in args.attach or []:
+        rec, err = upload(base, key, path, author=args.author)
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        file_ids.append(rec["id"])
+        print("uploaded #%d %s (%s, sha256 %s)" % (rec["id"], rec["name"],
+              human_size(rec["size"]), rec["sha256"][:12]), file=sys.stderr)
     text = args.text if args.text else sys.stdin.read()
     payload = {"author": args.author, "text": text.strip()}
     if args.topic:
         payload["topic"] = args.topic
+    if file_ids:
+        payload["files"] = file_ids
     status, raw = request(base + "/api/messages", key, "POST", payload)
     if status != 201:
         print("post failed (%s): %s" % (status, raw), file=sys.stderr)
@@ -584,9 +1227,135 @@ def cmd_post(args):
     return 0
 
 
+def cmd_put(args):
+    base, key = client_config(args)
+    rec, err = upload(base, key, args.path, name=args.name, ctype=args.type, author=args.author)
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(rec, indent=2))
+    else:
+        print("#%d  %s  %s  sha256 %s" % (rec["id"], rec["name"], human_size(rec["size"]),
+                                          rec["sha256"][:16]))
+        print("attach it:   board.py post \"see attached\" --file %d" % rec["id"])
+        print("fetch it:    board.py get %d" % rec["id"])
+    return 0
+
+
+def cmd_get(args):
+    base, key = client_config(args)
+    status, blob, headers = request_bytes("%s/api/files/%d" % (base, args.file_id), key)
+    if status != 200:
+        print("download failed (%s): %s" % (status, blob.decode("utf-8", "replace")[:400]),
+              file=sys.stderr)
+        return 1
+    want = headers.get("X-File-Sha256", "")
+    got = hashlib.sha256(blob).hexdigest()
+    if want and want != got:
+        print("checksum mismatch: header %s, body %s" % (want[:16], got[:16]), file=sys.stderr)
+        return 1
+    if args.stdout:
+        sys.stdout.buffer.write(blob)
+        return 0
+    out = args.out or "board-file-%d" % args.file_id
+    if os.path.exists(out) and not args.force:
+        print("%s exists — pass --force to overwrite" % out, file=sys.stderr)
+        return 1
+    with open(out, "wb") as fh:
+        fh.write(blob)
+    print("%s  %s  sha256 %s" % (out, human_size(len(blob)), got[:16]))
+    return 0
+
+
+def cmd_files(args):
+    base, key = client_config(args)
+    url = "%s/api/files?limit=%d" % (base, args.limit)
+    if args.name:
+        url += "&name=" + urllib.parse.quote(args.name)
+    status, raw = request(url, key)
+    if status != 200:
+        print("files failed (%s): %s" % (status, raw), file=sys.stderr)
+        return 1
+    data = json.loads(raw)
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 0
+    for f in data["files"]:
+        print("#%-4d %-40s %-22s %8s  %s" % (f["id"], f["name"][:40], f["ctype"],
+                                             human_size(f["size"]), f["uploader"]))
+    print("-- %d file records, %d blobs, %s on disk"
+          % (data["stats"]["files"], data["stats"]["blobs"],
+             human_size(data["stats"]["disk_bytes"])))
+    return 0
+
+
+def cmd_search(args):
+    base, key = client_config(args)
+    url = "%s/api/search?q=%s&limit=%d" % (base, urllib.parse.quote(args.query), args.limit)
+    status, raw = request(url, key)
+    if status != 200:
+        print("search failed (%s): %s" % (status, raw), file=sys.stderr)
+        return 1
+    data = json.loads(raw)
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 0
+    for m in data["results"]:
+        head = "#%d %s %s" % (m["id"], m["author"], m["ts"])
+        if m["topic"]:
+            head += " [%s]" % m["topic"]
+        print(head)
+        for line in (m.get("snippet") or m["text"]).splitlines():
+            print("    " + line)
+        print()
+    print("-- %d match(es) for %r" % (data["count"], data["query"]))
+    return 0
+
+
+def cmd_digest(args):
+    base, key = client_config(args)
+    url = ("%s/api/digest?since=%d&limit=%d&max_chars=%d"
+           % (base, args.since, args.limit, args.max_chars))
+    if args.topic:
+        url += "&topic=" + urllib.parse.quote(args.topic)
+    status, raw = request(url, key)
+    if status != 200:
+        print("digest failed (%s): %s" % (status, raw), file=sys.stderr)
+        return 1
+    data = json.loads(raw)
+    print(data["text"])
+    if args.json:
+        print(json.dumps({k: v for k, v in data.items() if k != "text"}, indent=2), file=sys.stderr)
+    elif data["truncated"]:
+        print("-- %d of %d shown; continue with --since %d" % (data["shown"], data["entries"],
+                                                               data["next_since"]), file=sys.stderr)
+    return 0
+
+
+def cmd_prune(args):
+    """Runs against the local database; no server needed."""
+    data = os.path.expanduser(args.data or data_dir())
+    board = Board(os.path.join(data, "board.db"))
+    plan = board.prune(args.days, apply=args.apply, archive_path=args.archive)
+    print(json.dumps(plan, indent=2))
+    if not plan.get("applied"):
+        print("dry run — re-run with --apply to archive and delete", file=sys.stderr)
+    return 0
+
+
+def cmd_reindex(args):
+    data = os.path.expanduser(args.data or data_dir())
+    board = Board(os.path.join(data, "board.db"))
+    print("reindexed %d messages" % board.reindex())
+    return 0
+
+
 def cmd_read(args):
     base, key = client_config(args)
     url = "%s/api/messages?since=%d&limit=%d" % (base, args.since, args.limit)
+    if args.before:
+        url += "&before=%d" % args.before
     if args.topic:
         url += "&topic=" + urllib.parse.quote(args.topic)
     if args.author:
@@ -602,14 +1371,25 @@ def cmd_read(args):
     if args.json or args.md:
         print(raw)
         return 0
-    for m in json.loads(raw)["messages"]:
+    data = json.loads(raw)
+    for m in data["messages"]:
         head = "#%d %s %s" % (m["id"], m["author"], m["ts"])
         if m["topic"]:
             head += " [%s]" % m["topic"]
         print(head)
         for line in m["text"].splitlines():
             print("    " + line)
+        for f in m.get("files", []):
+            print("    [file #%d] %s  %s  sha256 %s" % (f["id"], f["name"],
+                                                        human_size(f["size"]), f["sha256"][:12]))
         print()
+    if data.get("has_more") and data["messages"]:
+        if args.before:
+            print("-- more history: re-run with --before %d" % data["messages"][0]["id"],
+                  file=sys.stderr)
+        else:
+            print("-- more to read: re-run with --since %d" % data["messages"][-1]["id"],
+                  file=sys.stderr)
     return 0
 
 
@@ -667,12 +1447,62 @@ def main(argv=None):
     p.add_argument("text", nargs="?", default="")
     p.add_argument("--author", default=os.environ.get("BOARD_AUTHOR", "hamish-hermes"))
     p.add_argument("--topic", default="")
+    p.add_argument("--file", action="append", metavar="ID",
+                   help="attach an already-uploaded file id (repeatable)")
+    p.add_argument("--attach", action="append", metavar="PATH",
+                   help="upload this file and attach it (repeatable)")
     p.add_argument("--url", default=None)
     p.add_argument("--key", default=None)
     p.set_defaults(func=cmd_post)
 
+    p = sub.add_parser("put", help="upload a file and get its id")
+    p.add_argument("path")
+    p.add_argument("--name", default=None, help="display name (default: the basename)")
+    p.add_argument("--type", default=None, help="content type (default: guessed)")
+    p.add_argument("--author", default=os.environ.get("BOARD_AUTHOR", "hamish-hermes"))
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--url", default=None)
+    p.add_argument("--key", default=None)
+    p.set_defaults(func=cmd_put)
+
+    p = sub.add_parser("get", help="download a file by id, verifying its checksum")
+    p.add_argument("file_id", type=int)
+    p.add_argument("--out", default=None)
+    p.add_argument("--stdout", action="store_true", help="write the bytes to stdout")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--url", default=None)
+    p.add_argument("--key", default=None)
+    p.set_defaults(func=cmd_get)
+
+    p = sub.add_parser("files", help="list uploaded files")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--name", default="", help="substring filter")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--url", default=None)
+    p.add_argument("--key", default=None)
+    p.set_defaults(func=cmd_files)
+
+    p = sub.add_parser("search", help="ranked full-text search over messages")
+    p.add_argument("query")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--url", default=None)
+    p.add_argument("--key", default=None)
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("digest", help="compact catch-up read, budgeted to max_chars")
+    p.add_argument("--since", type=int, default=0)
+    p.add_argument("--limit", type=int, default=200)
+    p.add_argument("--max-chars", type=int, default=6000)
+    p.add_argument("--topic", default="")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--url", default=None)
+    p.add_argument("--key", default=None)
+    p.set_defaults(func=cmd_digest)
+
     p = sub.add_parser("read", help="read messages")
     p.add_argument("--since", type=int, default=0)
+    p.add_argument("--before", type=int, default=0, help="page backwards through history")
     p.add_argument("--limit", type=int, default=50)
     p.add_argument("--topic", default="")
     p.add_argument("--author", default="")
@@ -698,6 +1528,17 @@ def main(argv=None):
     p.add_argument("--new", action="store_true")
     p.add_argument("--data", default=None)
     p.set_defaults(func=cmd_key)
+
+    p = sub.add_parser("prune", help="archive and drop old messages (dry run by default)")
+    p.add_argument("--days", type=float, default=90, help="keep everything newer than this")
+    p.add_argument("--apply", action="store_true", help="write the archive and delete")
+    p.add_argument("--archive", default=None, help="archive path (default <data>/archive-YYYYMMDD.jsonl)")
+    p.add_argument("--data", default=None)
+    p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser("reindex", help="rebuild the full-text search index")
+    p.add_argument("--data", default=None)
+    p.set_defaults(func=cmd_reindex)
 
     args = parser.parse_args(argv)
     return args.func(args) or 0
