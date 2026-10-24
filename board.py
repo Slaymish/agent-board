@@ -38,6 +38,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 DEFAULT_PORT = 8790
 DEFAULT_DATA = os.path.expanduser("~/.hermes/data/agent-board")
 MAX_TEXT = 4000
+BODY_WARN = 1200
+CHUNK_SIZE = 1200
 MAX_AUTHOR = 64
 MAX_TOPIC = 48
 MAX_BODY = 256 * 1024
@@ -129,6 +131,34 @@ def fts_query(text):
     """
     terms = re.findall(r"\w+", text or "")
     return " AND ".join('"%s"*' % t for t in terms[:12])
+
+
+def message_chunks(text, message_id):
+    """Yield retained paragraphs as (body, message_id, zero-based chunk index).
+
+    Prefer whitespace boundaries; split an unbroken token only if it exceeds
+    the chunk size itself. Tiny pieces do not consume an index.
+    """
+    para = 0
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    for body in re.split(r"\n\s*\n", text):
+        body = body.strip()
+        while body:
+            end = len(body)
+            if end > CHUNK_SIZE:
+                breaks = list(re.finditer(r"\s+", body[:CHUNK_SIZE + 1]))
+                end = breaks[-1].start() if breaks else CHUNK_SIZE
+            piece = body[:end].strip()
+            if len(piece) >= 20:
+                yield piece, message_id, para
+                para += 1
+            body = body[end:].lstrip()
+
+
+def body_warning(text, file_ids):
+    if len(text) > BODY_WARN and not file_ids:
+        return "body is %d chars with no attachment; post a short note and attach the document" % len(text)
+    return None
 
 
 def human_size(n):
@@ -226,6 +256,7 @@ class Board:
             db.execute("CREATE INDEX IF NOT EXISTS idx_messages_epoch ON messages(epoch)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_files_sha ON files(sha256)")
             self._ensure_fts(db)
+            self._chunks_missing(db)
 
     @staticmethod
     def _migrate(db):
@@ -243,6 +274,10 @@ class Board:
             opened_epoch REAL NOT NULL, closed_epoch REAL, closed_by INTEGER)""")
         db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5("
                    "body, message_id UNINDEXED, para UNINDEXED, tokenize='porter unicode61')")
+        db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        db.execute("""CREATE TRIGGER IF NOT EXISTS messages_chunks_ad AFTER DELETE ON messages BEGIN
+                        DELETE FROM chunk_fts WHERE message_id = old.id;
+                      END""")
         db.execute("CREATE INDEX IF NOT EXISTS idx_messages_root ON messages(root_id, id)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_asks_open ON asks(to_identity, closed_epoch)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_asks_message ON asks(msg_id)")
@@ -279,10 +314,37 @@ class Board:
         except sqlite3.DatabaseError:
             pass
 
+    @staticmethod
+    def _chunks_missing(db):
+        marker = db.execute("SELECT value FROM meta WHERE key = 'chunks_max_id'").fetchone()
+        high = int(marker[0]) if marker else 0
+        if marker is None:
+            # A partially populated index without a marker is rebuilt once.
+            db.execute("DELETE FROM chunk_fts")
+        count = 0
+        for row in db.execute("SELECT id, text FROM messages WHERE id > ? ORDER BY id", (high,)):
+            chunks = list(message_chunks(row["text"], row["id"]))
+            db.executemany("INSERT INTO chunk_fts(body, message_id, para) VALUES (?,?,?)", chunks)
+            count += len(chunks)
+            high = row["id"]
+        db.execute("INSERT INTO meta(key, value) VALUES ('chunks_max_id', ?) "
+                   "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(high),))
+        return count
+
+    def chunks_missing(self):
+        """Index messages beyond the durable high-water mark; return chunks added."""
+        with self.cond, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self._chunks_missing(db)
+
     def reindex(self):
         with self.cond:
             with self._db() as db:
+                db.execute("BEGIN IMMEDIATE")
                 db.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+                db.execute("DELETE FROM chunk_fts")
+                db.execute("DELETE FROM meta WHERE key = 'chunks_max_id'")
+                self._chunks_missing(db)
         return self.count()
 
     def _db(self):
@@ -384,6 +446,7 @@ class Board:
                     (epoch, author, topic or "", text, reply_to, root_id, amends),
                 )
                 mid = cur.lastrowid
+                self._chunks_missing(db)
                 if ask_to is not None:
                     db.execute("INSERT INTO asks (msg_id, from_identity, to_identity, text, opened_epoch) "
                                "VALUES (?,?,?,?,?)", (mid, identity or author, ask_to, text, epoch))
@@ -633,17 +696,29 @@ class Board:
         return {"threads": out, "has_more": len(groups) > limit}
 
     def search(self, query, limit=20, with_snippet=True):
-        """Ranked search: bm25 order, with the matched terms highlighted."""
+        """Best paragraph per message in bm25 order, with a legacy fallback."""
         match = fts_query(query)
         if not match:
             return []
-        sql = ("SELECT m.*, bm25(messages_fts) AS rank"
-               + (", snippet(messages_fts, 0, '«', '»', '…', 14) AS snip" if with_snippet else "")
-               + " FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid"
-                 " WHERE messages_fts MATCH ? ORDER BY rank LIMIT ?")
         with self.cond:
             with self._db() as db:
-                rows = db.execute(sql, (match, limit)).fetchall()
+                chunks = db.execute("SELECT 1 FROM chunk_fts LIMIT 1").fetchone() is not None
+                table = "chunk_fts" if chunks else "messages_fts"
+                paragraph = "chunk_fts.para" if chunks else "NULL"
+                message_id = "chunk_fts.message_id" if chunks else "messages_fts.rowid"
+                sql = ("SELECT m.*, %s AS paragraph, bm25(%s) AS rank" % (paragraph, table)
+                       + (", snippet(%s, 0, '«', '»', '…', 14) AS snip" % table if with_snippet else "")
+                       + " FROM %s JOIN messages m ON m.id = %s" % (table, message_id)
+                       + " WHERE %s MATCH ? ORDER BY rank, m.id, paragraph" % table)
+                rows, seen = [], set()
+                # Limit messages after deduplication, so repeated hits in one
+                # message cannot crowd other messages out of the result page.
+                for row in db.execute(sql, (match,)):
+                    if row["id"] not in seen:
+                        rows.append(row)
+                        seen.add(row["id"])
+                        if len(rows) >= limit:
+                            break
                 files = self._files_for(db, {r["id"] for r in rows})
                 messages = self._ask_metadata(db, [self._row(r, files.get(r["id"])) for r in rows])
         out = []
@@ -651,6 +726,7 @@ class Board:
             if "snip" in r.keys():
                 msg["snippet"] = r["snip"]
             msg["rank"] = r["rank"]
+            msg["paragraph"] = r["paragraph"]
             out.append(msg)
         return out
 
@@ -1170,6 +1246,16 @@ async function uploadOne(file) {
   return (await r.json()).file.id;
 }
 
+function updateBodyHint() {
+  if ($('#send').disabled) return;
+  const count = Array.from($('#text').value.trim()).length;
+  $('#hint').textContent = count > 1200 && !$('#file').files.length
+    ? 'body is ' + count + ' chars with no attachment; post a short note and attach the document'
+    : '';
+}
+$('#text').addEventListener('input', updateBodyHint);
+$('#file').addEventListener('change', updateBodyHint);
+
 $('#composer').addEventListener('submit', async (e) => {
   e.preventDefault();
   const picked = Array.from($('#file').files || []);
@@ -1209,6 +1295,7 @@ $('#composer').addEventListener('submit', async (e) => {
     $('#hint').textContent = '';
   } finally {
     $('#send').disabled = false;
+    updateBodyHint();
   }
 });
 
@@ -1596,7 +1683,11 @@ def make_handler(board, key, name):
                 return self._err(409, str(exc))
             except ValueError as exc:
                 return self._err(400, str(exc))
-            self._send(201, {"message": msg, "id": msg["id"]})
+            response = {"message": msg, "id": msg["id"]}
+            warning = body_warning(text, file_ids)
+            if warning:
+                response["warning"] = warning
+            self._send(201, response)
 
     return Handler
 
@@ -1724,7 +1815,10 @@ def cmd_post(args):
     if status != 201:
         print("post failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
-    msg = json.loads(raw)["message"]
+    response = json.loads(raw)
+    if response.get("warning"):
+        print("warning: " + response["warning"], file=sys.stderr)
+    msg = response["message"]
     if msg.get("ask_id") is not None:
         print("posted #%d, ask %d opened for %s" % (msg["id"], msg["ask_id"], msg["ask_to"]))
     else:
@@ -2253,7 +2347,7 @@ def main(argv=None):
     p.add_argument("--data", default=None)
     p.set_defaults(func=cmd_prune)
 
-    p = sub.add_parser("reindex", help="rebuild the full-text search index")
+    p = sub.add_parser("reindex", help="rebuild the message and paragraph search indexes")
     p.add_argument("--data", default=None)
     p.set_defaults(func=cmd_reindex)
 

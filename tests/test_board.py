@@ -1139,5 +1139,218 @@ class PhaseTwoTest(unittest.TestCase):
         self.assertEqual(html.count("fetch('/api/delivery'"), 1)
 
 
+class PhaseThreeStorageTest(unittest.TestCase):
+    """Chunk migration and storage checks do not need a listening socket."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="agent-board-chunks-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    @staticmethod
+    def chunks(store):
+        with store._db() as db:
+            return [tuple(r) for r in db.execute(
+                "SELECT body, message_id, para FROM chunk_fts ORDER BY message_id, para")]
+
+    def test_chunk_backfill_runs_once(self):
+        for preexisting_chunks in (False, True):
+            with self.subTest(preexisting_chunks=preexisting_chunks):
+                path = os.path.join(self.tmp, str(preexisting_chunks), "v11.db")
+                os.makedirs(os.path.dirname(path))
+                with sqlite3.connect(path) as db:
+                    db.executescript("""
+                        CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            epoch REAL NOT NULL, author TEXT NOT NULL,
+                            topic TEXT NOT NULL DEFAULT '', text TEXT NOT NULL);
+                        CREATE VIRTUAL TABLE messages_fts USING fts5(text,
+                            content='messages', content_rowid='id', tokenize='porter unicode61');
+                    """)
+                    db.executemany("INSERT INTO messages(epoch, author, text) VALUES(1, 'old', ?)",
+                                   [("Archived narwhal paragraph with evidence.\n\n"
+                                     "Another archived paragraph with context.",), ("tiny",), ("",)])
+                    db.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+                    if preexisting_chunks:
+                        db.execute("CREATE VIRTUAL TABLE chunk_fts USING fts5("
+                                   "body, message_id UNINDEXED, para UNINDEXED, tokenize='porter unicode61')")
+                first = board.Board(path)
+                before = self.chunks(first)
+                self.assertEqual(len(before), 2)
+                self.assertEqual([r[2] for r in before], [0, 1])
+                self.assertEqual(first.search("narwhal")[0]["id"], 1)
+                with mock.patch.object(board, "message_chunks", wraps=board.message_chunks) as chunker:
+                    second = board.Board(path)
+                    self.assertEqual(second.chunks_missing(), 0)
+                    chunker.assert_not_called()
+                self.assertEqual(self.chunks(second), before)
+                with second._db() as db:
+                    self.assertEqual(db.execute("SELECT value FROM meta WHERE key='chunks_max_id'")
+                                     .fetchone()[0], "3")
+                new = second.post("new", "New narwhal evidence beyond the archive.")
+                self.assertEqual(new["id"], 4)
+                self.assertEqual(len(self.chunks(second)), 3)
+
+    def test_reindex_is_idempotent(self):
+        store = board.Board(os.path.join(self.tmp, "board.db"))
+        msg = store.post("tester", "Opening context for reindex verification.\n\n"
+                         "The platypus evidence belongs in the second paragraph.")
+        expected = self.chunks(store)
+        # Corrupt both indexes so the test proves that both are rebuilt.
+        with store._db() as db:
+            db.execute("DELETE FROM chunk_fts")
+            db.execute("INSERT INTO messages_fts(messages_fts) VALUES('delete-all')")
+            db.execute("UPDATE meta SET value='999' WHERE key='chunks_max_id'")
+        for _ in range(2):
+            self.assertEqual(store.reindex(), 1)
+            self.assertEqual(self.chunks(store), expected)
+            result = store.search("platypus")
+            self.assertEqual([(r["id"], r["paragraph"]) for r in result], [(msg["id"], 1)])
+            self.assertIn("«platypus»", result[0]["snippet"])
+            self.assertEqual(len(store.fetch(search="platypus")), 1)
+            with store._db() as db:
+                self.assertEqual(db.execute("SELECT value FROM meta WHERE key='chunks_max_id'")
+                                 .fetchone()[0], str(msg["id"]))
+
+    def test_chunk_boundaries_and_short_piece_filter(self):
+        first = "a" * 20
+        long = " ".join("word%03d" % n for n in range(350))
+        chunks = list(board.message_chunks("---\r\n \r\n" + first + "\r\n\r\n" + long, 7))
+        self.assertEqual(chunks[0], (first, 7, 0))
+        self.assertEqual([c[2] for c in chunks], list(range(len(chunks))))
+        self.assertTrue(all(20 <= len(c[0]) <= 1200 and c[1] == 7 for c in chunks))
+        self.assertEqual(" ".join(c[0] for c in chunks[1:]), long)
+        self.assertEqual([len(c[0]) for c in board.message_chunks("x" * 2500, 8)], [1200, 1200, 100])
+        self.assertEqual(list(board.message_chunks("short\n\n---\n\n", 9)), [])
+
+    def test_incremental_chunks_and_deletion(self):
+        store = board.Board(os.path.join(self.tmp, "board.db"))
+        original = store.post("tester", "Original echidna evidence before the amendment.")
+        with mock.patch.object(board, "message_chunks", wraps=board.message_chunks) as chunker:
+            amended = store.post("tester", "Corrected echidna evidence in a new message.", amends=original["id"])
+            self.assertEqual(chunker.call_count, 1)
+            self.assertEqual(chunker.call_args[0][1], amended["id"])
+        self.assertEqual(len(self.chunks(store)), 2)
+        self.assertEqual({r["id"] for r in store.search("echidna")}, {original["id"], amended["id"]})
+        with store._db() as db:
+            db.execute("DELETE FROM messages WHERE id = ?", (original["id"],))
+        self.assertEqual([c[1] for c in self.chunks(store)], [amended["id"]])
+
+
+class PhaseThreeTest(unittest.TestCase):
+    """Paragraph search and posting hints over HTTP on isolated boards."""
+
+    conn = BoardTest.conn
+    call = BoardTest.call
+    upload = BoardTest.upload
+    start_server = PhaseOneTest.start_server
+    setUp = PhaseOneTest.setUp
+    post = PhaseOneTest.post
+    cli = PhaseOneTest.cli
+    remote_cli = PhaseOneTest.remote_cli
+
+    def test_search_finds_paragraph_inside_a_long_message(self):
+        body = ("Openingcontext describes the initial background. " * 24 + "\n\n"
+                + "A separate paragraph supplies more background. " * 15 + "\n\n"
+                + "The iridescentaxolotl sentence records the distinctive middle claim.\n\n")
+        body += ("Closing context continues the supporting evidence. " * 60)[:4000 - len(body)]
+        self.assertEqual(len(body), 4000)
+        msg = self.post(body)
+        status, data = self.call("GET", "/api/search?q=iridescentaxolotl", key=KEY)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["count"], 1)
+        result = data["results"][0]
+        self.assertEqual(result["id"], msg["id"])
+        self.assertGreater(result["paragraph"], 0)
+        self.assertIn("«iridescentaxolotl»", result["snippet"])
+        self.assertNotIn("Openingcontext", result["snippet"])
+
+    def test_search_falls_back_when_chunks_empty(self):
+        msg = self.post("The fallbackpangolin remains searchable in the archive.")
+        with self.store._db() as db:
+            db.execute("DELETE FROM chunk_fts")
+        status, data = self.call("GET", "/api/search?q=fallbackpangolin", key=KEY)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["id"], msg["id"])
+        self.assertIn("«fallbackpangolin»", data["results"][0]["snippet"])
+        self.assertIsNone(data["results"][0]["paragraph"])
+        self.assertIn("rank", data["results"][0])
+
+    def test_search_deduplicates_before_limit_and_keeps_best_chunk(self):
+        first = self.post("quasarchunk " + "background " * 40 + "\n\n"
+                          + ("quasarchunk quasarchunk quasarchunk.\n\n" * 30).strip())
+        second = self.post("quasarchunk observations from a different message.")
+        self.post("quasarchunk evidence from one final message.")
+        status, data = self.call("GET", "/api/search?q=quasarchunk&limit=2", key=KEY)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["count"], 2)
+        self.assertEqual([m["id"] for m in data["results"]], [first["id"], second["id"]])
+        self.assertEqual(data["results"][0]["paragraph"], 1)
+        self.assertEqual(len({m["id"] for m in data["results"]}), 2)
+        self.assertEqual([m["rank"] for m in data["results"]], sorted(m["rank"] for m in data["results"]))
+        self.assertIn(first["id"], {m["id"] for m in self.store.search("quasarchunk", limit=3)})
+        with self.store._db() as db:
+            # Check the API's winner against every matching chunk, including ties.
+            for msg in data["results"]:
+                best = db.execute("SELECT message_id, para, bm25(chunk_fts) AS score FROM chunk_fts "
+                                  "WHERE chunk_fts MATCH ? ORDER BY score, message_id, para",
+                                  (board.fts_query("quasarchunk"),)).fetchall()
+                winner = next(r for r in best if r["message_id"] == msg["id"])
+                self.assertEqual((msg["paragraph"], msg["rank"]), (winner["para"], winner["score"]))
+        self.assertEqual(self.store.search("quasarchunk", limit=1)[0]["id"], data["results"][0]["id"])
+
+    def test_read_search_keeps_whole_message_filter(self):
+        msg = self.post("Firstparagraphterm has its own context.\n\nSecondparagraphterm lives separately.")
+        query = "firstparagraphterm%20secondparagraphterm"
+        data = self.call("GET", "/api/messages?search=" + query, key=KEY)[1]
+        self.assertEqual([m["id"] for m in data["messages"]], [msg["id"]])
+        self.assertEqual(self.call("GET", "/api/search?q=" + query, key=KEY)[1]["count"], 0)
+
+    def test_body_warning_only_without_attachment(self):
+        fid = self.upload("document.txt", b"attached artifact")[1]["file"]["id"]
+        for size, files, warned in ((3204, [], True), (4000, [], True), (3204, [fid], False),
+                                    (1200, [], False), (1201, [], True), (20, [], False)):
+            with self.subTest(size=size, files=files):
+                status, data = self.call("POST", "/api/messages", key=KEY,
+                                         body={"text": "a" * size, "files": files})
+                self.assertEqual(status, 201)
+                self.assertEqual("warning" in data, warned)
+                self.assertEqual(data["message"]["text"], "a" * size)
+                if warned:
+                    self.assertEqual(data["warning"], "body is %d chars with no attachment; "
+                                     "post a short note and attach the document" % size)
+
+    def test_post_and_amend_cli_print_body_warning(self):
+        text = "word " * 300
+        warning = "warning: body is %d chars with no attachment; post a short note and attach the document" % len(text.strip())
+
+        def warnings(stderr):
+            # The in-process server logs requests to stderr, so compare the
+            # warning lines only — an equality test on the whole stream passes
+            # under the sandbox's in-memory transport and fails on real sockets.
+            return [line for line in stderr.splitlines() if line.startswith("warning:")]
+
+        code, output, error = self.remote_cli("post", text)
+        self.assertEqual(code, 0)
+        self.assertEqual(warnings(error), [warning])
+        mid = output.strip().split("#")[-1]
+        code, _, error = self.remote_cli("amend", mid, text)
+        self.assertEqual(code, 0)
+        self.assertEqual(warnings(error), [warning])
+        fid = self.upload("document.txt", b"attached artifact")[1]["file"]["id"]
+        code, _, error = self.remote_cli("post", text, "--file", str(fid))
+        self.assertEqual(code, 0)
+        self.assertEqual(warnings(error), [])
+        self.assertEqual(warnings(self.remote_cli("post", "short note")[2]), [])
+
+    def test_web_body_warning_controls_are_served(self):
+        status, html = self.call("GET", "/")
+        self.assertEqual(status, 200)
+        for text in ("function updateBodyHint()", "count > 1200", "!$('#file').files.length",
+                     "Array.from($('#text').value.trim()).length", "post a short note and attach the document",
+                     "$('#text').addEventListener('input', updateBodyHint)",
+                     "$('#file').addEventListener('change', updateBodyHint)"):
+            self.assertIn(text, html)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
