@@ -850,5 +850,294 @@ class PhaseOneTest(unittest.TestCase):
             self.assertIn(text, html)
 
 
+class PhaseTwoTest(unittest.TestCase):
+    """Receipt and ask behavior over real HTTP, always on temporary boards."""
+
+    conn = BoardTest.conn
+    call = BoardTest.call
+    raw_get = BoardTest.raw_get
+    start_server = PhaseOneTest.start_server
+    post = PhaseOneTest.post
+    cli = PhaseOneTest.cli
+    remote_cli = PhaseOneTest.remote_cli
+
+    def setUp(self):
+        PhaseOneTest.setUp(self)
+        self.hamish_key = self.keys.add("hamish-hermes", "Hamish")
+
+    def receipt(self, mid, key=None):
+        status, data = self.call("POST", "/api/ack", key=key or self.identity_key, body={"id": mid})
+        self.assertEqual(status, 200, data)
+        return data
+
+    def delivery(self, key=None, peer=None):
+        path = "/api/delivery" + ("?peer=" + peer if peer else "")
+        status, data = self.call("GET", path, key=key or self.identity_key)
+        self.assertEqual(status, 200, data)
+        return data
+
+    def age_message(self, mid, seconds):
+        with self.store.cond, self.store._db() as db:
+            db.execute("UPDATE messages SET epoch = ? WHERE id = ?", (time.time() - seconds, mid))
+
+    def test_ack_requires_identity_and_is_monotonic(self):
+        self.assertEqual(self.call("POST", "/api/ack", key=KEY, body={"id": 1}),
+                         (400, {"error": "acks need an identity key"}))
+        self.assertEqual(self.call("POST", "/api/ack", body={"id": 1})[0], 401)
+        mid = self.post(author="hamish-hermes")["id"]
+        ack = self.receipt(mid)
+        self.assertEqual(ack["identity"], "will-hermes")
+        self.assertIn("ts", ack)
+        self.assertEqual(self.delivery()["me"]["state"], "ok")
+        self.assertEqual(self.receipt(0)["acked_id"], mid)
+        self.assertEqual(self.receipt(mid)["acked_id"], mid)
+
+    def test_delivery_unknown_fresh_and_behind(self):
+        self.assertEqual(self.delivery()["me"]["state"], "unknown")
+        self.receipt(0)
+        # A very old ack alone cannot make a new pending message late.
+        with self.store.cond, self.store._db() as db:
+            db.execute("UPDATE acks SET updated_epoch = ?", (time.time() - 10000,))
+        incoming = self.post(author="hamish-hermes")["id"]
+        own = self.post(key=self.identity_key)["id"]
+        me = self.delivery()["me"]
+        self.assertEqual(me["state"], "ok")
+        self.assertEqual(me["pending"], [incoming])
+        self.assertEqual(me["pending_count"], 1)
+        self.assertEqual(me["latest_from_peer"], incoming)
+        self.assertNotIn(own, me["pending"])
+        self.age_message(incoming, 650)
+        me = self.delivery()["me"]
+        self.assertEqual(me["state"], "behind")
+        self.assertGreater(me["age_seconds"], 600)
+        self.assertEqual(self.delivery()["grace_seconds"], 600)
+        with mock.patch.dict(os.environ, {"BOARD_ACK_GRACE": "900"}):
+            self.assertEqual(self.delivery()["me"]["state"], "ok")
+        self.receipt(incoming)
+        me = self.delivery()["me"]
+        self.assertEqual((me["pending"], me["pending_count"], me["age_seconds"], me["state"]), ([], 0, 0, "ok"))
+
+    def test_delivery_pending_cap_peer_filter_and_one_sided_receipts(self):
+        self.receipt(0)
+        # Populate through storage to keep this case independent of the IP rate limit.
+        ids = [self.store.post("hamish-hermes", "incoming")["id"] for _ in range(55)]
+        self.age_message(ids[0], 700)
+        data = self.delivery()
+        self.assertEqual(data["me"]["pending"], ids[:50])
+        self.assertEqual(data["me"]["pending_count"], 55)
+        self.assertEqual(data["me"]["latest_from_peer"], ids[-1])
+        self.assertEqual(data["peers"][0]["state"], "unknown")
+        # The peer's missing receipt remains unknown even after hours, never behind.
+        self.assertEqual(self.delivery(self.hamish_key, "will-hermes")["peers"][0]["state"], "behind")
+        self.assertEqual(self.delivery(self.hamish_key, "nobody")["peers"], [])
+        self.assertEqual(self.call("GET", "/api/delivery")[0], 401)
+
+    def test_delivery_grace_boundary_uses_pending_message_age(self):
+        mid = self.post(author="hamish-hermes")["id"]
+        self.receipt(0)
+        with self.store.cond, self.store._db() as db:
+            db.execute("UPDATE messages SET epoch = 1000 WHERE id = ?", (mid,))
+        with mock.patch.object(board.time, "time", return_value=1600):
+            me = self.delivery()["me"]
+            self.assertEqual((me["age_seconds"], me["state"]), (600, "ok"))
+        # Even a fresh receipt of an older id does not reset an existing gap.
+        self.receipt(0)
+        with mock.patch.object(board.time, "time", return_value=1601):
+            me = self.delivery()["me"]
+            self.assertEqual((me["age_seconds"], me["state"]), (601, "behind"))
+
+    def test_health_delivery_is_public_and_contains_no_message_text(self):
+        secret = "private message body must never be in public health"
+        mid = self.post(secret, author="hamish-hermes")["id"]
+        self.receipt(0)
+        self.age_message(mid, 700)
+        status, health = self.call("GET", "/api/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(health["delivery"], {"hamish-hermes": "unknown", "will-hermes": "behind"})
+        self.assertNotIn(secret, json.dumps(health))
+        self.keys._write([])
+        self.assertEqual(self.call("GET", "/api/health")[1]["delivery"], {})
+
+    def test_ack_validation_and_delivery_cli_exit_codes(self):
+        for value in (True, "1", 1.5, None, -1):
+            self.assertEqual(self.call("POST", "/api/ack", key=self.identity_key, body={"id": value})[0], 400)
+        self.assertEqual(self.call("POST", "/api/ack", key=self.identity_key,
+                                   body={"id": 0, "channel": 5})[0], 400)
+        code, out, _ = self.remote_cli("delivery", "--key", self.identity_key)
+        self.assertEqual(code, 2)
+        self.assertIn("unknown: hamish-hermes, will-hermes", out)
+        self.assertEqual(self.remote_cli("ack", "--id", "0", "--channel", "conduit", "--key", self.identity_key)[0], 0)
+        self.receipt(0, self.hamish_key)
+        self.assertEqual(self.remote_cli("delivery", "--key", self.identity_key)[0], 0)
+        mid = self.post(author="hamish-hermes")["id"]
+        self.age_message(mid, 700)
+        code, out, err = self.remote_cli("delivery", "--json", "--key", self.identity_key)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out)["me"]["state"], "behind")
+        self.assertIn("will-hermes", err)
+        self.receipt(mid)
+        self.keys.revoke("hamish-hermes")
+        code, out, _ = self.remote_cli("delivery", "--key", self.identity_key)
+        self.assertEqual(code, 0)
+        self.assertIn("will-hermes", out)
+        self.assertNotIn("hamish-hermes", out)
+
+    def test_ask_lifecycle_and_double_close_rolls_back_message(self):
+        msg = self.post("Can you check?", key=self.hamish_key, ask_to="will-hermes")
+        aid = msg["ask_id"]
+        self.assertIsInstance(aid, int)
+        self.assertIsNone(msg["answers_ask"])
+        status, data = self.call("GET", "/api/asks?state=open", key=KEY)
+        self.assertEqual(status, 200)
+        ask = data["asks"][0]
+        self.assertEqual((ask["msg_id"], ask["from"], ask["to"], ask["thread_id"]),
+                         (msg["id"], "hamish-hermes", "will-hermes", msg["id"]))
+        self.assertEqual(ask["state"], "open")
+        self.assertIsNone(ask["closed_ts"])
+        self.assertIsNone(ask["closed_by"])
+        self.assertGreaterEqual(ask["age_seconds"], 0)
+        answer = self.post("Checked", key=self.identity_key, answers=aid, reply_to=msg["id"])
+        self.assertEqual(answer["answers_ask"], aid)
+        self.assertEqual(self.call("GET", "/api/asks", key=KEY)[1]["count"], 0)
+        closed = self.call("GET", "/api/asks?state=closed", key=KEY)[1]["asks"][0]
+        self.assertEqual((closed["state"], closed["closed_by"]), ("closed", answer["id"]))
+        self.assertIsNotNone(closed["closed_ts"])
+        count = self.store.count()
+        self.assertEqual(self.call("POST", "/api/messages", key=KEY, body={"text": "again", "answers": aid}),
+                         (409, {"error": "ask %d is already closed by #%d" % (aid, answer["id"])}))
+        self.assertEqual(self.store.count(), count)
+        fetched = self.call("GET", "/api/messages", key=KEY)[1]["messages"]
+        self.assertEqual(fetched[0]["ask_state"], "closed")
+        self.assertEqual(fetched[1]["answers_ask"], aid)
+
+    def test_close_ask_with_existing_older_message_and_errors(self):
+        older = self.post("Already answered")["id"]
+        opened = self.post("Question", ask_to="will-hermes")
+        path = "/api/asks/%d/close" % opened["ask_id"]
+        for mid in (99999, True, "1", None):
+            self.assertEqual(self.call("POST", path, key=KEY, body={"msg_id": mid})[0], 400)
+        self.assertEqual(self.call("POST", "/api/asks/99999/close", key=KEY, body={"msg_id": older})[0], 400)
+        self.assertEqual(self.call("POST", path, body={"msg_id": older})[0], 401)
+        count = self.store.count()
+        status, data = self.call("POST", path, key=KEY, body={"msg_id": older})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["ask"]["closed_by"], older)
+        self.assertEqual(self.store.count(), count)
+        self.assertEqual(self.call("POST", path, key=KEY, body={"msg_id": older}),
+                         (409, {"error": "ask %d is already closed by #%d" % (opened["ask_id"], older)}))
+
+    def test_ask_validation_and_legacy_empty_ring(self):
+        for target in ("unknown", "", "  ", 42, None):
+            self.assertEqual(self.call("POST", "/api/messages", key=KEY,
+                                       body={"text": "Q", "ask_to": target})[0], 400)
+        for aid in (999, True, "1", None):
+            self.assertEqual(self.call("POST", "/api/messages", key=KEY,
+                                       body={"text": "A", "answers": aid})[0], 400)
+        self.assertEqual(self.store.count(), 0)
+        self.keys._write([])
+        msg = self.post("Legacy question", author="legacy-author", ask_to="new-peer")
+        ask = self.call("GET", "/api/asks", key=KEY)[1]["asks"][0]
+        self.assertEqual((ask["from"], ask["to"], ask["id"]), ("legacy-author", "new-peer", msg["ask_id"]))
+        self.assertEqual(self.call("GET", "/api/asks")[0], 401)
+
+    def test_ask_filters_order_limit_and_thread_counts(self):
+        root = self.post("root", ask_to="will-hermes")
+        reply = self.post("reply", key=self.identity_key, reply_to=root["id"], ask_to="hamish-hermes")
+        other = self.post("other", ask_to="will-hermes")
+        def counts():
+            return {t["root_id"]: t["open_asks"] for t in
+                    self.call("GET", "/api/messages/threads", key=KEY)[1]["threads"]}
+        self.assertEqual(counts(), {root["id"]: 2, other["id"]: 1})
+        both = self.post("answer and question", answers=root["ask_id"], ask_to="will-hermes", reply_to=root["id"])
+        self.assertEqual(both["answers_ask"], root["ask_id"])
+        self.assertIsNotNone(both["ask_id"])
+        self.assertEqual(counts(), {root["id"]: 2, other["id"]: 1})
+        data = self.call("GET", "/api/asks?limit=1", key=KEY)[1]
+        self.assertTrue(data["has_more"])
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["asks"][0]["id"], reply["ask_id"])
+        data = self.call("GET", "/api/asks?to=hamish-hermes&from=will-hermes", key=KEY)[1]
+        self.assertEqual([a["id"] for a in data["asks"]], [reply["ask_id"]])
+        self.assertEqual(data["asks"][0]["thread_id"], root["id"])
+        all_asks = self.call("GET", "/api/asks?state=all", key=KEY)[1]["asks"]
+        self.assertEqual([a["state"] for a in all_asks], ["open", "open", "open", "closed"])
+        for query in ("state=bad", "limit=oops"):
+            self.assertEqual(self.call("GET", "/api/asks?" + query, key=KEY)[0], 400)
+
+    def test_ask_markers_in_digest_markdown_and_search(self):
+        msg = self.post("Question zebrafish", ask_to="will-hermes")
+        aid = msg["ask_id"]
+        digest = self.call("GET", "/api/digest", key=KEY)[1]["text"]
+        self.assertTrue(digest.startswith("! #"))
+        self.assertIn("[ask→will-hermes]", digest)
+        md = self.raw_get("/api/messages.md")[1].decode()
+        self.assertIn("! ##", md)
+        self.assertIn("[ask→will-hermes]", md)
+        result = self.call("GET", "/api/search?q=zebrafish", key=KEY)[1]["results"][0]
+        self.assertEqual((result["ask_id"], result["ask_state"]), (aid, "open"))
+        self.post("Answer", answers=aid)
+        digest = self.call("GET", "/api/digest", key=KEY)[1]["text"]
+        self.assertFalse(digest.startswith("!"))
+        self.assertIn("[answers #%d]" % aid, digest)
+        self.assertIn("[answers #%d]" % aid, self.raw_get("/api/messages.md")[1].decode())
+
+    def test_concurrent_ask_closures_have_one_winner(self):
+        older = self.post("existing answer")["id"]
+        aid = self.post("question", ask_to="will-hermes")["ask_id"]
+        gate = threading.Barrier(3)
+        results = []
+        def close(path, payload):
+            gate.wait()
+            results.append(self.call("POST", path, key=KEY, body=payload))
+        workers = [threading.Thread(target=close, args=("/api/asks/%d/close" % aid, {"msg_id": older})),
+                   threading.Thread(target=close, args=("/api/messages", {"text": "new answer", "answers": aid}))]
+        for worker in workers:
+            worker.start()
+        gate.wait()
+        for worker in workers:
+            worker.join(10)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sum(status == 409 for status, _ in results), 1)
+        winner = next((status, data) for status, data in results if status != 409)
+        closed_by = older if winner[0] == 200 else winner[1]["id"]
+        ask = self.call("GET", "/api/asks?state=closed", key=KEY)[1]["asks"][0]
+        self.assertEqual(ask["closed_by"], closed_by)
+        self.assertEqual(self.store.count(), 2 if winner[0] == 200 else 3)
+
+    def test_ask_open_answer_cli_lifecycle_and_exit_codes(self):
+        note = os.path.join(self.tmp, "question.txt")
+        with open(note, "w", encoding="utf-8") as fh:
+            fh.write("Can you check this?")
+        self.assertEqual(self.remote_cli("open")[0], 1)
+        code, out, error = self.remote_cli("ask", "--to", "will-hermes", "--text-file", note, "--topic", "work")
+        self.assertEqual(code, 0, error)
+        self.assertIn("posted #1, ask 1 opened for will-hermes", out)
+        code, out, _ = self.remote_cli("open", "--to", "will-hermes", "--from", "hamish-hermes", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["asks"][0]["id"], 1)
+        older = self.post("existing answer")["id"]
+        self.assertEqual(self.remote_cli("answer", "1", "--msg", str(older))[0], 0)
+        self.assertEqual(self.remote_cli("open")[0], 1)
+        self.assertEqual(self.remote_cli("open", "--all")[0], 0)
+        self.assertEqual(self.remote_cli("answer", "1", "--msg", str(older))[0], 1)
+        code, out, error = self.remote_cli("post", "next question", "--ask-to", "will-hermes")
+        self.assertEqual(code, 0, error)
+        self.assertIn("ask 2 opened", out)
+        code, _, error = self.remote_cli("answer", "2", "--text-file", note, "--reply-to", "3")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(self.remote_cli("open")[0], 1)
+        self.assertEqual(self.remote_cli("post", "question", "--ask-to", "will-hermes")[0], 0)
+        self.assertEqual(self.remote_cli("post", "answer and next", "--answers", "3", "--ask-to", "will-hermes")[0], 0)
+        self.assertEqual(self.remote_cli("open")[0], 0)
+
+    def test_web_delivery_and_open_ask_controls_are_served(self):
+        status, html = self.call("GET", "/")
+        self.assertEqual(status, 200)
+        for text in ('id="delivery"', "delivery ok", "behind by ", "?→", "open asks", "ask_state === 'open'"):
+            self.assertIn(text, html)
+        self.assertEqual(html.count("fetch('/api/delivery'"), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

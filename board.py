@@ -140,6 +140,10 @@ def human_size(n):
 
 def structure_markers(msg):
     markers = []
+    if msg.get("ask_id") is not None:
+        markers.append("[ask→%s]" % msg["ask_to"])
+    if msg.get("answers_ask") is not None:
+        markers.extend("[answers #%d]" % aid for aid in msg.get("answers_asks", [msg["answers_ask"]]))
     if msg["reply_to"] is not None:
         markers.append("↳#%d" % msg["reply_to"])
     if msg["amends"] is not None:
@@ -153,6 +157,8 @@ def markdown_transcript(messages):
     lines = ["# agent-board transcript", ""]
     for msg in messages:
         head = "## #%d · %s · %s" % (msg["id"], msg["author"], msg["ts"])
+        if msg.get("ask_state") == "open":
+            head = "! " + head
         if msg["topic"]:
             head += " · [%s]" % msg["topic"]
         markers = structure_markers(msg).strip()
@@ -166,6 +172,10 @@ def markdown_transcript(messages):
         if msg["files"]:
             lines.append("")
     return "\n".join(lines)
+
+
+class AskClosed(ValueError):
+    pass
 
 
 class Board:
@@ -235,6 +245,8 @@ class Board:
                    "body, message_id UNINDEXED, para UNINDEXED, tokenize='porter unicode61')")
         db.execute("CREATE INDEX IF NOT EXISTS idx_messages_root ON messages(root_id, id)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_asks_open ON asks(to_identity, closed_epoch)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_asks_message ON asks(msg_id)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_asks_closed_by ON asks(closed_by)")
 
     def _ensure_fts(self, db):
         """Full-text index over message bodies, kept in sync by triggers.
@@ -304,7 +316,26 @@ class Board:
             "root_id": row["root_id"],
             "amends": row["amends"],
             "amended_by": row["amended_by"],
+            "ask_id": None, "answers_ask": None,
         }
+
+    def _ask_metadata(self, db, messages):
+        by_id = {m["id"]: m for m in messages}
+        if not by_id:
+            return messages
+        low, high = min(by_id), max(by_id)
+        rows = db.execute("SELECT * FROM asks WHERE msg_id BETWEEN ? AND ? "
+                          "OR closed_by BETWEEN ? AND ? ORDER BY id", (low, high, low, high))
+        for ask in rows:
+            if ask["msg_id"] in by_id:
+                by_id[ask["msg_id"]].update(ask_id=ask["id"], ask_to=ask["to_identity"],
+                                             ask_state="closed" if ask["closed_epoch"] is not None else "open")
+            if ask["closed_by"] in by_id:
+                msg = by_id[ask["closed_by"]]
+                msg.setdefault("answers_asks", []).append(ask["id"])
+                if msg["answers_ask"] is None:
+                    msg["answers_ask"] = ask["id"]
+        return messages
 
     def rate_ok(self, ip):
         with self.cond:
@@ -317,11 +348,14 @@ class Board:
             q.append(time.time())
             return True
 
-    def post(self, author, text, topic=None, file_ids=None, reply_to=None, amends=None):
+    def post(self, author, text, topic=None, file_ids=None, reply_to=None, amends=None,
+             ask_to=None, answers=None, identity=None):
         epoch = time.time()
         with self.cond:
             with self._db() as db:
                 db.execute("BEGIN IMMEDIATE")
+                if answers is not None:
+                    self._check_ask(db, answers)
                 root_id = None
                 for field, target in (("reply_to", reply_to), ("amends", amends)):
                     if target is None:
@@ -350,6 +384,12 @@ class Board:
                     (epoch, author, topic or "", text, reply_to, root_id, amends),
                 )
                 mid = cur.lastrowid
+                if ask_to is not None:
+                    db.execute("INSERT INTO asks (msg_id, from_identity, to_identity, text, opened_epoch) "
+                               "VALUES (?,?,?,?,?)", (mid, identity or author, ask_to, text, epoch))
+                if answers is not None:
+                    db.execute("UPDATE asks SET closed_epoch = ?, closed_by = ? WHERE id = ?",
+                               (epoch, mid, answers))
                 if amends is not None:
                     db.execute("UPDATE messages SET amended_by = ? WHERE id = ?", (mid, amends))
                 for fid in file_ids or []:
@@ -360,7 +400,83 @@ class Board:
             self.cond.notify_all()
             with self._db() as db:
                 linked = self._files_for(db, {mid}).get(mid, [])
-                return self._row(db.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone(), linked)
+                msg = self._row(db.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone(), linked)
+                return self._ask_metadata(db, [msg])[0]
+
+    @staticmethod
+    def _check_ask(db, aid):
+        if type(aid) is not int:
+            raise ValueError("ask id must be an integer")
+        ask = db.execute("SELECT * FROM asks WHERE id = ?", (aid,)).fetchone()
+        if ask is None:
+            raise ValueError("no such ask: %d" % aid)
+        if ask["closed_epoch"] is not None:
+            raise AskClosed("ask %d is already closed by #%d" % (aid, ask["closed_by"]))
+
+    def close_ask(self, aid, mid):
+        with self.cond, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._check_ask(db, aid)
+            if type(mid) is not int or not db.execute("SELECT 1 FROM messages WHERE id = ?", (mid,)).fetchone():
+                raise ValueError("msg_id must cite an existing message")
+            db.execute("UPDATE asks SET closed_epoch = ?, closed_by = ? WHERE id = ?",
+                       (time.time(), mid, aid))
+        return self.asks(state="closed", ask_id=aid)["asks"][0]
+
+    def asks(self, state="open", to=None, from_identity=None, limit=100, ask_id=None):
+        sql = ("SELECT a.*, COALESCE(m.root_id, a.msg_id) AS thread_id FROM asks a "
+               "LEFT JOIN messages m ON m.id = a.msg_id WHERE 1=1")
+        args = []
+        if state != "all":
+            sql += " AND a.closed_epoch IS " + ("NULL" if state == "open" else "NOT NULL")
+        for column, value in (("to_identity", to), ("from_identity", from_identity), ("id", ask_id)):
+            if value is not None:
+                sql += " AND a.%s = ?" % column
+                args.append(value)
+        sql += " ORDER BY a.closed_epoch IS NOT NULL, a.opened_epoch, a.id LIMIT ?"
+        args.append(limit + 1)
+        with self.cond, self._db() as db:
+            rows = db.execute(sql, args).fetchall()
+        now = time.time()
+        asks = [{"id": r["id"], "msg_id": r["msg_id"], "from": r["from_identity"],
+                 "to": r["to_identity"], "text": r["text"], "opened_ts": now_iso(r["opened_epoch"]),
+                 "closed_ts": now_iso(r["closed_epoch"]) if r["closed_epoch"] is not None else None,
+                 "closed_by": r["closed_by"], "state": "closed" if r["closed_epoch"] is not None else "open",
+                 "age_seconds": max(0, int((r["closed_epoch"] if r["closed_epoch"] is not None else now)
+                                           - r["opened_epoch"])), "thread_id": r["thread_id"]}
+                for r in rows[:limit]]
+        return {"asks": asks, "count": len(asks), "has_more": len(rows) > limit}
+
+    def ack(self, identity, mid):
+        with self.cond, self._db() as db:
+            db.execute("INSERT INTO acks (identity, acked_id, updated_epoch) VALUES (?,?,?) "
+                       "ON CONFLICT(identity) DO UPDATE SET "
+                       "acked_id = MAX(acks.acked_id, excluded.acked_id), updated_epoch = excluded.updated_epoch",
+                       (identity, mid, time.time()))
+            row = db.execute("SELECT * FROM acks WHERE identity = ?", (identity,)).fetchone()
+        return {"identity": identity, "acked_id": row["acked_id"], "ts": now_iso(row["updated_epoch"])}
+
+    def delivery(self, identities, me=None, peer=None):
+        grace = max(0, float(os.environ.get("BOARD_ACK_GRACE") or 600))
+        states = []
+        with self.cond, self._db() as db:
+            for identity in sorted(set(identities)):
+                ack = db.execute("SELECT * FROM acks WHERE identity = ?", (identity,)).fetchone()
+                acked = ack["acked_id"] if ack else 0
+                latest = db.execute("SELECT MAX(id) FROM messages WHERE author != ?", (identity,)).fetchone()[0] or 0
+                pending = db.execute("SELECT id FROM messages WHERE author != ? AND id > ? ORDER BY id LIMIT 50",
+                                     (identity, acked)).fetchall()
+                stats = db.execute("SELECT COUNT(*), MIN(epoch) FROM messages WHERE author != ? AND id > ?",
+                                   (identity, acked)).fetchone()
+                age = max(0, int(time.time() - stats[1])) if stats[1] is not None else 0
+                state = "unknown" if ack is None else "behind" if stats[0] and age > grace else "ok"
+                states.append({"identity": identity, "acked_id": acked if ack else None,
+                               "acked_ts": now_iso(ack["updated_epoch"]) if ack else None,
+                               "latest_from_peer": latest, "pending": [r["id"] for r in pending],
+                               "pending_count": stats[0], "age_seconds": age, "state": state})
+        return {"me": next((s for s in states if s["identity"] == me), None),
+                "peers": [s for s in states if s["identity"] != me and (peer is None or s["identity"] == peer)],
+                "grace_seconds": grace}
 
     # -- attachments ---------------------------------------------------
 
@@ -484,7 +600,7 @@ class Board:
             with self._db() as db:
                 rows = db.execute(sql, args).fetchall()
                 files = self._files_for(db, {r["id"] for r in rows})
-        out = [self._row(r, files.get(r["id"])) for r in rows]
+                out = self._ask_metadata(db, [self._row(r, files.get(r["id"])) for r in rows])
         return list(reversed(out)) if descending else out
 
     def threads(self, limit=20, before=None):
@@ -507,10 +623,13 @@ class Board:
                                          "WHERE id = ? OR root_id = ? ORDER BY author",
                                          (group["root"], group["root"])).fetchall()
                     subject = (root["topic"] or (root["text"].splitlines() or [""])[0][:80]) if root else ""
+                    open_asks = db.execute("SELECT COUNT(*) FROM asks a JOIN messages m ON m.id = a.msg_id "
+                                           "WHERE a.closed_epoch IS NULL AND COALESCE(m.root_id, m.id) = ?",
+                                           (group["root"],)).fetchone()[0]
                     out.append({"root_id": group["root"], "subject": subject,
                                 "messages": group["size"], "last_id": group["last_id"],
                                 "last_ts": now_iso(last["epoch"]),
-                                "authors": [r["author"] for r in authors], "open_asks": 0})
+                                "authors": [r["author"] for r in authors], "open_asks": open_asks})
         return {"threads": out, "has_more": len(groups) > limit}
 
     def search(self, query, limit=20, with_snippet=True):
@@ -526,9 +645,9 @@ class Board:
             with self._db() as db:
                 rows = db.execute(sql, (match, limit)).fetchall()
                 files = self._files_for(db, {r["id"] for r in rows})
+                messages = self._ask_metadata(db, [self._row(r, files.get(r["id"])) for r in rows])
         out = []
-        for r in rows:
-            msg = self._row(r, files.get(r["id"]))
+        for r, msg in zip(rows, messages):
             if "snip" in r.keys():
                 msg["snippet"] = r["snip"]
             msg["rank"] = r["rank"]
@@ -550,6 +669,8 @@ class Board:
             head = "#%d %s%s %s: " % (m["id"], m["author"],
                                       (" [%s]" % m["topic"]) if m["topic"] else "", m["ts"])
             head += structure_markers(m)
+            if m.get("ask_state") == "open":
+                head = "! " + head
             room = budget - used - len(head) - 1
             if room < 60:
                 break
@@ -765,7 +886,9 @@ body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-u
 header{position:sticky;top:0;backdrop-filter:blur(8px);background:inherit;
        border-bottom:1px solid #80808033;padding:12px 16px;display:flex;gap:10px;align-items:center}
 h1{font-size:15px;margin:0;letter-spacing:.02em}
-#status{margin-left:auto;font-size:12px;opacity:.6}
+#status-wrap{margin-left:auto;text-align:right;font-size:12px;opacity:.6}
+#delivery{display:block}
+.ask-chip{border:1px solid #80808040;border-radius:8px;padding:0 5px}
 #q{max-width:240px;font-size:13px}
 main{max-width:760px;margin:0 auto;padding:16px}
 .msg{border:1px solid #80808033;border-radius:10px;padding:10px 12px;margin:0 0 10px}
@@ -798,7 +921,7 @@ button:disabled{opacity:.5;cursor:default}
 <header><h1>agent-board</h1>
   <input id="q" placeholder="search the archive…" autocomplete="off">
   <button id="back-live" class="ghost" hidden>back to live</button>
-  <span id="status">connecting…</span></header>
+  <span id="status-wrap"><span id="status">connecting…</span><span id="delivery"></span></span></header>
 <main id="feed"><div class="empty">Loading…</div></main>
 <form id="composer" autocomplete="off">
   <div id="reply-chip" hidden>Replying to #<span id="reply-id"></span>
@@ -879,6 +1002,7 @@ function messageEl(m, bodyHtml) {
     '<a href="#thread/' + (m.root_id || m.id) + '">#' + m.id + '</a><span>' + fmt(m.ts) + '</span>' +
     (m.reply_to ? '<a href="#thread/' + (m.root_id || m.id) + '">↳ #' + m.reply_to + '</a>' : '') +
     (m.amended_by ? '<a href="#thread/' + (m.root_id || m.id) + '">amended → #' + m.amended_by + '</a>' : '') +
+    (m.ask_state === 'open' ? '<span class="ask-chip">?→' + esc(m.ask_to) + '</span>' : '') +
     '</div>' +
     '<div class="body">' + (bodyHtml || esc(m.text)) + '</div>';
   const body = el.querySelector('.body');
@@ -897,6 +1021,14 @@ function render(msgs) {
     if (glue) glue.remove();
   }
   for (const m of msgs) {
+    for (const aid of (m.answers_asks || [])) {
+      for (const old of feed.querySelectorAll('.msg')) {
+        if (old.message.ask_id === aid) {
+          old.message.ask_state = 'closed';
+          old.replaceWith(messageEl(old.message));
+        }
+      }
+    }
     if (m.amends) {
       const amended = $('#message-' + m.amends);
       if (amended) {
@@ -913,10 +1045,16 @@ function render(msgs) {
 
 async function poll() {
   while (true) {
-    if (mode !== 'live') { await new Promise(r => setTimeout(r, 500)); continue; }
     const version = viewVersion;
     pollController = new AbortController();
     try {
+      await refreshDelivery();
+      if (mode !== 'live') {
+        for (let tick = 0; tick < 50 && version === viewVersion; tick++) {
+          await new Promise(r => setTimeout(r, 500));
+        }
+        continue;
+      }
       const r = await fetch('/api/messages?since=' + lastId + '&wait=25&limit=200',
                             {headers: auth({}), signal: pollController.signal});
       if (version !== viewVersion) continue;
@@ -935,6 +1073,16 @@ async function poll() {
       await new Promise(r => setTimeout(r, 2000));
     }
   }
+}
+
+async function refreshDelivery() {
+  const r = await fetch('/api/delivery', {headers: auth({})});
+  if (!r.ok) { $('#delivery').textContent = 'delivery unavailable'; return; }
+  const data = await r.json();
+  const rows = [...(data.me ? [data.me] : []), ...data.peers];
+  const issues = rows.filter(s => s.state !== 'ok');
+  $('#delivery').textContent = issues.length ? 'delivery: ' + issues.map(s =>
+    s.identity + (s.state === 'behind' ? ' behind by ' + s.pending_count : ' unknown')).join(', ') : 'delivery ok';
 }
 
 function showLive() {
@@ -969,7 +1117,8 @@ async function route() {
     if (version !== viewVersion) return;
     feed.innerHTML = '';
     render(messages);
-    $('#status').textContent = 'thread #' + match[1];
+    $('#status').textContent = 'thread #' + match[1] + ' · ' +
+      messages.filter(m => m.ask_state === 'open').length + ' open asks';
   } catch (e) {
     if (version === viewVersion) feed.innerHTML = '<div class="empty">thread failed</div>';
   }
@@ -1133,6 +1282,13 @@ def make_handler(board, key, name):
             parsed = urllib.parse.urlparse(self.path)
             return urllib.parse.parse_qs(parsed.query), parsed.path
 
+        def _delivery(self, peer=None):
+            identities = {entry["identity"] for entry in keys.entries()}
+            me = getattr(self, "auth_identity", None)
+            if me is None and len(identities) == 1:
+                me = next(iter(identities))
+            return board.delivery(identities, me, peer)
+
         def _supplied_key(self, qs):
             if self.headers.get("X-Board-Key"):
                 return self.headers["X-Board-Key"].strip()
@@ -1214,6 +1370,8 @@ def make_handler(board, key, name):
                     "time": now_iso(time.time()),
                     "auth_required": keys.required(),
                     "public_read": board.public_read,
+                    "delivery": {row["identity"]: row["state"] for row in
+                                 board.delivery([e["identity"] for e in keys.entries()])["peers"]},
                 })
                 return
             if not self._authed(qs, write=False):
@@ -1224,6 +1382,18 @@ def make_handler(board, key, name):
                     return self._err(401, "board key required")
                 return self._send(200, {"identity": self.auth_identity,
                                         "unrestricted": self.auth_unrestricted})
+            if path == "/api/delivery":
+                return self._send(200, self._delivery((qs.get("peer") or [None])[0]))
+            if path == "/api/asks":
+                state = (qs.get("state") or ["open"])[0]
+                if state not in ("open", "closed", "all"):
+                    return self._err(400, "state must be open, closed or all")
+                try:
+                    limit = max(1, min(int((qs.get("limit") or ["100"])[0]), 1000))
+                except ValueError:
+                    return self._err(400, "limit must be an integer")
+                return self._send(200, board.asks(state, (qs.get("to") or [None])[0],
+                                                 (qs.get("from") or [None])[0], limit))
             if path == "/api/messages/threads":
                 try:
                     limit = max(1, min(int((qs.get("limit") or ["20"])[0]), 1000))
@@ -1348,7 +1518,8 @@ def make_handler(board, key, name):
                 return
 
             raw = self.rfile.read(length) if length else b""
-            if path != "/api/messages":
+            close_match = re.fullmatch(r"/api/asks/(\d+)/close", path)
+            if path not in ("/api/messages", "/api/ack") and not close_match:
                 self._err(404, "no such path: " + path)
                 return
             if not self._authed(qs, write=True):
@@ -1362,6 +1533,23 @@ def make_handler(board, key, name):
             if data is None:
                 self._err(400, "body must be a JSON object under %d bytes" % MAX_BODY)
                 return
+            if path == "/api/ack":
+                if self.auth_identity is None:
+                    return self._err(400, "acks need an identity key")
+                mid = data.get("id")
+                if type(mid) is not int or mid < 0:
+                    return self._err(400, "id must be a non-negative integer")
+                if "channel" in data and not isinstance(data["channel"], str):
+                    return self._err(400, "channel must be a string")
+                return self._send(200, board.ack(self.auth_identity, mid))
+            if close_match:
+                try:
+                    ask = board.close_ask(int(close_match[1]), data.get("msg_id"))
+                except AskClosed as exc:
+                    return self._err(409, str(exc))
+                except ValueError as exc:
+                    return self._err(400, str(exc))
+                return self._send(200, {"ask": ask})
             author = (str(data.get("author") or data.get("from") or "anonymous")).strip()[:MAX_AUTHOR] or "anonymous"
             identity = self.auth_identity
             if self.auth_known and not self.auth_unrestricted:
@@ -1391,9 +1579,21 @@ def make_handler(board, key, name):
                 self._err(400, "no such file id(s): %s" % ", ".join(str(m) for m in missing))
                 return
             topic = str(data.get("topic") or "").strip()[:MAX_TOPIC] if "topic" in data else None
+            ask_to = data.get("ask_to")
+            if "ask_to" in data:
+                identities = {entry["identity"] for entry in keys.entries()}
+                if not isinstance(ask_to, str) or not ask_to.strip():
+                    return self._err(400, "ask_to must be a non-empty identity string")
+                if identities and ask_to not in identities:
+                    return self._err(400, "ask_to must be a known identity")
+            if "answers" in data and type(data["answers"]) is not int:
+                return self._err(400, "answers must be an integer ask id")
             try:
                 msg = board.post(author, text, topic, file_ids,
-                                 data.get("reply_to"), data.get("amends"))
+                                 data.get("reply_to"), data.get("amends"), ask_to,
+                                 data.get("answers"), identity)
+            except AskClosed as exc:
+                return self._err(409, str(exc))
             except ValueError as exc:
                 return self._err(400, str(exc))
             self._send(201, {"message": msg, "id": msg["id"]})
@@ -1514,15 +1714,106 @@ def cmd_post(args):
         payload["reply_to"] = args.reply_to
     if args.amends is not None:
         payload["amends"] = args.amends
+    if args.ask_to is not None:
+        payload["ask_to"] = args.ask_to
+    if args.answers is not None:
+        payload["answers"] = args.answers
     if file_ids:
         payload["files"] = file_ids
     status, raw = request(base + "/api/messages", key, "POST", payload)
     if status != 201:
         print("post failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
-    mid = json.loads(raw)["id"]
-    print("posted #%s" % mid)
+    msg = json.loads(raw)["message"]
+    if msg.get("ask_id") is not None:
+        print("posted #%d, ask %d opened for %s" % (msg["id"], msg["ask_id"], msg["ask_to"]))
+    else:
+        print("posted #%d" % msg["id"])
     return 0
+
+
+def cmd_answer(args):
+    if args.msg is None:
+        return cmd_post(args)
+    base, key = client_config(args)
+    status, raw = request("%s/api/asks/%d/close" % (base, args.answers), key, "POST", {"msg_id": args.msg})
+    if status != 200:
+        print("close failed (%s): %s" % (status, raw), file=sys.stderr)
+        return 1
+    print("ask %d closed by #%d" % (args.answers, args.msg))
+    return 0
+
+
+def cmd_open(args):
+    base, key = client_config(args)
+    query = {"state": "all" if args.all else "open", "limit": 1000}
+    if args.to:
+        query["to"] = args.to
+    if args.from_identity:
+        query["from"] = args.from_identity
+    status, raw = request(base + "/api/asks?" + urllib.parse.urlencode(query), key)
+    if status != 200:
+        print("asks failed (%s): %s" % (status, raw), file=sys.stderr)
+        return 1
+    data = json.loads(raw)
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        for ask in data["asks"]:
+            print("ask %d  #%d  %s → %s  %s  %s" % (ask["id"], ask["msg_id"], ask["from"],
+                  ask["to"], ask["state"], " ".join(ask["text"].split())))
+        if not data["asks"]:
+            print("no asks")
+        if data["has_more"]:
+            print("more asks available (showing first 1000)")
+    return 0 if data["asks"] else 1
+
+
+def cmd_ack(args):
+    base, key = client_config(args)
+    payload = {"id": args.id}
+    if args.channel is not None:
+        payload["channel"] = args.channel
+    status, raw = request(base + "/api/ack", key, "POST", payload)
+    if status != 200:
+        print("ack failed (%s): %s" % (status, raw), file=sys.stderr)
+        return 1
+    ack = json.loads(raw)
+    print("%s acked through #%d at %s" % (ack["identity"], ack["acked_id"], ack["ts"]))
+    return 0
+
+
+def cmd_delivery(args):
+    base, key = client_config(args)
+    status, raw = request(base + "/api/delivery", key)
+    if status != 200:
+        print("delivery failed (%s): %s" % (status, raw), file=sys.stderr)
+        return 1
+    data = json.loads(raw)
+    if getattr(args, "state", False):
+        # One fixed word about THIS side's delivery only: a peer that has never
+        # acked is informational, not a fault on this machine, and a monitor that
+        # reported it would alarm forever. Exit 0 so a shell can inline it.
+        me = data.get("me")
+        print(me["state"] if me else "unknown")
+        return 0
+    rows = ([data["me"]] if data["me"] else []) + data["peers"]
+    behind = sorted(r["identity"] for r in rows if r["state"] == "behind")
+    unknown = sorted(r["identity"] for r in rows if r["state"] == "unknown")
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        print("identity                 acked  pending  state")
+        for row in rows:
+            print("%-24s %5s  %7d  %s" % (row["identity"],
+                  row["acked_id"] if row["acked_id"] is not None else "—", row["pending_count"], row["state"]))
+    verdict = []
+    if behind:
+        verdict.append("behind: " + ", ".join(behind))
+    if unknown:
+        verdict.append("unknown: " + ", ".join(unknown))
+    print("delivery " + ("; ".join(verdict) if verdict else "ok"), file=sys.stderr if args.json else sys.stdout)
+    return 1 if behind else 2 if unknown else 0
 
 
 def cmd_put(args):
@@ -1811,6 +2102,8 @@ def main(argv=None):
         p.add_argument("--author", default=os.environ.get("BOARD_AUTHOR") or None)
         p.add_argument("--topic", default=None)
         p.add_argument("--reply-to", type=int, default=None)
+        p.add_argument("--ask-to", default=None)
+        p.add_argument("--answers", type=int, default=None)
         p.add_argument("--file", action="append", metavar="ID",
                    help="attach an already-uploaded file id (repeatable)")
         p.add_argument("--attach", action="append", metavar="PATH",
@@ -1818,6 +2111,49 @@ def main(argv=None):
         p.add_argument("--url", default=None)
         p.add_argument("--key", default=None)
         p.set_defaults(func=cmd_post)
+
+    for command in ("ask", "answer"):
+        p = sub.add_parser(command, help="open an ask" if command == "ask" else "answer an ask")
+        p.set_defaults(text="", file=None, attach=None, amends=None, ask_to=None, answers=None,
+                       topic=None, author=os.environ.get("BOARD_AUTHOR") or None)
+        if command == "ask":
+            p.add_argument("--to", dest="ask_to", required=True)
+            p.add_argument("--text-file", required=True)
+            p.add_argument("--topic", default=None)
+            p.set_defaults(func=cmd_post)
+        else:
+            p.add_argument("answers", type=int)
+            source = p.add_mutually_exclusive_group(required=True)
+            source.add_argument("--text-file")
+            source.add_argument("--msg", type=int)
+            p.set_defaults(func=cmd_answer)
+        p.add_argument("--reply-to", type=int, default=None)
+        p.add_argument("--url", default=None)
+        p.add_argument("--key", default=None)
+
+    p = sub.add_parser("open", help="show the ask ledger")
+    p.add_argument("--to", default=None)
+    p.add_argument("--from", dest="from_identity", default=None)
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--url", default=None)
+    p.add_argument("--key", default=None)
+    p.set_defaults(func=cmd_open)
+
+    p = sub.add_parser("ack", help="record receipt through a message id")
+    p.add_argument("--id", type=int, required=True)
+    p.add_argument("--channel", default=None)
+    p.add_argument("--url", default=None)
+    p.add_argument("--key", default=None)
+    p.set_defaults(func=cmd_ack)
+
+    p = sub.add_parser("delivery", help="show delivery receipts and pending messages")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--state", action="store_true",
+                   help="print one word for THIS identity only (ok|behind|unknown), for monitors")
+    p.add_argument("--url", default=None)
+    p.add_argument("--key", default=None)
+    p.set_defaults(func=cmd_delivery)
 
     p = sub.add_parser("put", help="upload a file and get its id")
     p.add_argument("path")
