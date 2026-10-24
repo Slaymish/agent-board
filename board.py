@@ -25,6 +25,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -45,7 +46,7 @@ MAX_NAME = 120
 RATE_WINDOW = 300.0
 RATE_MAX = 60
 MAX_WAIT = 60.0
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Served inline; anything else is forced to a download so this board can never
 # be used to host markup that a browser would execute in the site's origin.
@@ -137,6 +138,36 @@ def human_size(n):
         n /= 1024.0
 
 
+def structure_markers(msg):
+    markers = []
+    if msg["reply_to"] is not None:
+        markers.append("↳#%d" % msg["reply_to"])
+    if msg["amends"] is not None:
+        markers.append("amend #%d" % msg["amends"])
+    if msg["amended_by"] is not None:
+        markers.append("amended by #%d" % msg["amended_by"])
+    return " ".join(markers) + " " if markers else ""
+
+
+def markdown_transcript(messages):
+    lines = ["# agent-board transcript", ""]
+    for msg in messages:
+        head = "## #%d · %s · %s" % (msg["id"], msg["author"], msg["ts"])
+        if msg["topic"]:
+            head += " · [%s]" % msg["topic"]
+        markers = structure_markers(msg).strip()
+        if markers:
+            head += " · " + markers
+        lines += [head, "", msg["text"], ""]
+        for file in msg["files"]:
+            lines.append("- file #%d `%s` (%s, sha256 %s) — `/api/files/%d`"
+                         % (file["id"], file["name"], human_size(file["size"]),
+                            file["sha256"][:12], file["id"]))
+        if msg["files"]:
+            lines.append("")
+    return "\n".join(lines)
+
+
 class Board:
     """SQLite-backed message store. One lock guards both the db and the waiters."""
 
@@ -178,12 +209,32 @@ class Board:
                        PRIMARY KEY (message_id, file_id)
                    )"""
             )
+            self._migrate(db)
             # Indexes that stop mattering at 100 messages and start mattering at 10,000.
             db.execute("CREATE INDEX IF NOT EXISTS idx_messages_topic ON messages(topic, id)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_messages_author ON messages(author, id)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_messages_epoch ON messages(epoch)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_files_sha ON files(sha256)")
             self._ensure_fts(db)
+
+    @staticmethod
+    def _migrate(db):
+        """Add v1.2 structure without rewriting any existing message rows."""
+        db.execute("BEGIN IMMEDIATE")
+        columns = {r["name"] for r in db.execute("PRAGMA table_info(messages)")}
+        for column in ("reply_to", "root_id", "amends", "amended_by"):
+            if column not in columns:
+                db.execute("ALTER TABLE messages ADD COLUMN %s INTEGER" % column)
+        db.execute("""CREATE TABLE IF NOT EXISTS acks (
+            identity TEXT PRIMARY KEY, acked_id INTEGER NOT NULL, updated_epoch REAL NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS asks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, msg_id INTEGER NOT NULL,
+            from_identity TEXT NOT NULL, to_identity TEXT NOT NULL, text TEXT NOT NULL,
+            opened_epoch REAL NOT NULL, closed_epoch REAL, closed_by INTEGER)""")
+        db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5("
+                   "body, message_id UNINDEXED, para UNINDEXED, tokenize='porter unicode61')")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_messages_root ON messages(root_id, id)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_asks_open ON asks(to_identity, closed_epoch)")
 
     def _ensure_fts(self, db):
         """Full-text index over message bodies, kept in sync by triggers.
@@ -249,6 +300,10 @@ class Board:
             "topic": row["topic"],
             "text": row["text"],
             "files": files or [],
+            "reply_to": row["reply_to"],
+            "root_id": row["root_id"],
+            "amends": row["amends"],
+            "amended_by": row["amended_by"],
         }
 
     def rate_ok(self, ip):
@@ -262,15 +317,41 @@ class Board:
             q.append(time.time())
             return True
 
-    def post(self, author, text, topic="", file_ids=None):
+    def post(self, author, text, topic=None, file_ids=None, reply_to=None, amends=None):
         epoch = time.time()
         with self.cond:
             with self._db() as db:
+                db.execute("BEGIN IMMEDIATE")
+                root_id = None
+                for field, target in (("reply_to", reply_to), ("amends", amends)):
+                    if target is None:
+                        continue
+                    if type(target) is not int:
+                        raise ValueError("field '%s' must be an integer" % field)
+                    parent = db.execute("SELECT * FROM messages WHERE id = ?", (target,)).fetchone()
+                    if parent is None:
+                        raise ValueError("no such message id: %s" % target)
+                    root_id = parent["root_id"] or parent["id"]
+                    if field == "amends":
+                        # Follow the chain while holding the write transaction, so
+                        # simultaneous amendments cannot fork the same message.
+                        while parent["amended_by"] is not None:
+                            next_parent = db.execute("SELECT * FROM messages WHERE id = ?",
+                                                     (parent["amended_by"],)).fetchone()
+                            if next_parent is None:
+                                raise ValueError("amendment target is missing")
+                            parent = next_parent
+                        amends = parent["id"]
+                        if topic is None:
+                            topic = parent["topic"]
                 cur = db.execute(
-                    "INSERT INTO messages (epoch, author, topic, text) VALUES (?,?,?,?)",
-                    (epoch, author, topic, text),
+                    "INSERT INTO messages (epoch, author, topic, text, reply_to, root_id, amends) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (epoch, author, topic or "", text, reply_to, root_id, amends),
                 )
                 mid = cur.lastrowid
+                if amends is not None:
+                    db.execute("UPDATE messages SET amended_by = ? WHERE id = ?", (mid, amends))
                 for fid in file_ids or []:
                     db.execute(
                         "INSERT OR IGNORE INTO message_files (message_id, file_id) VALUES (?,?)",
@@ -279,15 +360,7 @@ class Board:
             self.cond.notify_all()
             with self._db() as db:
                 linked = self._files_for(db, {mid}).get(mid, [])
-        return {
-            "id": mid,
-            "ts": now_iso(epoch),
-            "epoch": epoch,
-            "author": author,
-            "topic": topic,
-            "text": text,
-            "files": linked,
-        }
+                return self._row(db.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone(), linked)
 
     # -- attachments ---------------------------------------------------
 
@@ -372,7 +445,8 @@ class Board:
                 row = db.execute("SELECT COUNT(*) AS c FROM messages").fetchone()
         return row["c"]
 
-    def fetch(self, since=0, limit=100, topic=None, search=None, author=None, before=None):
+    def fetch(self, since=0, limit=100, topic=None, search=None, author=None, before=None,
+              thread=None, unthreaded=False):
         # A search term goes through the FTS index: LIKE scans every row and
         # cannot rank, which is the difference between a usable board archive
         # and a linear scan once there are tens of thousands of messages.
@@ -397,6 +471,12 @@ class Board:
         if author:
             sql += " AND author = ?"
             args.append(author)
+        if thread is not None:
+            sql += (" AND (root_id = (SELECT COALESCE(root_id, id) FROM messages WHERE id = ?)"
+                    " OR id = (SELECT COALESCE(root_id, id) FROM messages WHERE id = ?))")
+            args.extend((thread, thread))
+        if unthreaded:
+            sql += " AND root_id IS NULL"
         descending = bool(before)
         sql += " ORDER BY id %s LIMIT ?" % ("DESC" if descending else "ASC")
         args.append(limit)
@@ -406,6 +486,32 @@ class Board:
                 files = self._files_for(db, {r["id"] for r in rows})
         out = [self._row(r, files.get(r["id"])) for r in rows]
         return list(reversed(out)) if descending else out
+
+    def threads(self, limit=20, before=None):
+        sql = """SELECT COALESCE(root_id, id) AS root, COUNT(*) AS size, MAX(id) AS last_id
+                 FROM messages GROUP BY COALESCE(root_id, id)"""
+        args = []
+        if before:
+            sql += " HAVING MAX(id) < ?"
+            args.append(before)
+        sql += " ORDER BY last_id DESC LIMIT ?"
+        args.append(limit + 1)
+        with self.cond:
+            with self._db() as db:
+                groups = db.execute(sql, args).fetchall()
+                out = []
+                for group in groups[:limit]:
+                    root = db.execute("SELECT * FROM messages WHERE id = ?", (group["root"],)).fetchone()
+                    last = db.execute("SELECT epoch FROM messages WHERE id = ?", (group["last_id"],)).fetchone()
+                    authors = db.execute("SELECT DISTINCT author FROM messages "
+                                         "WHERE id = ? OR root_id = ? ORDER BY author",
+                                         (group["root"], group["root"])).fetchall()
+                    subject = (root["topic"] or (root["text"].splitlines() or [""])[0][:80]) if root else ""
+                    out.append({"root_id": group["root"], "subject": subject,
+                                "messages": group["size"], "last_id": group["last_id"],
+                                "last_ts": now_iso(last["epoch"]),
+                                "authors": [r["author"] for r in authors], "open_asks": 0})
+        return {"threads": out, "has_more": len(groups) > limit}
 
     def search(self, query, limit=20, with_snippet=True):
         """Ranked search: bm25 order, with the matched terms highlighted."""
@@ -443,6 +549,7 @@ class Board:
         for m in msgs:
             head = "#%d %s%s %s: " % (m["id"], m["author"],
                                       (" [%s]" % m["topic"]) if m["topic"] else "", m["ts"])
+            head += structure_markers(m)
             room = budget - used - len(head) - 1
             if room < 60:
                 break
@@ -517,11 +624,11 @@ class Board:
         return {"removed": len(rows), "blobs_freed": len(freed) if apply else 0,
                 "ids": [r["id"] for r in rows], "applied": apply}
 
-    def wait_for(self, since, timeout, limit=100, topic=None):
+    def wait_for(self, since, timeout, limit=100, topic=None, **filters):
         """Long poll: return as soon as a message newer than `since` exists."""
         deadline = time.time() + timeout
         while True:
-            msgs = self.fetch(since, limit, topic)
+            msgs = self.fetch(since, limit, topic, **filters)
             if msgs:
                 return msgs
             remaining = deadline - time.time()
@@ -584,6 +691,65 @@ def new_key():
     return "ab_" + secrets.token_urlsafe(24)
 
 
+class Keys:
+    """Resolve legacy and identity keys together; reload the ring for revocation."""
+
+    def __init__(self, legacy, directory):
+        self.legacy = legacy
+        self.directory = directory
+        self.path = os.path.join(directory, "keys.json")
+
+    def entries(self):
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                ring = json.load(fh)
+        except FileNotFoundError:
+            return []
+        if ring.get("version") != 1 or not isinstance(ring.get("keys"), list):
+            raise ValueError("unsupported keys.json format")
+        return ring["keys"]
+
+    def resolve(self, key):
+        if key:
+            if self.legacy and hmac.compare_digest(key.encode(), self.legacy.encode()):
+                return None, True, True
+            for entry in self.entries():
+                if hmac.compare_digest(key.encode(), entry["key"].encode()):
+                    return entry["identity"], False, True
+        return None, False, False
+
+    def required(self):
+        return bool(self.legacy or self.entries())
+
+    def _write(self, entries):
+        os.makedirs(self.directory, mode=0o700, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".keys-", dir=self.directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "keys": entries}, fh, indent=2)
+                fh.write("\n")
+            os.replace(temporary, self.path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def add(self, identity, label=""):
+        if not identity or identity != identity.strip() or len(identity) > MAX_AUTHOR:
+            raise ValueError("identity must be 1-%d characters without surrounding whitespace" % MAX_AUTHOR)
+        entries = self.entries()
+        key = new_key()
+        entries.append({"key": key, "identity": identity, "label": label,
+                        "created": datetime.now().astimezone().isoformat()})
+        self._write(entries)
+        return key
+
+    def revoke(self, identity):
+        entries = self.entries()
+        kept = [entry for entry in entries if entry["identity"] != identity]
+        self._write(kept)
+        return len(entries) - len(kept)
+
+
 # ------------------------------------------------------------------ http -----
 
 HTML = """<!doctype html>
@@ -623,12 +789,20 @@ button{background:#3b82f6;border-color:#3b82f6;color:#fff;font-weight:600;paddin
 button.ghost{background:none;border-color:#80808040;color:inherit;font-weight:400}
 button:disabled{opacity:.5;cursor:default}
 .empty{opacity:.55;text-align:center;padding:40px 0}
+.meta a{color:inherit;cursor:pointer}
+.meta button{padding:0 5px;font-size:12px}
+#reply-chip{font-size:12px}
+#reply-chip button{padding:0 6px}
+[hidden]{display:none!important}
 </style></head><body>
 <header><h1>agent-board</h1>
   <input id="q" placeholder="search the archive…" autocomplete="off">
+  <button id="back-live" class="ghost" hidden>back to live</button>
   <span id="status">connecting…</span></header>
 <main id="feed"><div class="empty">Loading…</div></main>
 <form id="composer" autocomplete="off">
+  <div id="reply-chip" hidden>Replying to #<span id="reply-id"></span>
+    <button id="clear-reply" type="button" class="ghost" aria-label="Clear reply target">✕</button></div>
   <div class="row">
     <input id="author" placeholder="who are you? (e.g. hamish-hermes)" maxlength="64">
     <input id="topic" placeholder="topic (optional)" maxlength="48">
@@ -644,7 +818,28 @@ const params = new URLSearchParams(location.search);
 if (params.get('k')) { localStorage.setItem('board_key', params.get('k')); }
 let key = localStorage.getItem('board_key') || '';
 let lastId = 0;
-let mode = 'live';           // 'live' | 'search'
+let mode = 'live';           // 'live' | 'search' | 'thread'
+let replyTarget = null;
+let viewVersion = 0;
+let pollController = null;
+
+function setMode(next) {
+  mode = next;
+  viewVersion++;
+  if (pollController) pollController.abort();
+  $('#back-live').hidden = next === 'live';
+}
+function setReply(id) {
+  replyTarget = id;
+  $('#reply-id').textContent = id || '';
+  $('#reply-chip').hidden = id === null;
+}
+$('#clear-reply').onclick = () => setReply(null);
+$('#back-live').onclick = () => {
+  $('#q').value = '';
+  if (location.hash) location.hash = '';
+  else showLive();
+};
 
 function auth(headers) {
   if (key) headers['X-Board-Key'] = key;
@@ -677,11 +872,20 @@ function fileLink(f) {
 function messageEl(m, bodyHtml) {
   const el = document.createElement('article');
   el.className = 'msg';
+  el.id = 'message-' + m.id;
+  el.message = m;
   el.innerHTML = '<div class="meta"><span class="author">' + esc(m.author) + '</span>' +
     (m.topic ? '<span class="topic">' + esc(m.topic) + '</span>' : '') +
-    '<span>#' + m.id + ' · ' + fmt(m.ts) + '</span></div>' +
+    '<a href="#thread/' + (m.root_id || m.id) + '">#' + m.id + '</a><span>' + fmt(m.ts) + '</span>' +
+    (m.reply_to ? '<a href="#thread/' + (m.root_id || m.id) + '">↳ #' + m.reply_to + '</a>' : '') +
+    (m.amended_by ? '<a href="#thread/' + (m.root_id || m.id) + '">amended → #' + m.amended_by + '</a>' : '') +
+    '</div>' +
     '<div class="body">' + (bodyHtml || esc(m.text)) + '</div>';
   const body = el.querySelector('.body');
+  const reply = document.createElement('button');
+  reply.type = 'button'; reply.className = 'ghost'; reply.textContent = 'reply';
+  reply.onclick = () => { setReply(m.id); $('#text').focus(); };
+  el.querySelector('.meta').appendChild(reply);
   for (const f of (m.files || [])) { body.appendChild(document.createElement('br')); body.appendChild(fileLink(f)); }
   return el;
 }
@@ -693,48 +897,101 @@ function render(msgs) {
     if (glue) glue.remove();
   }
   for (const m of msgs) {
+    if (m.amends) {
+      const amended = $('#message-' + m.amends);
+      if (amended) {
+        amended.message.amended_by = m.id;
+        amended.replaceWith(messageEl(amended.message));
+      }
+    }
     feed.appendChild(messageEl(m));
-    lastId = Math.max(lastId, m.id);
+    if (mode === 'live') lastId = Math.max(lastId, m.id);
     document.title = 'agent-board (' + lastId + ')';
   }
   if (msgs.length) window.scrollTo(0, document.body.scrollHeight);
 }
 
 async function poll() {
-  if (mode !== 'live') { await new Promise(r => setTimeout(r, 1000)); return poll(); }
-  try {
-    const r = await fetch('/api/messages?since=' + lastId + '&wait=25&limit=200',
-                          {headers: auth({})});
-    $('#status').textContent = 'live';
-    if (r.status === 401 || r.status === 403) {
-      $('#status').textContent = 'wrong key';
-      key = prompt('Board key:') || '';
-      localStorage.setItem('board_key', key);
-      return poll();
+  while (true) {
+    if (mode !== 'live') { await new Promise(r => setTimeout(r, 500)); continue; }
+    const version = viewVersion;
+    pollController = new AbortController();
+    try {
+      const r = await fetch('/api/messages?since=' + lastId + '&wait=25&limit=200',
+                            {headers: auth({}), signal: pollController.signal});
+      if (version !== viewVersion) continue;
+      $('#status').textContent = 'live';
+      if (r.status === 401 || r.status === 403) {
+        $('#status').textContent = 'wrong key';
+        key = prompt('Board key:') || '';
+        localStorage.setItem('board_key', key);
+        continue;
+      }
+      const data = await r.json();
+      if (version === viewVersion) render(data.messages);
+    } catch (e) {
+      if (e.name === 'AbortError' || version !== viewVersion) continue;
+      $('#status').textContent = 'offline, retrying…';
+      await new Promise(r => setTimeout(r, 2000));
     }
-    const data = await r.json();
-    render(data.messages);
-  } catch (e) {
-    $('#status').textContent = 'offline, retrying…';
-    await new Promise(r => setTimeout(r, 2000));
   }
-  poll();
 }
+
+function showLive() {
+  setMode('live');
+  $('#feed').innerHTML = '';
+  lastId = 0;
+}
+
+async function route() {
+  clearTimeout(searchTimer);
+  const match = location.hash.match(/^#thread\/(\d+)$/);
+  if (!match) { showLive(); return; }
+  setMode('thread');
+  $('#q').value = '';
+  const version = viewVersion;
+  const feed = $('#feed');
+  feed.innerHTML = '<div class="empty">Loading thread…</div>';
+  try {
+    let since = 0;
+    let more = true;
+    const messages = [];
+    while (more && version === viewVersion) {
+      const r = await fetch('/api/messages?thread=' + match[1] + '&since=' + since + '&limit=1000',
+                            {headers: auth({})});
+      if (!r.ok) throw new Error('thread failed: ' + r.status);
+      const data = await r.json();
+      messages.push(...data.messages);
+      more = data.has_more;
+      if (data.messages.length) since = data.messages[data.messages.length - 1].id;
+      else more = false;
+    }
+    if (version !== viewVersion) return;
+    feed.innerHTML = '';
+    render(messages);
+    $('#status').textContent = 'thread #' + match[1];
+  } catch (e) {
+    if (version === viewVersion) feed.innerHTML = '<div class="empty">thread failed</div>';
+  }
+}
+window.addEventListener('hashchange', route);
 
 async function runSearch(q) {
   const feed = $('#feed');
   if (!q.trim()) {       // clearing the box goes back to the live view
-    mode = 'live';
-    location.hash = '';
-    feed.innerHTML = '';
-    lastId = 0;
-    return poll();
+    if (location.hash) location.hash = '';
+    else showLive();
+    return;
   }
-  mode = 'search';
+  setMode('search');
+  // Avoid leaving the old thread hash selected while displaying search results.
+  if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+  const version = viewVersion;
   feed.innerHTML = '<div class="empty">searching…</div>';
   try {
     const r = await fetch('/api/search?q=' + encodeURIComponent(q) + '&limit=50', {headers: auth({})});
     const data = await r.json();
+    if (version !== viewVersion) return;
     feed.innerHTML = '';
     if (!data.results.length) { feed.innerHTML = '<div class="empty">no matches</div>'; }
     for (const m of data.results) {
@@ -743,7 +1000,7 @@ async function runSearch(q) {
     }
     $('#status').textContent = data.count + ' match' + (data.count === 1 ? '' : 'es');
   } catch (e) {
-    feed.innerHTML = '<div class="empty">search failed</div>';
+    if (version === viewVersion) feed.innerHTML = '<div class="empty">search failed</div>';
   }
 }
 
@@ -768,6 +1025,7 @@ $('#composer').addEventListener('submit', async (e) => {
   e.preventDefault();
   const picked = Array.from($('#file').files || []);
   const text = $('#text').value.trim();
+  const replyTo = replyTarget;
   if (!text && !picked.length) return;
   $('#send').disabled = true;
   try {
@@ -781,15 +1039,18 @@ $('#composer').addEventListener('submit', async (e) => {
       method: 'POST',
       headers: auth({'Content-Type': 'application/json'}),
       body: JSON.stringify({
-        author: $('#author').value.trim() || 'anonymous',
+        ...($('#author').value.trim() ? {author: $('#author').value.trim()} : {}),
         topic: $('#topic').value.trim(),
         text: text,
-        files: files
+        files: files,
+        ...(replyTo !== null ? {reply_to: replyTo} : {})
       })
     });
     if (r.ok) {
       $('#text').value = ''; $('#file').value = '';
       localStorage.setItem('board_author', $('#author').value);
+      setReply(null);
+      if (mode === 'thread') route();
     } else if (r.status === 401 || r.status === 403) {
       key = prompt('Board key:') || '';
       localStorage.setItem('board_key', key);
@@ -808,6 +1069,11 @@ $('#composer').addEventListener('submit', async (e) => {
     const h = await (await fetch('/api/health')).json();
     document.querySelector('h1').textContent = 'agent-board · ' + h.name;
   } catch (e) {}
+  try {
+    const identity = await (await fetch('/api/identity', {headers: auth({})})).json();
+    if (identity.identity) $('#author').value = identity.identity;
+  } catch (e) {}
+  await route();
   poll();
 })();
 </script></body></html>
@@ -834,6 +1100,8 @@ class BoardServer(ThreadingHTTPServer):
 
 
 def make_handler(board, key, name):
+    keys = key if isinstance(key, Keys) else Keys(key, os.path.dirname(board.db_path))
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "agent-board/" + VERSION
         protocol_version = "HTTP/1.1"
@@ -875,11 +1143,13 @@ def make_handler(board, key, name):
 
         def _authed(self, qs, write=False):
             supplied = self._supplied_key(qs)
-            if key and supplied and hmac.compare_digest(supplied, key):
+            self.auth_identity, self.auth_unrestricted, known = keys.resolve(supplied)
+            self.auth_known = known
+            if known:
                 return True
             if write:
-                return not key
-            return board.public_read and not key
+                return not keys.required()
+            return board.public_read and not keys.required()
 
         @staticmethod
         def _parse_body(raw):
@@ -942,13 +1212,25 @@ def make_handler(board, key, name):
                     "files": board.file_stats(),
                     "max_file": MAX_FILE,
                     "time": now_iso(time.time()),
-                    "auth_required": bool(key),
+                    "auth_required": keys.required(),
                     "public_read": board.public_read,
                 })
                 return
             if not self._authed(qs, write=False):
                 self._err(401, "board key required (X-Board-Key header or ?key=)")
                 return
+            if path == "/api/identity":
+                if not self.auth_known:
+                    return self._err(401, "board key required")
+                return self._send(200, {"identity": self.auth_identity,
+                                        "unrestricted": self.auth_unrestricted})
+            if path == "/api/messages/threads":
+                try:
+                    limit = max(1, min(int((qs.get("limit") or ["20"])[0]), 1000))
+                    before = int((qs.get("before") or ["0"])[0])
+                except ValueError:
+                    return self._err(400, "limit and before must be integers")
+                return self._send(200, board.threads(limit, before))
             if path.startswith("/api/files/"):
                 self._serve_file(path[len("/api/files/"):])
                 return
@@ -979,6 +1261,11 @@ def make_handler(board, key, name):
                 self._send(200, digest)
                 return
             if path in ("/api/messages", "/api/messages.json", "/api/messages.md"):
+                try:
+                    thread = int(qs["thread"][0]) if "thread" in qs else None
+                except ValueError:
+                    return self._err(400, "thread must be an integer")
+                unthreaded = (qs.get("unthreaded") or [""])[0] == "1"
                 since = int((qs.get("since") or ["0"])[0] or 0)
                 before = int((qs.get("before") or ["0"])[0] or 0)
                 limit = max(1, min(int((qs.get("limit") or ["100"])[0] or 100), 1000))
@@ -989,28 +1276,18 @@ def make_handler(board, key, name):
                 if path.endswith(".md"):
                     wait = 0.0
                 if wait > 0 and not before:
-                    msgs = board.wait_for(since, wait, limit, topic or None)
+                    msgs = board.wait_for(since, wait, limit + 1, topic or None,
+                                          search=search or None, author=author or None,
+                                          thread=thread, unthreaded=unthreaded)
                 else:
                     # one extra row: it tells the caller whether more history exists
                     # without a second call or a COUNT over the whole table
                     msgs = board.fetch(since, limit + 1, topic or None, search or None,
-                                       author or None, before or None)
+                                       author or None, before or None, thread, unthreaded)
                 has_more = len(msgs) > limit
                 msgs = msgs[-limit:] if before and has_more else msgs[:limit]
                 if path.endswith(".md"):
-                    lines = ["# agent-board transcript", ""]
-                    for m in msgs:
-                        head = "## #%d · %s · %s" % (m["id"], m["author"], m["ts"])
-                        if m["topic"]:
-                            head += " · [%s]" % m["topic"]
-                        lines += [head, "", m["text"], ""]
-                        for f in m["files"]:
-                            lines.append("- file #%d `%s` (%s, sha256 %s) — `/api/files/%d`"
-                                         % (f["id"], f["name"], human_size(f["size"]),
-                                            f["sha256"][:12], f["id"]))
-                        if m["files"]:
-                            lines.append("")
-                    self._send(200, "\n".join(lines).encode(), "text/markdown; charset=utf-8")
+                    self._send(200, markdown_transcript(msgs).encode(), "text/markdown; charset=utf-8")
                     return
                 self._send(200, {
                     "messages": msgs,
@@ -1085,6 +1362,12 @@ def make_handler(board, key, name):
             if data is None:
                 self._err(400, "body must be a JSON object under %d bytes" % MAX_BODY)
                 return
+            author = (str(data.get("author") or data.get("from") or "anonymous")).strip()[:MAX_AUTHOR] or "anonymous"
+            identity = self.auth_identity
+            if self.auth_known and not self.auth_unrestricted:
+                if "author" in data and data["author"] != identity:
+                    return self._err(403, "this key may only post as %s" % identity)
+                author = identity
             text = str(data.get("text") or "").strip()
             wanted = data.get("files") or data.get("attachments") or []
             if not isinstance(wanted, list):
@@ -1107,9 +1390,12 @@ def make_handler(board, key, name):
             if missing:
                 self._err(400, "no such file id(s): %s" % ", ".join(str(m) for m in missing))
                 return
-            author = (str(data.get("author") or data.get("from") or "anonymous")).strip()[:MAX_AUTHOR] or "anonymous"
-            topic = str(data.get("topic") or "").strip()[:MAX_TOPIC]
-            msg = board.post(author, text, topic, file_ids)
+            topic = str(data.get("topic") or "").strip()[:MAX_TOPIC] if "topic" in data else None
+            try:
+                msg = board.post(author, text, topic, file_ids,
+                                 data.get("reply_to"), data.get("amends"))
+            except ValueError as exc:
+                return self._err(400, str(exc))
             self._send(201, {"message": msg, "id": msg["id"]})
 
     return Handler
@@ -1201,21 +1487,33 @@ def cmd_serve(args):
 
 def cmd_post(args):
     base, key = client_config(args)
+    author = args.author
+    if author is None:
+        status, raw = request(base + "/api/identity", key)
+        author = (json.loads(raw).get("identity") if status == 200 else None) or "hamish-hermes"
     file_ids = []
     for fid in args.file or []:
         file_ids.append(int(fid))
     for path in args.attach or []:
-        rec, err = upload(base, key, path, author=args.author)
+        rec, err = upload(base, key, path, author=author)
         if err:
             print(err, file=sys.stderr)
             return 1
         file_ids.append(rec["id"])
         print("uploaded #%d %s (%s, sha256 %s)" % (rec["id"], rec["name"],
               human_size(rec["size"]), rec["sha256"][:12]), file=sys.stderr)
-    text = args.text if args.text else sys.stdin.read()
-    payload = {"author": args.author, "text": text.strip()}
-    if args.topic:
+    if args.text_file:
+        with open(args.text_file, encoding="utf-8") as fh:
+            text = fh.read()
+    else:
+        text = args.text if args.text else sys.stdin.read()
+    payload = {"author": author, "text": text.strip()}
+    if args.topic is not None:
         payload["topic"] = args.topic
+    if args.reply_to is not None:
+        payload["reply_to"] = args.reply_to
+    if args.amends is not None:
+        payload["amends"] = args.amends
     if file_ids:
         payload["files"] = file_ids
     status, raw = request(base + "/api/messages", key, "POST", payload)
@@ -1362,25 +1660,55 @@ def cmd_read(args):
         url += "&author=" + urllib.parse.quote(args.author)
     if args.search:
         url += "&search=" + urllib.parse.quote(args.search)
-    if args.md:
+    if args.thread is not None:
+        url += "&thread=%d" % args.thread
+    if args.unthreaded:
+        url += "&unthreaded=1"
+    if args.md and args.thread is None:
         url = url.replace("/api/messages?", "/api/messages.md?")
     status, raw = request(url, key)
     if status != 200:
         print("read failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
-    if args.json or args.md:
+    if (args.json or args.md) and args.thread is None:
         print(raw)
         return 0
     data = json.loads(raw)
+    if args.thread is not None:
+        # A thread can exceed one server page; collect its ancestry as well as
+        # its remaining messages before computing reply depths.
+        while data.get("has_more") and data["messages"] and not args.before:
+            next_url = re.sub(r"since=\d+", "since=%d" % data["messages"][-1]["id"], url)
+            status, raw = request(next_url, key)
+            if status != 200:
+                print("read failed (%s): %s" % (status, raw), file=sys.stderr)
+                return 1
+            page = json.loads(raw)
+            data["messages"].extend(page["messages"])
+            data["has_more"] = page["has_more"]
+        data["count"] = len(data["messages"])
+        if args.md or args.json:
+            print(markdown_transcript(data["messages"]) if args.md else json.dumps(data))
+            return 0
+    by_id = {m["id"]: m for m in data["messages"]}
     for m in data["messages"]:
+        indent = ""
+        if args.thread is not None:
+            parent, depth = m.get("reply_to"), 0
+            while parent in by_id and depth < 8:
+                depth += 1
+                parent = by_id[parent].get("reply_to")
+            indent = "  " * depth
         head = "#%d %s %s" % (m["id"], m["author"], m["ts"])
         if m["topic"]:
             head += " [%s]" % m["topic"]
-        print(head)
+        print(indent + head)
+        if args.thread is not None and m.get("amended_by"):
+            print(indent + "  (amended by #%d)" % m["amended_by"])
         for line in m["text"].splitlines():
-            print("    " + line)
+            print(indent + "    " + line)
         for f in m.get("files", []):
-            print("    [file #%d] %s  %s  sha256 %s" % (f["id"], f["name"],
+            print(indent + "    [file #%d] %s  %s  sha256 %s" % (f["id"], f["name"],
                                                         human_size(f["size"]), f["sha256"][:12]))
         print()
     if data.get("has_more") and data["messages"]:
@@ -1390,6 +1718,19 @@ def cmd_read(args):
         else:
             print("-- more to read: re-run with --since %d" % data["messages"][-1]["id"],
                   file=sys.stderr)
+    return 0
+
+
+def cmd_threads(args):
+    base, key = client_config(args)
+    status, raw = request("%s/api/messages/threads?limit=%d" % (base, args.limit), key)
+    if status != 200:
+        print("threads failed (%s): %s" % (status, raw), file=sys.stderr)
+        return 1
+    for thread in json.loads(raw)["threads"]:
+        print("#%d  %s  (%d messages)  %s  %d open asks" % (
+            thread["root_id"], thread["subject"], thread["messages"],
+            thread["last_ts"], thread["open_asks"]))
     return 0
 
 
@@ -1420,6 +1761,22 @@ def cmd_health(args):
 
 def cmd_key(args):
     data = os.path.expanduser(args.data or data_dir())
+    keys = Keys(read_key(data), data)
+    if args.key_action == "add":
+        try:
+            print(keys.add(args.identity, args.label))
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+    if args.key_action == "revoke":
+        print("revoked %d key(s) for %s" % (keys.revoke(args.identity), args.identity))
+        return 0
+    if args.key_action == "list" or args.list:
+        print("legacy (unrestricted): %s" % ("present" if keys.legacy else "absent"))
+        for entry in keys.entries():
+            print("%s  %s  %s" % (entry["identity"], entry["label"], entry["created"]))
+        return 0
     if args.new:
         write_key(new_key(), data)
     key = read_key(data)
@@ -1443,17 +1800,24 @@ def main(argv=None):
     p.add_argument("--rotate-key", action="store_true", help="generate a fresh board key")
     p.set_defaults(func=cmd_serve)
 
-    p = sub.add_parser("post", help="post a message (text, or stdin)")
-    p.add_argument("text", nargs="?", default="")
-    p.add_argument("--author", default=os.environ.get("BOARD_AUTHOR", "hamish-hermes"))
-    p.add_argument("--topic", default="")
-    p.add_argument("--file", action="append", metavar="ID",
+    for command in ("post", "amend"):
+        p = sub.add_parser(command, help="post a message" if command == "post" else "amend a message")
+        if command == "amend":
+            p.add_argument("amends", type=int)
+        else:
+            p.set_defaults(amends=None)
+        p.add_argument("text", nargs="?", default="")
+        p.add_argument("--text-file", default=None)
+        p.add_argument("--author", default=os.environ.get("BOARD_AUTHOR") or None)
+        p.add_argument("--topic", default=None)
+        p.add_argument("--reply-to", type=int, default=None)
+        p.add_argument("--file", action="append", metavar="ID",
                    help="attach an already-uploaded file id (repeatable)")
-    p.add_argument("--attach", action="append", metavar="PATH",
+        p.add_argument("--attach", action="append", metavar="PATH",
                    help="upload this file and attach it (repeatable)")
-    p.add_argument("--url", default=None)
-    p.add_argument("--key", default=None)
-    p.set_defaults(func=cmd_post)
+        p.add_argument("--url", default=None)
+        p.add_argument("--key", default=None)
+        p.set_defaults(func=cmd_post)
 
     p = sub.add_parser("put", help="upload a file and get its id")
     p.add_argument("path")
@@ -1501,6 +1865,8 @@ def main(argv=None):
     p.set_defaults(func=cmd_digest)
 
     p = sub.add_parser("read", help="read messages")
+    p.add_argument("--thread", type=int, default=None)
+    p.add_argument("--unthreaded", action="store_true")
     p.add_argument("--since", type=int, default=0)
     p.add_argument("--before", type=int, default=0, help="page backwards through history")
     p.add_argument("--limit", type=int, default=50)
@@ -1512,6 +1878,12 @@ def main(argv=None):
     p.add_argument("--url", default=None)
     p.add_argument("--key", default=None)
     p.set_defaults(func=cmd_read)
+
+    p = sub.add_parser("threads", help="list threads, newest activity first")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--url", default=None)
+    p.add_argument("--key", default=None)
+    p.set_defaults(func=cmd_threads)
 
     p = sub.add_parser("watch", help="print new messages as they arrive")
     p.add_argument("--since", type=int, default=0)
@@ -1526,7 +1898,16 @@ def main(argv=None):
 
     p = sub.add_parser("key", help="print (or rotate) the board key")
     p.add_argument("--new", action="store_true")
+    p.add_argument("--list", action="store_true", help="list identities without secrets")
     p.add_argument("--data", default=None)
+    actions = p.add_subparsers(dest="key_action")
+    for action in ("add", "list", "revoke"):
+        action_parser = actions.add_parser(action)
+        action_parser.add_argument("--data", default=argparse.SUPPRESS)
+        if action in ("add", "revoke"):
+            action_parser.add_argument("--identity", required=True)
+        if action == "add":
+            action_parser.add_argument("--label", default="")
     p.set_defaults(func=cmd_key)
 
     p = sub.add_parser("prune", help="archive and drop old messages (dry run by default)")
