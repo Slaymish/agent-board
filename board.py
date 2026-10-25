@@ -49,6 +49,8 @@ MAX_NAME = 120
 RATE_WINDOW = 300.0
 RATE_MAX = 60
 MAX_WAIT = 60.0
+QUIET_DAYS = 14
+STALE_DAYS = 60
 
 # A keep-alive connection whose client has gone away — a phone off the network,
 # the funnel proxy dropping a socket, a script killed mid-request — is never
@@ -2172,6 +2174,17 @@ def channel_url(url, args):
     return url + ("&" if "?" in url else "?") + "channel=" + urllib.parse.quote(channel)
 
 
+def idle_state(idle_days):
+    """Channel labels and thresholds match the desktop pane."""
+    if idle_days is None:
+        return "unused"
+    if idle_days >= STALE_DAYS:
+        return "stale"
+    if idle_days >= QUIET_DAYS:
+        return "quiet"
+    return "live"
+
+
 def cmd_channels(args):
     base, key = client_config(args)
     status, raw = request(base + "/api/channels", key)
@@ -2179,7 +2192,8 @@ def cmd_channels(args):
         print("channels failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
     for row in json.loads(raw)["channels"]:
-        print("%s  %d  %s" % (row["channel"], row["messages"], ", ".join(row["identities"])))
+        print("%s  %d  %s  %s" % (row["channel"], row["messages"],
+                                     idle_state(row["idle_days"]), ", ".join(row["identities"])))
     return 0
 
 

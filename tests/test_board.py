@@ -7,6 +7,7 @@ throwaway port and data directory, then drives it over real HTTP.
 """
 
 import hashlib
+import ast
 import contextlib
 import http.client
 import importlib.util
@@ -1708,8 +1709,8 @@ class ChannelAPITest(unittest.TestCase):
             self.assertIn(field, data)
         code, out, error = self.remote_cli("channels", "--key", self.owner)
         self.assertEqual(code, 0, error)
-        self.assertIn("private  1  hamish-hermes, other", out)
-        self.assertIn("will  1  hamish-hermes, legacy, other, will-hermes", out)
+        self.assertIn("private  1  live  hamish-hermes, other", out)
+        self.assertIn("will  1  live  hamish-hermes, legacy, other, will-hermes", out)
         for secret in (KEY, self.owner, self.peer, self.multi):
             self.assertNotIn(secret, out)
         code, out, _ = self.remote_cli("channels", "--key", self.peer)
@@ -1719,6 +1720,25 @@ class ChannelAPITest(unittest.TestCase):
         self.post(key=self.owner, channel="future")
         self.assertIn("future", self.remote_cli("channels", "--key", self.owner)[1])
         self.assertNotIn("house", self.call("GET", "/api/health")[1]["channels"])
+
+    def test_channels_cli_idle_states_match_desktop_boundaries(self):
+        # Read the pane's constants without importing its separate dependencies.
+        with open(os.path.join(HERE, "..", "plugin", "dashboard", "plugin_api.py")) as fh:
+            tree = ast.parse(fh.read())
+        pane = {node.targets[0].id: ast.literal_eval(node.value) for node in tree.body
+                if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in ("QUIET_DAYS", "STALE_DAYS")}
+        self.assertEqual((board.QUIET_DAYS, board.STALE_DAYS), (pane["QUIET_DAYS"], pane["STALE_DAYS"]))
+        for idle, expected in ((None, "unused"), (0, "live"), (13.9, "live"),
+                               (14, "quiet"), (59.9, "quiet"), (60, "stale"), (90, "stale")):
+            with self.subTest(idle=idle):
+                rows = [{"channel": "room", "messages": 0 if idle is None else 71,
+                         "idle_days": idle, "identities": ["hamish-hermes", "legacy", "will-hermes"]}]
+                with mock.patch.object(board, "request", return_value=(200, json.dumps({"channels": rows}))), \
+                     contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(board.main(["channels", "--url", "http://unused", "--key", KEY]), 0)
+                self.assertEqual(out.getvalue(), "room  %d  %s  hamish-hermes, legacy, will-hermes\n" %
+                                 (rows[0]["messages"], expected))
 
     def test_cli_channel_flags_text_file_and_key_membership_round_trips(self):
         note = os.path.join(self.tmp, "note.txt")
