@@ -544,7 +544,7 @@ class PhaseOneTest(unittest.TestCase):
             tables = {r["name"] for r in db.execute("SELECT name FROM sqlite_master")}
             self.assertTrue({"acks", "asks", "chunk_fts", "idx_messages_root", "idx_asks_open"} <= tables)
             self.assertEqual([r["name"] for r in db.execute("PRAGMA table_info(acks)")],
-                             ["identity", "acked_id", "updated_epoch"])
+                             ["identity", "channel", "acked_id", "updated_epoch"])
             self.assertEqual([r["name"] for r in db.execute("PRAGMA table_info(asks)")],
                              ["id", "msg_id", "from_identity", "to_identity", "text",
                               "opened_epoch", "closed_epoch", "closed_by"])
@@ -963,12 +963,18 @@ class PhaseTwoTest(unittest.TestCase):
         for value in (True, "1", 1.5, None, -1):
             self.assertEqual(self.call("POST", "/api/ack", key=self.identity_key, body={"id": value})[0], 400)
         self.assertEqual(self.call("POST", "/api/ack", key=self.identity_key,
-                                   body={"id": 0, "channel": 5})[0], 400)
+                                   body={"id": 0, "channel": 5})[0], 200)
         code, out, _ = self.remote_cli("delivery", "--key", self.identity_key)
         self.assertEqual(code, 2)
-        self.assertIn("unknown: hamish-hermes, will-hermes", out)
-        self.assertEqual(self.remote_cli("ack", "--id", "0", "--channel", "conduit", "--key", self.identity_key)[0], 0)
+        # Only hamish-hermes is unknown here: will-hermes acked whole-board at 0 a
+        # moment ago (the non-string channel above), and that receipt covers every
+        # room with nothing pending behind it.
+        self.assertIn("unknown: hamish-hermes", out)
+        self.assertNotIn("unknown: hamish-hermes, will-hermes", out)
+        self.assertEqual(self.remote_cli("ack", "--id", "0", "--channel", "will", "--key", self.identity_key)[0], 0)
+        self.receipt(0)
         self.receipt(0, self.hamish_key)
+        self.store.ack("hamish-hermes", 0, "will")
         self.assertEqual(self.remote_cli("delivery", "--key", self.identity_key)[0], 0)
         mid = self.post(author="hamish-hermes")["id"]
         self.age_message(mid, 700)
@@ -977,6 +983,7 @@ class PhaseTwoTest(unittest.TestCase):
         self.assertEqual(json.loads(out)["me"]["state"], "behind")
         self.assertIn("will-hermes", err)
         self.receipt(mid)
+        self.store.ack("will-hermes", mid, "will")
         self.keys.revoke("hamish-hermes")
         code, out, _ = self.remote_cli("delivery", "--key", self.identity_key)
         self.assertEqual(code, 0)
@@ -1728,7 +1735,7 @@ class ChannelAPITest(unittest.TestCase):
             code, _, error = self.remote_cli(*argv, "--channel", "private", "--key", self.owner)
             self.assertIn(code, (0, 1), error)  # open returns 1 for an empty ledger
             self.assertNotIn("failed", error)
-        # Delivery accepts the channel option while retaining its global state.
+        # Delivery can select one channel’s receipt state.
         self.assertEqual(self.remote_cli("delivery", "--state", "--channel", "private", "--key", self.owner)[0], 0)
         with mock.patch.object(board, "request", side_effect=KeyboardInterrupt) as request:
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt):
@@ -1742,6 +1749,78 @@ class ChannelAPITest(unittest.TestCase):
         self.assertEqual(self.cli("key", "revoke", "--identity", "remove-me")[0], 0)
         self.assertEqual(self.keys.entries(), before)
 
+    def test_channel_acks_are_independent_and_legacy_fallback_is_unchanged(self):
+        public, secret = self.seed()
+        for value in ("conduit", "does-not-exist", "", None, 5, [], {}):
+            status, receipt = self.call("POST", "/api/ack", self.owner,
+                                        {"id": secret["id"], "channel": value})
+            self.assertEqual(status, 200, receipt)
+            self.assertNotIn("channel", receipt)
+        self.call("POST", "/api/ack", self.owner, {"id": public["id"], "channel": "will"})
+        data = self.call("GET", "/api/delivery", self.owner)[1]
+        mine = {r["channel"]: r for r in data["channels"] if r["identity"] == "hamish-hermes"}
+        self.assertEqual(data["me"]["acked_id"], secret["id"])
+        self.assertEqual(mine["will"]["acked_id"], public["id"])
+        # No receipt of its own: the whole-board floor covers it, and it says so
+        # rather than reporting a backlog that was delivered before channels existed.
+        self.assertEqual(mine["private"]["acked_id"], secret["id"])
+        self.assertEqual(mine["private"]["ack_source"], "whole-board")
+        self.assertEqual(mine["private"]["pending_count"], 0)
+        self.assertEqual(mine["private"]["state"], "ok")
+        self.assertEqual(self.call("POST", "/api/ack", self.peer,
+                                   {"id": secret["id"], "channel": "private"})[0], 403)
+        status, receipt = self.call("POST", "/api/ack", self.owner,
+                                    {"id": secret["id"], "channel": "private"})
+        self.assertEqual(status, 200)
+        self.assertEqual(receipt["channel"], "private")
+        self.call("POST", "/api/ack", self.owner, {"id": 0, "channel": "private"})
+        data = self.call("GET", "/api/delivery?channel=private", self.owner)[1]
+        self.assertEqual({r["channel"] for r in data["channels"]}, {"private"})
+        self.assertEqual(next(r for r in data["channels"] if r["identity"] == "hamish-hermes")["acked_id"], secret["id"])
+        peer_data = self.call("GET", "/api/delivery", self.peer)[1]
+        self.assertEqual({r["channel"] for r in peer_data["channels"]}, {"will"})
+        self.assertEqual(self.call("GET", "/api/delivery?channel=private", self.peer)[0], 403)
+
+    def test_a_whole_board_ack_covers_rooms_it_predates(self):
+        # The shape of the 1.2 -> 1.3 cutover: every receipt in the database is
+        # whole-board, no room has one of its own, and the board must not report a
+        # backlog that was delivered before rooms existed.
+        self.seed()
+        self.call("POST", "/api/ack", self.owner, {"id": self.store.latest_id()})
+        data = self.call("GET", "/api/delivery", self.owner)[1]
+        rows = [r for r in data["channels"] if r["identity"] == "hamish-hermes"]
+        self.assertTrue(rows, "no per-channel rows to inspect")
+        for row in rows:
+            self.assertEqual((row["state"], row["pending_count"], row["ack_source"]),
+                             ("ok", 0, "whole-board"), row["channel"])
+
+    def test_delivery_channel_grace_unknown_and_cli_blocks(self):
+        self.seed()
+        with self.store._db() as db:
+            db.execute("UPDATE messages SET epoch=?", (time.time() - 700,))
+        self.store.ack("hamish-hermes", 0, "will")
+        data = self.call("GET", "/api/delivery", self.owner)[1]
+        mine = {r["channel"]: r for r in data["channels"] if r["identity"] == "hamish-hermes"}
+        # An ack in `will` says nothing about `private`, and there is no
+        # whole-board receipt here either, so this room is still unknown: unknown
+        # is reserved for "no evidence", and a peer that never acked is never
+        # called behind.
+        self.assertEqual(mine["private"]["state"], "unknown")
+        self.assertIsNone(mine["private"]["ack_source"])
+        self.assertEqual(self.remote_cli("delivery", "--channels-state", "--key", self.owner)[1].strip(), "ok")
+        self.store.ack("will-hermes", 0, "will")
+        self.assertEqual(self.remote_cli("delivery", "--channels-state", "--key", self.owner)[1].strip(), "behind")
+        code, output, _ = self.remote_cli("delivery", "--key", self.owner)
+        self.assertEqual(code, 1)
+        self.assertIn("channel will", output)
+        self.assertIn("channel private", output)
+        code, output, _ = self.remote_cli("delivery", "--channel", "private", "--key", self.owner)
+        self.assertEqual(code, 2)
+        self.assertNotIn("channel will", output)
+        self.assertEqual(self.remote_cli("delivery", "--state", "--channel", "will", "--key", self.peer)[1].strip(), "behind")
+        self.store.ack("will-hermes", self.store.latest_id(), "will")
+        self.assertEqual(self.remote_cli("delivery", "--state", "--channel", "will", "--key", self.peer)[1].strip(), "ok")
+
     def test_web_channel_controls_are_self_contained(self):
         status, html = self.call("GET", "/")
         self.assertEqual(status, 200)
@@ -1749,6 +1828,44 @@ class ChannelAPITest(unittest.TestCase):
                      "esc(m.channel)", "channelQuery()", "setReply(null)"):
             self.assertIn(text, html)
         self.assertNotIn('<script src=', html)
+
+
+class ChannelAckMigrationTest(unittest.TestCase):
+    def test_channel_grace_boundary_and_whole_board_row_are_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = board.Board(os.path.join(directory, "board.db"))
+            will = store.post("will-hermes", "delivered", channel="will")["id"]
+            store.post("house-peer", "still pending", channel="house")
+            with store._db() as db:
+                db.execute("UPDATE messages SET epoch=1000")
+            store.ack("hamish-hermes", 0)
+            store.ack("hamish-hermes", will, "will")
+            store.ack("hamish-hermes", 0, "house")
+            with mock.patch.object(board.time, "time", return_value=1600):
+                data = store.delivery(["hamish-hermes"], "hamish-hermes")
+                self.assertEqual({r["channel"]: r["state"] for r in data["channels"]}, {"will": "ok", "house": "ok"})
+            with mock.patch.object(board.time, "time", return_value=1601):
+                data = store.delivery(["hamish-hermes"], "hamish-hermes")
+                self.assertEqual(data["me"]["state"], "behind")
+                self.assertEqual({r["channel"]: r["state"] for r in data["channels"]}, {"will": "ok", "house": "behind"})
+                self.assertEqual({r["channel"]: r["pending_count"] for r in data["channels"]}, {"will": 0, "house": 1})
+
+    def test_migration_preserves_legacy_row_timestamp_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "board.db")
+            store = board.Board(path)
+            with store._db() as db:
+                db.execute("DROP TABLE acks")
+                db.execute("CREATE TABLE acks (identity TEXT PRIMARY KEY, acked_id INTEGER NOT NULL, updated_epoch REAL NOT NULL)")
+                db.execute("INSERT INTO acks VALUES ('will-hermes', 84, 123.5)")
+            store = board.Board(path)
+            store.ack("will-hermes", 2, "house")
+            store = board.Board(path)
+            with store._db() as db:
+                rows = [tuple(r) for r in db.execute("SELECT identity, channel, acked_id, updated_epoch FROM acks ORDER BY channel")]
+            self.assertEqual(rows[0], ("will-hermes", "*", 84, 123.5))
+            self.assertEqual(rows[1][:3], ("will-hermes", "house", 2))
+            self.assertEqual(len(rows), 2)
 
 
 if __name__ == "__main__":

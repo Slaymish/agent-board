@@ -313,7 +313,17 @@ class Board:
             # Display authors can be supplied by clients; retain authenticated ownership separately.
             db.execute("ALTER TABLE files ADD COLUMN uploader_identity TEXT NOT NULL DEFAULT ''")
         db.execute("""CREATE TABLE IF NOT EXISTS acks (
-            identity TEXT PRIMARY KEY, acked_id INTEGER NOT NULL, updated_epoch REAL NOT NULL)""")
+            identity TEXT NOT NULL, channel TEXT NOT NULL DEFAULT '*',
+            acked_id INTEGER NOT NULL, updated_epoch REAL NOT NULL,
+            PRIMARY KEY (identity, channel))""")
+        if "channel" not in {r["name"] for r in db.execute("PRAGMA table_info(acks)")}:
+            db.execute("ALTER TABLE acks RENAME TO acks_legacy")
+            db.execute("""CREATE TABLE acks (
+                identity TEXT NOT NULL, channel TEXT NOT NULL DEFAULT '*',
+                acked_id INTEGER NOT NULL, updated_epoch REAL NOT NULL,
+                PRIMARY KEY (identity, channel))""")
+            db.execute("INSERT INTO acks SELECT identity, '*', acked_id, updated_epoch FROM acks_legacy")
+            db.execute("DROP TABLE acks_legacy")
         db.execute("""CREATE TABLE IF NOT EXISTS asks (
             id INTEGER PRIMARY KEY AUTOINCREMENT, msg_id INTEGER NOT NULL,
             from_identity TEXT NOT NULL, to_identity TEXT NOT NULL, text TEXT NOT NULL,
@@ -565,36 +575,62 @@ class Board:
                 for r in rows[:limit]]
         return {"asks": asks, "count": len(asks), "has_more": len(rows) > limit}
 
-    def ack(self, identity, mid):
+    def ack(self, identity, mid, channel="*"):
         with self.cond, self._db() as db:
-            db.execute("INSERT INTO acks (identity, acked_id, updated_epoch) VALUES (?,?,?) "
-                       "ON CONFLICT(identity) DO UPDATE SET "
+            db.execute("INSERT INTO acks (identity, channel, acked_id, updated_epoch) VALUES (?,?,?,?) "
+                       "ON CONFLICT(identity, channel) DO UPDATE SET "
                        "acked_id = MAX(acks.acked_id, excluded.acked_id), updated_epoch = excluded.updated_epoch",
-                       (identity, mid, time.time()))
-            row = db.execute("SELECT * FROM acks WHERE identity = ?", (identity,)).fetchone()
-        return {"identity": identity, "acked_id": row["acked_id"], "ts": now_iso(row["updated_epoch"])}
+                       (identity, channel, mid, time.time()))
+            row = db.execute("SELECT * FROM acks WHERE identity = ? AND channel = ?",
+                             (identity, channel)).fetchone()
+        result = {"identity": identity, "acked_id": row["acked_id"], "ts": now_iso(row["updated_epoch"])}
+        if channel != "*":
+            result["channel"] = channel
+        return result
 
-    def delivery(self, identities, me=None, peer=None):
+    def delivery(self, identities, me=None, peer=None, memberships=None, channels=None):
         grace = max(0, float(os.environ.get("BOARD_ACK_GRACE") or 600))
-        states = []
+        states, breakdown = [], []
         with self.cond, self._db() as db:
-            for identity in sorted(set(identities)):
-                ack = db.execute("SELECT * FROM acks WHERE identity = ?", (identity,)).fetchone()
-                acked = ack["acked_id"] if ack else 0
-                latest = db.execute("SELECT MAX(id) FROM messages WHERE author != ?", (identity,)).fetchone()[0] or 0
-                pending = db.execute("SELECT id FROM messages WHERE author != ? AND id > ? ORDER BY id LIMIT 50",
-                                     (identity, acked)).fetchall()
-                stats = db.execute("SELECT COUNT(*), MIN(epoch) FROM messages WHERE author != ? AND id > ?",
-                                   (identity, acked)).fetchone()
-                age = max(0, int(time.time() - stats[1])) if stats[1] is not None else 0
-                state = "unknown" if ack is None else "behind" if stats[0] and age > grace else "ok"
-                states.append({"identity": identity, "acked_id": acked if ack else None,
-                               "acked_ts": now_iso(ack["updated_epoch"]) if ack else None,
-                               "latest_from_peer": latest, "pending": [r["id"] for r in pending],
-                               "pending_count": stats[0], "age_seconds": age, "state": state})
+            slugs = sorted(set(channels if channels is not None else self.channels()) |
+                           ({"will"} if channels is None else set()))
+            for channel in ["*"] + slugs:
+                for identity in sorted(set(identities)):
+                    if channel != "*" and memberships is not None and identity not in memberships.get(channel, []):
+                        continue
+                    clause, args = channel_clause(None if channel == "*" else [channel])
+                    ack = db.execute("SELECT * FROM acks WHERE identity = ? AND channel = ?",
+                                     (identity, channel)).fetchone()
+                    # A room with no receipt of its own inherits the whole-board
+                    # floor. Before channels existed every ack was whole-board, so
+                    # without this the first look after the upgrade reports a
+                    # backlog that was delivered days ago. It cannot hide anything
+                    # newer: a message posted after that floor has a higher id.
+                    fallback = None if channel == "*" else db.execute(
+                        "SELECT * FROM acks WHERE identity = ? AND channel = '*'",
+                        (identity,)).fetchone()
+                    source = ack or fallback
+                    acked = source["acked_id"] if source else 0
+                    latest = db.execute("SELECT MAX(id) FROM messages WHERE author != ? AND " + clause,
+                                        [identity] + args).fetchone()[0] or 0
+                    pending = db.execute("SELECT id FROM messages WHERE author != ? AND id > ? AND " + clause +
+                                         " ORDER BY id LIMIT 50", [identity, acked] + args).fetchall()
+                    stats = db.execute("SELECT COUNT(*), MIN(epoch) FROM messages WHERE author != ? AND id > ? AND " +
+                                       clause, [identity, acked] + args).fetchone()
+                    age = max(0, int(time.time() - stats[1])) if stats[1] is not None else 0
+                    state = "unknown" if source is None else "behind" if stats[0] and age > grace else "ok"
+                    row = {"identity": identity, "acked_id": acked if source else None,
+                           "acked_ts": now_iso(source["updated_epoch"]) if source else None,
+                           "ack_source": "channel" if ack else "whole-board" if fallback else None,
+                           "latest_from_peer": latest, "pending": [r["id"] for r in pending],
+                           "pending_count": stats[0], "age_seconds": age, "state": state}
+                    if channel == "*":
+                        states.append(row)
+                    elif identity == me or peer is None or identity == peer:
+                        breakdown.append(dict(row, channel=channel))
         return {"me": next((s for s in states if s["identity"] == me), None),
                 "peers": [s for s in states if s["identity"] != me and (peer is None or s["identity"] == peer)],
-                "grace_seconds": grace}
+                "grace_seconds": grace, "channels": breakdown}
 
     # -- attachments ---------------------------------------------------
 
@@ -1585,12 +1621,15 @@ def make_handler(board, key, name, idle_timeout=None):
                 qs["channel"] = channel_values
             return qs, parsed.path
 
-        def _delivery(self, peer=None):
+        def _delivery(self, peer=None, channels=None):
             identities = {entry["identity"] for entry in keys.entries()}
             me = getattr(self, "auth_identity", None)
             if (me is None or self.auth_unrestricted) and len(identities) == 1:
                 me = next(iter(identities))
-            return board.delivery(identities, me, peer)
+            listing = keys.channel_listing(board, self.auth_identity)
+            memberships = {r["channel"]: r["identities"] for r in listing}
+            visible = [r["channel"] for r in listing if channels is None or r["channel"] in channels]
+            return board.delivery(identities, me, peer, memberships, visible)
 
         def _supplied_key(self, qs):
             if self.headers.get("X-Board-Key"):
@@ -1688,7 +1727,7 @@ def make_handler(board, key, name, idle_timeout=None):
                     "auth_required": keys.required(),
                     "public_read": board.public_read,
                     "delivery": {row["identity"]: row["state"] for row in
-                                 board.delivery([e["identity"] for e in keys.entries()])["peers"]},
+                                 board.delivery([e["identity"] for e in keys.entries()], channels=[])["peers"]},
                 })
                 return
             if not self._authed(qs, write=False):
@@ -1708,7 +1747,7 @@ def make_handler(board, key, name, idle_timeout=None):
                 return self._send(200, {"identity": self.auth_identity,
                                         "unrestricted": self.auth_unrestricted})
             if path == "/api/delivery":
-                return self._send(200, self._delivery((qs.get("peer") or [None])[0]))
+                return self._send(200, self._delivery((qs.get("peer") or [None])[0], channels))
             if path == "/api/asks":
                 state = (qs.get("state") or ["open"])[0]
                 if state not in ("open", "closed", "all"):
@@ -1864,12 +1903,17 @@ def make_handler(board, key, name, idle_timeout=None):
                 mid = data.get("id")
                 if type(mid) is not int or mid < 0:
                     return self._err(400, "id must be a non-negative integer")
-                if "channel" in data:
-                    try:
-                        channel_slug(data["channel"])
-                    except ValueError as exc:
-                        return self._err(400, str(exc))
-                return self._send(200, board.ack(self.auth_identity, mid))
+                # Older clients used channel for a notification route (e.g. conduit).
+                # Only known board channels select a row; every other value is legacy.
+                supplied = data.get("channel")
+                known = {"will"}
+                for entry in keys.entries():
+                    known.update(c for c in keys.channels_for(entry["identity"]) if c != "*")
+                known.update(board.channels())
+                channel = supplied if isinstance(supplied, str) and supplied in known else "*"
+                if channel != "*" and not keys.may_read(self.auth_identity, channel):
+                    return self._err(403, "identity may not ack channel '%s'" % channel)
+                return self._send(200, board.ack(self.auth_identity, mid, channel))
             if close_match:
                 try:
                     ask = board.close_ask(int(close_match[1]), data.get("msg_id"), keys.read_scope(self.auth_identity))
@@ -2154,23 +2198,32 @@ def cmd_delivery(args):
         print("delivery failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
     data = json.loads(raw)
+    if getattr(args, "channels_state", False):
+        print("behind" if any(r["state"] == "behind" for r in data.get("channels", [])) else "ok")
+        return 0
     if getattr(args, "state", False):
         # One fixed word about THIS side's delivery only: a peer that has never
         # acked is informational, not a fault on this machine, and a monitor that
         # reported it would alarm forever. Exit 0 so a shell can inline it.
         me = data.get("me")
+        if args.channel:
+            me = next((r for r in data.get("channels", []) if me and r["identity"] == me["identity"]), None)
         print(me["state"] if me else "unknown")
         return 0
     rows = ([data["me"]] if data["me"] else []) + data["peers"]
+    rows = data.get("channels", rows)
     behind = sorted(r["identity"] for r in rows if r["state"] == "behind")
     unknown = sorted(r["identity"] for r in rows if r["state"] == "unknown")
     if args.json:
         print(json.dumps(data, indent=2))
     else:
-        print("identity                 acked  pending  state")
-        for row in rows:
-            print("%-24s %5s  %7d  %s" % (row["identity"],
-                  row["acked_id"] if row["acked_id"] is not None else "—", row["pending_count"], row["state"]))
+        for channel in sorted({r["channel"] for r in data.get("channels", [])}):
+            print("channel " + channel)
+            print("identity                 acked  pending  state")
+            for row in data["channels"]:
+                if row["channel"] == channel:
+                    print("%-24s %5s  %7d  %s" % (row["identity"],
+                          row["acked_id"] if row["acked_id"] is not None else "—", row["pending_count"], row["state"]))
     verdict = []
     if behind:
         verdict.append("behind: " + ", ".join(behind))
@@ -2520,6 +2573,7 @@ def main(argv=None):
 
     p = sub.add_parser("delivery", help="show delivery receipts and pending messages")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--channels-state", action="store_true", help="print ok|behind across visible channels")
     p.add_argument("--state", action="store_true",
                    help="print one word for THIS identity only (ok|behind|unknown), for monitors")
     p.add_argument("--url", default=None)
