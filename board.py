@@ -23,6 +23,7 @@ import json
 import mimetypes
 import os
 import re
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -48,7 +49,25 @@ MAX_NAME = 120
 RATE_WINDOW = 300.0
 RATE_MAX = 60
 MAX_WAIT = 60.0
-VERSION = "1.2.0"
+
+# A keep-alive connection whose client has gone away — a phone off the network,
+# the funnel proxy dropping a socket, a script killed mid-request — is never
+# reclaimed by http.server: the handler blocks in readline() with no socket
+# timeout, so the thread and its fd live until TCP keepalive gives up (hours).
+# Seen on the live board: three established connections with no client process
+# behind them. Idle connections now close after this, and a write that stalls
+# behind the timeout is treated as the client's departure, not a server fault.
+# Must exceed MAX_WAIT so a long poll is not cut off while it is still waiting.
+IDLE_TIMEOUT = float(os.environ.get("BOARD_IDLE_TIMEOUT") or 75)
+
+# Concurrent handler threads. Each long poll holds one for its whole wait, and
+# ThreadingHTTPServer sets no ceiling of its own, so a run of abandoned polls
+# would grow the process without limit. Past the cap the board refuses with 503
+# instead of queueing another thread — a fast refusal the client retries beats a
+# server that degrades for everyone.
+MAX_CONCURRENT = int(os.environ.get("BOARD_MAX_CONCURRENT") or 32)
+
+VERSION = "1.2.1"
 
 # Served inline; anything else is forced to a download so this board can never
 # be used to host markup that a browser would execute in the site's origin.
@@ -1316,31 +1335,90 @@ $('#composer').addEventListener('submit', async (e) => {
 """
 
 
-def make_server(address, handler):
-    return BoardServer(address, handler)
+def make_server(address, handler, max_concurrent=None):
+    return BoardServer(address, handler, max_concurrent=max_concurrent)
+
+
+def refuse_connection(request, message):
+    """Answer 503 on a socket accepted but never handed to a handler thread."""
+    body = json.dumps({"error": message}).encode()
+    try:
+        request.sendall(
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Retry-After: 5\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n\r\n" + body)
+    except OSError:
+        pass
 
 
 class BoardServer(ThreadingHTTPServer):
-    """Threaded HTTP server that does not shout about clients going away."""
+    """Threaded HTTP server that does not shout about clients going away.
+
+    Concurrency is capped rather than left to ThreadingMixIn's unbounded thread
+    spawn, and the listen backlog is raised from the stdlib's 5 so a burst of
+    reconnects after a restart is queued by the kernel instead of refused.
+    """
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64
+
+    def __init__(self, address, handler, max_concurrent=None):
+        self.max_concurrent = max_concurrent or MAX_CONCURRENT
+        self._slots = threading.BoundedSemaphore(self.max_concurrent)
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
+        self.started = time.time()
+        ThreadingHTTPServer.__init__(self, address, handler)
+
+    def inflight(self):
+        with self._inflight_lock:
+            return self._inflight
+
+    def uptime(self):
+        return time.time() - self.started
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            # Saturated. Answer at once so the client can back off and retry;
+            # this is what keeps a stalled peer from becoming a stalled board.
+            refuse_connection(request, "board is at capacity, retry in a moment")
+            self.shutdown_request(request)
+            return
+        with self._inflight_lock:
+            self._inflight += 1
+        ThreadingHTTPServer.process_request(self, request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            ThreadingHTTPServer.process_request_thread(self, request, client_address)
+        finally:
+            with self._inflight_lock:
+                self._inflight -= 1
+            self._slots.release()
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
         # A client that is still writing when we reject its request (an
-        # oversized body, say) gets a reset. That is the client's doing, not a
-        # fault in this server, and a traceback per occurrence is just noise.
-        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+        # oversized body, say) gets a reset. A client that stops reading, or
+        # goes away mid-request, gets a socket timeout now that idle sockets
+        # expire. Neither is a fault in this server, and a traceback per
+        # occurrence is just noise.
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, socket.timeout)):
             return
         ThreadingHTTPServer.handle_error(self, request, client_address)
 
 
-def make_handler(board, key, name):
+def make_handler(board, key, name, idle_timeout=None):
     keys = key if isinstance(key, Keys) else Keys(key, os.path.dirname(board.db_path))
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "agent-board/" + VERSION
         protocol_version = "HTTP/1.1"
+        # StreamRequestHandler.setup() applies this to the accepted socket, so
+        # an idle keep-alive connection is closed instead of pinning a thread.
+        timeout = idle_timeout or IDLE_TIMEOUT
 
         # -- helpers -------------------------------------------------------
         def log_message(self, fmt, *args):
@@ -1455,6 +1533,9 @@ def make_handler(board, key, name):
                     "files": board.file_stats(),
                     "max_file": MAX_FILE,
                     "time": now_iso(time.time()),
+                    "uptime_s": round(getattr(self.server, "uptime", lambda: 0)(), 1),
+                    "inflight": getattr(self.server, "inflight", lambda: 0)(),
+                    "max_concurrent": getattr(self.server, "max_concurrent", None),
                     "auth_required": keys.required(),
                     "public_read": board.public_read,
                     "delivery": {row["identity"]: row["state"] for row in
@@ -1763,8 +1844,8 @@ def cmd_serve(args):
         path = write_key(key, data)
         print("board key written to %s" % path, file=sys.stderr)
     board = Board(os.path.join(data, "board.db"), public_read=args.public_read)
-    handler = make_handler(board, key, args.name)
-    httpd = make_server((args.host, args.port), handler)
+    handler = make_handler(board, key, args.name, idle_timeout=args.idle_timeout)
+    httpd = make_server((args.host, args.port), handler, max_concurrent=args.max_concurrent)
     stats = board.file_stats()
     print("agent-board %s listening on http://%s:%d  (data: %s, %d messages, %d files / %s on disk)"
           % (VERSION, args.host, args.port, data, board.count(),
@@ -2183,6 +2264,10 @@ def main(argv=None):
     p.add_argument("--name", default=os.environ.get("BOARD_NAME", "hamish-and-friend"))
     p.add_argument("--public-read", action="store_true", help="allow reads without the key")
     p.add_argument("--rotate-key", action="store_true", help="generate a fresh board key")
+    p.add_argument("--idle-timeout", type=float, default=IDLE_TIMEOUT, metavar="SECONDS",
+                   help="close a connection idle this long (default %g)" % IDLE_TIMEOUT)
+    p.add_argument("--max-concurrent", type=int, default=MAX_CONCURRENT, metavar="N",
+                   help="handler threads before refusing with 503 (default %d)" % MAX_CONCURRENT)
     p.set_defaults(func=cmd_serve)
 
     for command in ("post", "amend"):

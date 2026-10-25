@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -1350,6 +1351,71 @@ class PhaseThreeTest(unittest.TestCase):
                      "$('#text').addEventListener('input', updateBodyHint)",
                      "$('#file').addEventListener('change', updateBodyHint)"):
             self.assertIn(text, html)
+
+
+class ServerResilienceTest(unittest.TestCase):
+    """The connection handling that keeps a long-lived server from drifting.
+
+    Both cases were observed on the live board on 26 Oct 2026: established
+    connections with no client process behind them, and no ceiling on how many
+    handler threads a stalled peer could hold.
+    """
+
+    def start(self, **kwargs):
+        tmp = tempfile.mkdtemp(prefix="agent-board-resilience-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        store = board.Board(os.path.join(tmp, "board.db"))
+        handler = board.make_handler(store, KEY, "resilience",
+                                     idle_timeout=kwargs.pop("idle_timeout", 1.0))
+        httpd = board.make_server(("127.0.0.1", 0), handler, **kwargs)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return httpd, httpd.server_address[1]
+
+    def test_idle_connection_is_closed_not_held_open(self):
+        httpd, port = self.start(idle_timeout=1.0)
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(sock.close)
+        # Say nothing, as a peer does when its network drops mid keep-alive.
+        sock.settimeout(6.0)
+        started = time.time()
+        self.assertEqual(sock.recv(1), b"", "server kept an idle connection open")
+        self.assertLess(time.time() - started, 5.0)
+
+    def test_an_idle_connection_stops_holding_a_slot(self):
+        httpd, port = self.start(idle_timeout=1.0)
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(sock.close)
+        time.sleep(0.3)
+        self.assertEqual(httpd.inflight(), 1)
+        time.sleep(1.6)
+        self.assertEqual(httpd.inflight(), 0, "an abandoned connection pinned a handler thread")
+
+    def test_over_capacity_is_refused_rather_than_queued(self):
+        httpd, port = self.start(idle_timeout=30.0, max_concurrent=1)
+        held = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(held.close)
+        time.sleep(0.3)
+        self.assertEqual(httpd.inflight(), 1)
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("GET", "/api/health")
+        response = conn.getresponse()
+        body = json.loads(response.read().decode())
+        conn.close()
+        self.assertEqual(response.status, 503)
+        self.assertEqual(response.getheader("Retry-After"), "5")
+        self.assertIn("capacity", body["error"])
+
+    def test_health_reports_uptime_and_capacity(self):
+        httpd, port = self.start(idle_timeout=5.0, max_concurrent=7)
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("GET", "/api/health")
+        data = json.loads(conn.getresponse().read().decode())
+        conn.close()
+        self.assertGreaterEqual(data["uptime_s"], 0)
+        self.assertEqual(data["max_concurrent"], 7)
+        self.assertEqual(data["inflight"], 1, "the health request itself is in flight")
 
 
 if __name__ == "__main__":
