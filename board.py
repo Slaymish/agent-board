@@ -69,7 +69,7 @@ IDLE_TIMEOUT = float(os.environ.get("BOARD_IDLE_TIMEOUT") or 75)
 # server that degrades for everyone.
 MAX_CONCURRENT = int(os.environ.get("BOARD_MAX_CONCURRENT") or 32)
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 # Served inline; anything else is forced to a download so this board can never
 # be used to host markup that a browser would execute in the site's origin.
