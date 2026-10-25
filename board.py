@@ -51,6 +51,8 @@ RATE_MAX = 60
 MAX_WAIT = 60.0
 QUIET_DAYS = 14
 STALE_DAYS = 60
+ASK_WARN_DAYS = 7
+ASK_STALE_DAYS = 30
 
 # A keep-alive connection whose client has gone away — a phone off the network,
 # the funnel proxy dropping a socket, a script killed mid-request — is never
@@ -69,7 +71,7 @@ IDLE_TIMEOUT = float(os.environ.get("BOARD_IDLE_TIMEOUT") or 75)
 # server that degrades for everyone.
 MAX_CONCURRENT = int(os.environ.get("BOARD_MAX_CONCURRENT") or 32)
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 # Served inline; anything else is forced to a download so this board can never
 # be used to host markup that a browser would execute in the site's origin.
@@ -207,7 +209,7 @@ def structure_markers(msg):
 def markdown_transcript(messages):
     lines = ["# agent-board transcript", ""]
     for msg in messages:
-        head = "## #%d · %s · %s" % (msg["id"], msg["author"], msg["ts"])
+        head = "## #%d · %s · %s" % (msg["id"], message_voice(msg), msg["ts"])
         if msg.get("ask_state") == "open":
             head = "! " + head
         if msg["topic"]:
@@ -223,6 +225,18 @@ def markdown_transcript(messages):
         if msg["files"]:
             lines.append("")
     return "\n".join(lines)
+
+
+def message_voice(msg):
+    return msg["author"] + (" (typed)" if msg.get("via") == "human" else "")
+
+
+def ask_ageing(age_days):
+    if age_days > ASK_STALE_DAYS:
+        return "stale"
+    if age_days >= ASK_WARN_DAYS:
+        return "warn"
+    return "ok"
 
 
 def channel_slug(value):
@@ -268,7 +282,8 @@ class Board:
                        root_id INTEGER,
                        amends INTEGER,
                        amended_by INTEGER,
-                       channel TEXT NOT NULL DEFAULT 'will'
+                       channel TEXT NOT NULL DEFAULT 'will',
+                       via TEXT NOT NULL DEFAULT 'agent'
                    )"""
             )
             db.execute(
@@ -309,6 +324,8 @@ class Board:
                 db.execute("ALTER TABLE messages ADD COLUMN %s INTEGER" % column)
         if "channel" not in columns:
             db.execute("ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'will'")
+        if "via" not in columns:
+            db.execute("ALTER TABLE messages ADD COLUMN via TEXT NOT NULL DEFAULT 'agent'")
         db.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel, id)")
         file_columns = {r["name"] for r in db.execute("PRAGMA table_info(files)")}
         if "uploader_identity" not in file_columns:
@@ -429,6 +446,7 @@ class Board:
             "ts": now_iso(row["epoch"]),
             "epoch": row["epoch"],
             "author": row["author"],
+            "via": row["via"],
             "topic": row["topic"],
             "channel": row["channel"],
             "text": row["text"],
@@ -470,8 +488,10 @@ class Board:
             return True
 
     def post(self, author, text, topic=None, file_ids=None, reply_to=None, amends=None,
-             ask_to=None, answers=None, identity=None, channel="will"):
+             ask_to=None, answers=None, identity=None, channel="will", via="agent"):
         channel_slug(channel)
+        if via not in ("agent", "human"):
+            raise ValueError("via must be agent or human")
         epoch = time.time()
         with self.cond:
             with self._db() as db:
@@ -503,9 +523,9 @@ class Board:
                         if topic is None:
                             topic = parent["topic"]
                 cur = db.execute(
-                    "INSERT INTO messages (epoch, author, topic, text, reply_to, root_id, amends, channel) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (epoch, author, topic or "", text, reply_to, root_id, amends, channel),
+                    "INSERT INTO messages (epoch, author, topic, text, reply_to, root_id, amends, channel, via) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (epoch, author, topic or "", text, reply_to, root_id, amends, channel, via),
                 )
                 mid = cur.lastrowid
                 self._chunks_missing(db)
@@ -576,6 +596,35 @@ class Board:
                                            - r["opened_epoch"])), "thread_id": r["thread_id"]}
                 for r in rows[:limit]]
         return {"asks": asks, "count": len(asks), "has_more": len(rows) > limit}
+
+    def inbox(self, identity, channels=None):
+        """All visible open obligations for this identity, independent of receipts."""
+        clause, args = channel_clause(channels, "m.channel")
+        with self.cond, self._db() as db:
+            rows = db.execute(
+                "SELECT a.*, m.channel FROM asks a JOIN messages m ON m.id=a.msg_id "
+                "WHERE a.closed_epoch IS NULL AND (a.to_identity=? OR a.from_identity=?) AND "
+                + clause + " ORDER BY a.opened_epoch, a.id", [identity, identity] + args).fetchall()
+            latest = db.execute("SELECT m.id, m.channel, m.epoch FROM messages m WHERE "
+                                + clause + " ORDER BY m.id DESC LIMIT 1", args).fetchone()
+        now = time.time()
+        asks, asks_by_me = [], []
+        for row in rows:
+            age_days = max(0, (now - row["opened_epoch"]) / 86400.0)
+            ask = {"id": row["id"], "msg_id": row["msg_id"], "from": row["from_identity"],
+                   "to": row["to_identity"], "channel": row["channel"], "text": row["text"],
+                   "opened": now_iso(row["opened_epoch"]), "age_days": age_days,
+                   "ageing": ask_ageing(age_days)}
+            if row["to_identity"] == identity:
+                asks.append(ask)
+            if row["from_identity"] == identity:
+                asks_by_me.append(ask)
+        return {"asks": asks, "asks_by_me": asks_by_me,
+                "latest": {"channel": latest["channel"], "id": latest["id"],
+                           "ts": now_iso(latest["epoch"])} if latest else
+                          {"channel": channels[0] if channels and len(channels) == 1 else None,
+                           "id": 0, "ts": None},
+                "counts": {"open_to_me": len(asks), "open_by_me": len(asks_by_me)}}
 
     def ack(self, identity, mid, channel="*"):
         with self.cond, self._db() as db:
@@ -850,7 +899,7 @@ class Board:
         budget = max(200, int(max_chars))
         lines, used, shown, cut = [], 0, 0, 0
         for m in msgs:
-            head = "#%d %s%s %s: " % (m["id"], m["author"],
+            head = "#%d %s%s %s: " % (m["id"], message_voice(m),
                                       (" [%s]" % m["topic"]) if m["topic"] else "", m["ts"])
             head += structure_markers(m)
             if m.get("ask_state") == "open":
@@ -1781,6 +1830,8 @@ def make_handler(board, key, name, idle_timeout=None):
                                         "unrestricted": self.auth_unrestricted})
             if path == "/api/delivery":
                 return self._send(200, self._delivery((qs.get("peer") or [None])[0], channels))
+            if path == "/api/inbox":
+                return self._send(200, board.inbox(self.auth_identity, channels))
             if path == "/api/asks":
                 state = (qs.get("state") or ["open"])[0]
                 if state not in ("open", "closed", "all"):
@@ -2004,7 +2055,8 @@ def make_handler(board, key, name, idle_timeout=None):
             try:
                 msg = board.post(author, text, topic, file_ids,
                                  data.get("reply_to"), data.get("amends"), ask_to,
-                                 data.get("answers"), identity if not self.auth_unrestricted else None, channel)
+                                 data.get("answers"), identity if not self.auth_unrestricted else None,
+                                 channel, via=data.get("via", "agent"))
             except AskClosed as exc:
                 return self._err(409, str(exc))
             except ValueError as exc:
@@ -2125,7 +2177,7 @@ def cmd_post(args):
             text = fh.read()
     else:
         text = args.text if args.text else sys.stdin.read()
-    payload = {"author": author, "text": text.strip()}
+    payload = {"author": author, "text": text.strip(), "via": getattr(args, "via", "agent")}
     if getattr(args, "channel", None) is not None:
         payload["channel"] = args.channel
     if args.topic is not None:
@@ -2220,6 +2272,31 @@ def cmd_open(args):
         if data["has_more"]:
             print("more asks available (showing first 1000)")
     return 0 if data["asks"] else 1
+
+
+def cmd_inbox(args):
+    base, key = client_config(args)
+    status, raw = request(channel_url(base + "/api/inbox", args), key)
+    if status != 200:
+        print("inbox failed (%s): %s" % (status, raw), file=sys.stderr)
+        return 1
+    data = json.loads(raw)
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 0
+    if not data["asks"] and not data["asks_by_me"]:
+        print("inbox: nothing waiting")
+        return 0
+    for label, asks, person in (("waiting on you", data["asks"], "from"),
+                                ("you are waiting on", data["asks_by_me"], "to")):
+        for ask in asks:
+            print("ask %d  #%d  [%s]  %.1fd %s  %s %s  %s: %s" % (
+                ask["id"], ask["msg_id"], ask["channel"], ask["age_days"], ask["ageing"],
+                person, ask[person], label, " ".join(ask["text"].split())))
+    oldest = max(a["age_days"] for a in data["asks"] + data["asks_by_me"])
+    print("%d waiting on you, %d you are waiting on, oldest %dd" % (
+        data["counts"]["open_to_me"], data["counts"]["open_by_me"], oldest))
+    return 0
 
 
 def cmd_ack(args):
@@ -2560,8 +2637,9 @@ def main(argv=None):
                    help="handler threads before refusing with 503 (default %d)" % MAX_CONCURRENT)
     p.set_defaults(func=cmd_serve)
 
-    for command in ("post", "amend"):
-        p = sub.add_parser(command, help="post a message" if command == "post" else "amend a message")
+    for command in ("post", "amend", "say"):
+        p = sub.add_parser(command, help={"post": "post a message", "amend": "amend a message",
+                                          "say": "post words typed by a human"}[command])
         if command == "amend":
             p.add_argument("amends", type=int)
         else:
@@ -2569,6 +2647,10 @@ def main(argv=None):
         p.add_argument("text", nargs="?", default="")
         p.add_argument("--text-file", default=None)
         p.add_argument("--author", default=os.environ.get("BOARD_AUTHOR") or None)
+        if command == "say":
+            p.set_defaults(via="human")
+        else:
+            p.add_argument("--via", choices=("agent", "human"), default="agent")
         p.add_argument("--topic", default=None)
         p.add_argument("--reply-to", type=int, default=None)
         p.add_argument("--ask-to", default=None)
@@ -2608,6 +2690,12 @@ def main(argv=None):
     p.add_argument("--url", default=None)
     p.add_argument("--key", default=None)
     p.set_defaults(func=cmd_open)
+
+    p = sub.add_parser("inbox", help="show what is waiting on you and what you are waiting on")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--url", default=None)
+    p.add_argument("--key", default=None)
+    p.set_defaults(func=cmd_inbox)
 
     p = sub.add_parser("ack", help="record receipt through a message id")
     p.add_argument("--id", type=int, required=True)
@@ -2734,7 +2822,7 @@ def main(argv=None):
     p.add_argument("--key", default=None)
     p.set_defaults(func=cmd_channels)
 
-    for command in ("post", "amend", "read", "search", "digest", "threads", "open", "watch", "delivery", "ask", "answer"):
+    for command in ("post", "amend", "say", "inbox", "read", "search", "digest", "threads", "open", "watch", "delivery", "ask", "answer"):
         sub.choices[command].add_argument("--channel", type=channel_slug, default=None)
 
     args = parser.parse_args(argv)

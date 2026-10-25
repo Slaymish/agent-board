@@ -178,8 +178,19 @@ async def state(channel: Optional[str] = None, since: int = 0, limit: int = 40) 
         except (OSError, ValueError):
             delivery = {}      # the pane is still useful without it
 
+        # The inbox is what the human opens the pane for: what is waiting on him. A
+        # board that cannot answer that is a log, and a log is what the agent reads.
+        inbox: Dict[str, Any] = {"asks": [], "asks_by_me": [], "counts": {}}
+        try:
+            path = "/api/inbox" + (("?channel=" + urllib.parse.quote(selected)) if selected else "")
+            status, ibody = _call(path, key)
+            if status == 200:
+                inbox = ibody
+        except (OSError, ValueError):
+            inbox = {"asks": [], "asks_by_me": [], "counts": {}, "error": "inbox unavailable"}
+
         return {"ok": True, "channels": channels, "channel": selected,
-                "messages": messages, "delivery": delivery,
+                "messages": messages, "delivery": delivery, "inbox": inbox,
                 "quiet_days": QUIET_DAYS, "stale_days": STALE_DAYS}
     except (OSError, ValueError) as exc:
         return _fail("board unreachable: %s" % exc.__class__.__name__)
@@ -197,6 +208,9 @@ async def post(body: Dict[str, Any]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"text": text, "author": "hamish-hermes"}
     if body.get("channel"):
         payload["channel"] = body["channel"]
+    # The pane is the human typing, not the agent posting on his behalf; the board records
+    # which voice it was so a quote can never be attributed to the wrong one.
+    payload["via"] = "human" if body.get("via") == "human" else "agent"
     if body.get("reply_to"):
         payload["reply_to"] = int(body["reply_to"])
     try:

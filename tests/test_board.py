@@ -1455,8 +1455,8 @@ class ChannelStorageTest(unittest.TestCase):
         with migrated._db() as db:
             self.assertEqual([tuple(r) for r in db.execute("PRAGMA table_info(messages)")], schema)
             rows = [tuple(r) for r in db.execute("SELECT * FROM messages ORDER BY id")]
-            self.assertEqual([r[:-1] for r in rows], before)
-            self.assertEqual([r[-1] for r in rows], ["will", "will"])
+            self.assertEqual([r[:-2] for r in rows], before)
+            self.assertEqual([r[-2:] for r in rows], [("will", "agent"), ("will", "agent")])
             self.assertEqual([tuple(r) for r in db.execute("PRAGMA table_info(messages_fts)")], fts)
             self.assertEqual([r[2] for r in db.execute("PRAGMA index_info(idx_messages_channel)")],
                              ["channel", "id"])
@@ -1848,6 +1848,198 @@ class ChannelAPITest(unittest.TestCase):
                      "esc(m.channel)", "channelQuery()", "setReply(null)"):
             self.assertIn(text, html)
         self.assertNotIn('<script src=', html)
+
+
+class HumanVoiceStorageTest(unittest.TestCase):
+    def test_existing_channel_database_migrates_via_without_rewriting_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "old.db")
+            with sqlite3.connect(path) as db:
+                db.executescript("""
+                    CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        epoch REAL NOT NULL, author TEXT NOT NULL,
+                        topic TEXT NOT NULL DEFAULT '', text TEXT NOT NULL,
+                        reply_to INTEGER, root_id INTEGER, amends INTEGER, amended_by INTEGER,
+                        channel TEXT NOT NULL DEFAULT 'will');
+                    INSERT INTO messages(epoch,author,text,channel)
+                        VALUES(123,'hamish-hermes','Original words','private');
+                    CREATE TABLE row_updates (n INTEGER);
+                    INSERT INTO row_updates VALUES(0);
+                    CREATE TRIGGER detect_updates AFTER UPDATE ON messages BEGIN
+                        UPDATE row_updates SET n=n+1; END;
+                """)
+                before = db.execute("SELECT * FROM messages").fetchone()
+            store = board.Board(path)
+            human = store.post("hamish-hermes", "Actually typed", via="human")
+            store = board.Board(path)
+            fresh = board.Board(os.path.join(directory, "fresh.db"))
+            with store._db() as db, fresh._db() as new_db:
+                schema = [tuple(r) for r in db.execute("PRAGMA table_info(messages)")]
+                self.assertEqual(schema, [tuple(r) for r in new_db.execute("PRAGMA table_info(messages)")])
+                self.assertEqual(schema[-1][1:5], ("via", "TEXT", 1, "'agent'"))
+                row = tuple(db.execute("SELECT * FROM messages WHERE id=1").fetchone())
+                self.assertEqual(row, before + ("agent",))
+                self.assertEqual(db.execute("SELECT n FROM row_updates").fetchone()[0], 0)
+                db.execute("INSERT INTO messages(epoch,author,text) VALUES(124,'old-client','no via')")
+                self.assertEqual(db.execute("SELECT via FROM messages WHERE id=3").fetchone()[0], "agent")
+            self.assertEqual(store.fetch()[1]["via"], "human")
+            self.assertEqual(human["id"], 2)
+
+
+class HumanVoiceInboxTest(unittest.TestCase):
+    conn = BoardTest.conn
+    call = BoardTest.call
+    start_server = PhaseOneTest.start_server
+    post = PhaseOneTest.post
+    cli = PhaseOneTest.cli
+    remote_cli = PhaseOneTest.remote_cli
+    setUp = ChannelAPITest.setUp
+
+    def inbox(self, key=None, channel=None):
+        path = "/api/inbox" + ("?channel=" + channel if channel else "")
+        status, data = self.call("GET", path, key or self.owner)
+        self.assertEqual(status, 200, data)
+        return data
+
+    def test_human_round_trip_and_default_agent_on_all_read_surfaces(self):
+        human = self.post("Human narwhal paragraph with enough words for paragraph search.",
+                          key=self.owner, via="human")
+        agent = self.post("Agent narwhal paragraph in the same thread.", key=self.owner,
+                          reply_to=human["id"])
+        self.assertEqual((human["author"], human["via"]), ("hamish-hermes", "human"))
+        self.assertEqual(agent["via"], "agent")
+        for path, field in (("/api/messages", "messages"),
+                            ("/api/messages.json?thread=%d" % human["id"], "messages"),
+                            ("/api/search?q=narwhal", "results"),
+                            ("/api/messages?search=narwhal", "messages")):
+            with self.subTest(path=path):
+                status, data = self.call("GET", path, self.owner)
+                self.assertEqual(status, 200)
+                self.assertEqual({m["id"]: m["via"] for m in data[field]},
+                                 {human["id"]: "human", agent["id"]: "agent"})
+        for path in ("/api/messages.md", "/api/digest", "/api/digest.json", "/api/digest.md"):
+            status, data = self.call("GET", path, self.owner)
+            self.assertEqual(status, 200)
+            text = data["text"] if isinstance(data, dict) else data
+            self.assertIn("hamish-hermes (typed)", text)
+            self.assertEqual(text.count("(typed)"), 1)
+
+    def test_invalid_via_is_400_without_posting(self):
+        for value in ("robot", "Human", "", None, False, 1, [], {}):
+            with self.subTest(via=value):
+                status, data = self.call("POST", "/api/messages", self.owner,
+                                         {"text": "invalid voice", "via": value})
+                self.assertEqual(status, 400, data)
+                self.assertIn("via", data["error"])
+        self.assertEqual(self.store.count(), 0)
+
+    def test_say_and_post_amend_via_cli(self):
+        for argv in (("say", "These are my words"),
+                     ("post", "These too", "--via", "human"),
+                     ("amend", "1", "Corrected words", "--via", "human"),
+                     ("post", "Agent words")):
+            code, output, error = self.remote_cli(*argv, "--key", self.owner, "--channel", "will")
+            self.assertEqual(code, 0, error)
+            self.assertIn("posted #", output)
+        messages = self.store.fetch()
+        self.assertEqual([m["via"] for m in messages], ["human", "human", "human", "agent"])
+        self.assertEqual({m["author"] for m in messages}, {"hamish-hermes"})
+        self.assertEqual(messages[2]["amends"], 1)
+
+    def test_via_does_not_change_author_or_channel_permissions(self):
+        for via in ("human", "agent"):
+            self.assertEqual(self.call("POST", "/api/messages", self.peer,
+                {"text": "spoof", "author": "hamish-hermes", "via": via})[0], 403)
+            self.assertEqual(self.call("POST", "/api/messages", self.peer,
+                {"text": "private", "channel": "private", "via": via})[0], 403)
+
+    def test_inbox_shape_order_ageing_and_closed_asks(self):
+        now = 1800000000.0
+        incoming = []
+        for days in (0, 6.999, 7, 30, 30.001):
+            msg = self.post("Question aged %s days" % days, key=self.peer, ask_to="hamish-hermes")
+            incoming.append((msg, days))
+        outgoing = self.post("Please reply", key=self.owner, ask_to="will-hermes")
+        closed = self.post("Already answered", key=self.peer, ask_to="hamish-hermes")
+        self.store.close_ask(closed["ask_id"], closed["id"])
+        with self.store._db() as db:
+            for msg, days in incoming + [(outgoing, 6.2)]:
+                db.execute("UPDATE asks SET opened_epoch=? WHERE id=?", (now - days * 86400, msg["ask_id"]))
+        with mock.patch.object(board.time, "time", return_value=now):
+            data = self.inbox(channel="will")
+        self.assertEqual(set(data), {"asks", "asks_by_me", "latest", "counts"})
+        self.assertEqual(data["counts"], {"open_to_me": 5, "open_by_me": 1})
+        self.assertEqual([a["msg_id"] for a in data["asks"]], [m["id"] for m, _ in reversed(incoming)])
+        self.assertEqual([a["ageing"] for a in data["asks"]], ["stale", "warn", "warn", "ok", "ok"])
+        for ask, (msg, days) in zip(data["asks"], reversed(incoming)):
+            self.assertEqual(ask["id"], msg["ask_id"])
+            self.assertEqual(ask["from"], "will-hermes")
+            self.assertEqual(ask["channel"], "will")
+            self.assertEqual(ask["text"], msg["text"])
+            self.assertEqual(ask["opened"], board.now_iso(now - days * 86400))
+            self.assertAlmostEqual(ask["age_days"], days)
+        self.assertEqual(data["asks_by_me"][0]["to"], "will-hermes")
+        self.assertAlmostEqual(data["asks_by_me"][0]["age_days"], 6.2)
+        self.assertEqual(data["asks_by_me"][0]["ageing"], "ok")
+        self.assertEqual(data["latest"], {"channel": "will", "id": closed["id"], "ts": closed["ts"]})
+
+    def test_inbox_omits_unreadable_asks_and_latest_and_filters_channel(self):
+        visible = self.post("Visible ask", key=self.owner, ask_to="will-hermes")
+        hidden = self.post("Hidden ask", key=self.owner, channel="private", ask_to="will-hermes")
+        data = self.inbox(self.peer)
+        self.assertEqual([a["msg_id"] for a in data["asks"]], [visible["id"]])
+        self.assertEqual(data["latest"]["id"], visible["id"])
+        self.assertEqual(data["counts"], {"open_to_me": 1, "open_by_me": 0})
+        # Authorship alone must not make an unreadable outgoing ask visible either.
+        entries = self.keys.entries()
+        entries[0]["channels"] = ["will"]
+        self.keys._write(entries)
+        self.assertEqual([a["msg_id"] for a in self.inbox()["asks_by_me"]], [visible["id"]])
+        self.assertNotIn(hidden["text"], json.dumps(data))
+        filtered = self.inbox(self.peer, "will")
+        self.assertEqual([a["msg_id"] for a in filtered["asks"]], [visible["id"]])
+        self.assertEqual(filtered["latest"], data["latest"])
+        self.assertEqual(self.call("GET", "/api/inbox?channel=private", self.peer)[0], 403)
+        self.assertEqual(self.call("GET", "/api/inbox")[0], 401)
+        for suffix in ("?channel=", "?channel=BAD", "?channel=will&channel=private"):
+            self.assertEqual(self.call("GET", "/api/inbox" + suffix, self.owner)[0], 400)
+
+    def test_inbox_has_no_ledger_limit_and_does_not_ack_on_view(self):
+        for i in range(105):
+            self.store.post("will-hermes", "Question %d" % i, ask_to="hamish-hermes")
+        self.assertEqual(self.inbox()["counts"]["open_to_me"], 105)
+        with self.store._db() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM acks").fetchone()[0], 0)
+        self.store.ack("hamish-hermes", 105, "will")
+        self.assertEqual(self.inbox()["counts"]["open_to_me"], 105)
+
+    def test_empty_inbox_cli_and_json(self):
+        code, output, error = self.remote_cli("inbox", "--channel", "will", "--key", self.owner)
+        self.assertEqual((code, output, error), (0, "inbox: nothing waiting\n", ""))
+        code, output, error = self.remote_cli("inbox", "--json", "--key", self.owner)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output), {"asks": [], "asks_by_me": [],
+            "latest": {"channel": None, "id": 0, "ts": None},
+            "counts": {"open_to_me": 0, "open_by_me": 0}})
+
+    def test_inbox_cli_lists_both_sides_and_summary(self):
+        incoming = self.post("A question for you", key=self.peer, ask_to="hamish-hermes")
+        outgoing = self.post("A question for Will", key=self.owner, ask_to="will-hermes")
+        with self.store._db() as db:
+            db.execute("UPDATE asks SET opened_epoch=? WHERE id=?",
+                       (time.time() - 12 * 86400, incoming["ask_id"]))
+        code, output, error = self.remote_cli("inbox", "--channel", "will", "--key", self.owner)
+        self.assertEqual((code, error), (0, ""))
+        lines = output.splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("[will]  12.0d warn  from will-hermes", lines[0])
+        self.assertIn("to will-hermes", lines[1])
+        self.assertEqual(lines[-1], "1 waiting on you, 1 you are waiting on, oldest 12d")
+        code, output, error = self.remote_cli("inbox", "--json", "--key", self.peer)
+        self.assertEqual((code, error), (0, ""))
+        data = json.loads(output)
+        self.assertEqual(data["asks"][0]["msg_id"], outgoing["id"])
+        self.assertEqual(data["asks_by_me"][0]["msg_id"], incoming["id"])
 
 
 class ChannelAckMigrationTest(unittest.TestCase):
