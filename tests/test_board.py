@@ -470,7 +470,7 @@ class PhaseOneTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.store = board.Board(os.path.join(self.tmp, "board.db"))
         self.keys = board.Keys(KEY, self.tmp)
-        self.identity_key = self.keys.add("will-hermes", "Will")
+        self.identity_key = self.keys.add("will-hermes", "Will", ["will"])
         self.start_server()
 
     def start_server(self, legacy=KEY):
@@ -551,7 +551,7 @@ class PhaseOneTest(unittest.TestCase):
         self.assertEqual(self.call("GET", "/api/search?q=first", key=KEY)[1]["count"], 1)
 
     def test_identity_and_legacy_auth(self):
-        for key, identity, unrestricted in ((KEY, None, True), (self.identity_key, "will-hermes", False)):
+        for key, identity, unrestricted in ((KEY, "legacy", True), (self.identity_key, "will-hermes", False)):
             self.assertEqual(self.call("GET", "/api/identity", key=key),
                              (200, {"identity": identity, "unrestricted": unrestricted}))
         for key in (None, "unknown", "non-ascii-🔑"):
@@ -864,7 +864,7 @@ class PhaseTwoTest(unittest.TestCase):
 
     def setUp(self):
         PhaseOneTest.setUp(self)
-        self.hamish_key = self.keys.add("hamish-hermes", "Hamish")
+        self.hamish_key = self.keys.add("hamish-hermes", "Hamish", ["*"])
 
     def receipt(self, mid, key=None):
         status, data = self.call("POST", "/api/ack", key=key or self.identity_key, body={"id": mid})
@@ -1416,6 +1416,339 @@ class ServerResilienceTest(unittest.TestCase):
         self.assertGreaterEqual(data["uptime_s"], 0)
         self.assertEqual(data["max_concurrent"], 7)
         self.assertEqual(data["inflight"], 1, "the health request itself is in flight")
+
+
+class ChannelStorageTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="agent-board-channel-storage-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_fresh_and_migrated_schema_backfill_and_idempotence(self):
+        fresh = board.Board(os.path.join(self.tmp, "fresh.db"))
+        path = os.path.join(self.tmp, "old.db")
+        with sqlite3.connect(path) as db:
+            db.executescript("""
+                CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    epoch REAL NOT NULL, author TEXT NOT NULL,
+                    topic TEXT NOT NULL DEFAULT '', text TEXT NOT NULL,
+                    reply_to INTEGER, root_id INTEGER, amends INTEGER, amended_by INTEGER);
+                INSERT INTO messages(epoch,author,topic,text) VALUES(12,'old','tag','original');
+                INSERT INTO messages(epoch,author,text,reply_to,root_id) VALUES(13,'peer','reply',1,1);
+                CREATE TABLE row_updates (n INTEGER);
+                INSERT INTO row_updates VALUES(0);
+                CREATE TRIGGER detect_updates AFTER UPDATE ON messages BEGIN
+                    UPDATE row_updates SET n=n+1; END;
+            """)
+            before = db.execute("SELECT * FROM messages").fetchall()
+        migrated = board.Board(path)
+        with fresh._db() as db:
+            schema = [tuple(r) for r in db.execute("PRAGMA table_info(messages)")]
+            fts = [tuple(r) for r in db.execute("PRAGMA table_info(messages_fts)")]
+        with migrated._db() as db:
+            self.assertEqual([tuple(r) for r in db.execute("PRAGMA table_info(messages)")], schema)
+            rows = [tuple(r) for r in db.execute("SELECT * FROM messages ORDER BY id")]
+            self.assertEqual([r[:-1] for r in rows], before)
+            self.assertEqual([r[-1] for r in rows], ["will", "will"])
+            self.assertEqual([tuple(r) for r in db.execute("PRAGMA table_info(messages_fts)")], fts)
+            self.assertEqual([r[2] for r in db.execute("PRAGMA index_info(idx_messages_channel)")],
+                             ["channel", "id"])
+            self.assertEqual(db.execute("SELECT n FROM row_updates").fetchone()[0], 0)
+        reopened = board.Board(path)
+        with reopened._db() as db:
+            self.assertEqual([tuple(r) for r in db.execute("SELECT * FROM messages ORDER BY id")], rows)
+            self.assertEqual(db.execute("SELECT n FROM row_updates").fetchone()[0], 0)
+        self.assertEqual(reopened.post("new", "next")["id"], 3)
+
+    def test_membership_matrix_and_key_round_trips(self):
+        keys = board.Keys(KEY, self.tmp)
+        owner = keys.add("hamish-hermes", "Hamish", ["*"])
+        peer = keys.add("will-hermes", "Will", ["will"])
+        old = keys.add("old", "Older ring")
+        entries = keys.entries()
+        entries[-1].pop("channels")
+        keys._write(entries)
+        self.assertEqual(keys.resolve(KEY), ("legacy", True, True))
+        for key, identity, channels in ((owner, "hamish-hermes", ["*"]),
+                                         (peer, "will-hermes", ["will"]),
+                                         (old, "old", ["will"]), (KEY, "legacy", ["will"])):
+            self.assertEqual(keys.resolve(key)[0], identity)
+            self.assertEqual(keys.channels_for(identity), channels)
+            self.assertTrue(keys.may_read(identity, "will"))
+            self.assertEqual(keys.may_read(identity, "future"), identity == "hamish-hermes")
+        keys.add("temporary", channels=["another", "will"])
+        self.assertEqual(keys.revoke("temporary"), 1)
+        self.assertEqual(keys.entries(), entries)
+        self.assertEqual(keys.default_channel("hamish-hermes"), "will")
+        self.assertEqual(keys.default_channel("old"), "will")
+
+    def test_a_new_identity_lands_in_the_public_channel_not_a_direct_one(self):
+        # The whole point of channels is that a peer added later cannot read the
+        # conversation that was already happening. A default of `will` would make
+        # one careless `key add` leak the direct channel to a flatmate.
+        keys = board.Keys(KEY, self.tmp)
+        keys.add("hamish-hermes", "Hamish", ["*"])
+        keys.add("will-hermes", "Will", ["will"])
+        flatmate = keys.add("cole-hermes", "Cole")
+        self.assertEqual(keys.resolve(flatmate)[0], "cole-hermes")
+        self.assertEqual(keys.channels_for("cole-hermes"), ["house"])
+        self.assertTrue(keys.may_read("cole-hermes", "house"))
+        self.assertFalse(keys.may_read("cole-hermes", "will"),
+                         "a new identity must not read a direct channel by default")
+
+
+class ChannelAPITest(unittest.TestCase):
+    conn = BoardTest.conn
+    call = BoardTest.call
+    upload = BoardTest.upload
+    raw_get = BoardTest.raw_get
+    start_server = PhaseOneTest.start_server
+    post = PhaseOneTest.post
+    cli = PhaseOneTest.cli
+    remote_cli = PhaseOneTest.remote_cli
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="agent-board-channels-api-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.store = board.Board(os.path.join(self.tmp, "board.db"))
+        self.keys = board.Keys(KEY, self.tmp)
+        self.owner = self.keys.add("hamish-hermes", "Hamish", ["*"])
+        self.peer = self.keys.add("will-hermes", "Will", ["will"])
+        self.multi = self.keys.add("other", "Other", ["private", "will"])
+        self.start_server()
+
+    def seed(self):
+        public = self.post("Visible narwhal evidence in the shared conversation.",
+                           key=self.owner, topic="same", ask_to="will-hermes")
+        secret = self.post("Hidden narwhal secret-codename inside another audience.",
+                           key=self.owner, channel="private", topic="same", ask_to="other")
+        return public, secret
+
+    def test_default_write_channels_and_read_union(self):
+        self.assertEqual(self.post(key=self.owner)["channel"], "will")
+        self.assertEqual(self.post(key=self.peer)["channel"], "will")
+        self.assertEqual(self.post(key=self.multi)["channel"], "private")
+        self.assertEqual(self.post(author="any-author")["channel"], "will")
+        for key, expected in ((self.owner, {"will", "private"}), (self.multi, {"will", "private"}),
+                              (self.peer, {"will"}), (KEY, {"will"})):
+            status, data = self.call("GET", "/api/messages", key)
+            self.assertEqual(status, 200)
+            self.assertEqual({m["channel"] for m in data["messages"]}, expected)
+        entries = self.keys.entries()
+        entries[1].pop("channels")
+        self.keys._write(entries)
+        self.assertEqual(self.call("GET", "/api/messages?channel=private", self.peer)[0], 403)
+
+    def test_forbidden_channels_for_posts_and_all_read_surfaces(self):
+        self.seed()
+        paths = ("/api/messages", "/api/messages.md", "/api/messages.json", "/api/search?q=narwhal",
+                 "/api/search.json?q=narwhal", "/api/digest", "/api/digest.md", "/api/digest.json",
+                 "/api/messages/threads", "/api/asks")
+        for key in (KEY, self.peer):
+            status, data = self.call("POST", "/api/messages", key,
+                                     {"text": "forbidden", "channel": "private"})
+            self.assertEqual(status, 403)
+            self.assertIn("private", data["error"])
+            for path in paths:
+                with self.subTest(key=key == KEY, path=path):
+                    status, data = self.call("GET", path + ("&" if "?" in path else "?") + "channel=private", key)
+                    self.assertEqual(status, 403)
+                    self.assertIn("private", data["error"])
+
+    def test_empty_query_values_keep_existing_search_alias_behavior(self):
+        self.seed()
+        status, data = self.call("GET", "/api/search?q=&search=narwhal", self.peer)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["count"], 1)
+
+    def test_unknown_authorized_channel_returns_empty_results(self):
+        self.seed()
+        for path, field in (("/api/messages", "messages"), ("/api/search?q=narwhal", "results"),
+                            ("/api/messages/threads", "threads"), ("/api/asks", "asks")):
+            status, data = self.call("GET", path + ("&" if "?" in path else "?") + "channel=unknown", self.owner)
+            self.assertEqual(status, 200)
+            self.assertEqual(data[field], [])
+        status, data = self.call("GET", "/api/digest?channel=unknown", self.owner)
+        self.assertEqual((status, data["entries"], data["text"]), (200, 0, ""))
+        self.assertNotIn("secret-codename", self.call("GET", "/api/messages.md?channel=unknown", self.owner)[1])
+        # Nonexistent channels still require membership: do not bypass the 403 rule.
+        self.assertEqual(self.call("GET", "/api/messages?channel=unknown", self.peer)[0], 403)
+
+    def test_search_digest_markdown_threads_and_asks_do_not_leak(self):
+        public, secret = self.seed()
+        paths = ("/api/messages", "/api/messages.md", "/api/messages?search=narwhal", "/api/search?q=narwhal",
+                 "/api/digest", "/api/digest.md", "/api/messages/threads", "/api/asks")
+        for path in paths:
+            for key in (self.peer, KEY):
+                status, data = self.call("GET", path, key)
+                self.assertEqual(status, 200)
+                rendered = json.dumps(data)
+                self.assertNotIn("secret-codename", rendered, path)
+                self.assertNotIn('"private"', rendered, path)
+        result = self.call("GET", "/api/search?q=narwhal", self.peer)[1]["results"]
+        self.assertEqual([m["id"] for m in result], [public["id"]])
+        self.assertIn("«narwhal»", result[0]["snippet"])
+        self.assertEqual(self.call("GET", "/api/digest", self.peer)[1]["entries"], 1)
+        self.assertEqual(self.call("GET", "/api/asks?channel=private", self.owner)[1]["asks"][0]["msg_id"], secret["id"])
+        self.assertEqual(self.call("GET", "/api/messages?topic=same&channel=private", self.owner)[1]["messages"][0]["topic"], "same")
+        # Exercise the legacy FTS snippet fallback with no paragraph chunks.
+        with self.store._db() as db:
+            db.execute("DELETE FROM chunk_fts")
+        result = self.call("GET", "/api/search?q=narwhal", self.peer)[1]["results"]
+        self.assertEqual([m["id"] for m in result], [public["id"]])
+        self.assertNotIn("secret-codename", json.dumps(result))
+
+    def test_sql_filters_before_message_conversion_and_pagination(self):
+        public, _ = self.seed()
+        later = self.post("Second readable narwhal evidence for pagination.", key=self.peer)
+        original = self.store._row
+        def check_row(row, files=None):
+            self.assertEqual(row["channel"], "will", "forbidden row fetched before Python conversion")
+            return original(row, files)
+        with mock.patch.object(self.store, "_row", side_effect=check_row):
+            for path in ("/api/messages?limit=1", "/api/messages?before=999&limit=1", "/api/search?q=narwhal&limit=1",
+                         "/api/digest", "/api/messages?search=narwhal"):
+                self.assertEqual(self.call("GET", path, self.peer)[0], 200)
+        data = self.call("GET", "/api/messages?limit=1", self.peer)[1]
+        self.assertTrue(data["has_more"])
+        self.assertEqual(data["messages"][0]["id"], public["id"])
+        data = self.call("GET", "/api/messages?since=%d&limit=1" % public["id"], self.peer)[1]
+        self.assertFalse(data["has_more"])
+        self.assertEqual(data["messages"][0]["id"], later["id"])
+
+    def test_long_poll_does_not_return_foreign_messages(self):
+        self.post("Hidden", key=self.owner, channel="private")
+        started = time.monotonic()
+        status, data = self.call("GET", "/api/messages?wait=0.15", self.peer)
+        self.assertEqual((status, data["messages"]), (200, []))
+        self.assertGreaterEqual(time.monotonic() - started, 0.1)
+
+    def test_reply_and_amend_channels_and_whole_thread(self):
+        root = self.post("Root", key=self.owner, channel="private", topic="tag")
+        child = self.post("Child", key=self.multi, channel="private", reply_to=root["id"])
+        for field in ("reply_to", "amends"):
+            status, data = self.call("POST", "/api/messages", self.owner,
+                                     {"text": "wrong audience", "channel": "will", field: child["id"]})
+            self.assertEqual(status, 400)
+            self.assertIn("channel", data["error"])
+        amended = self.post("Amended", key=self.owner, channel="private", amends=root["id"])
+        self.assertEqual(amended["topic"], "tag")
+        status, data = self.call("GET", "/api/messages?thread=%d" % child["id"], self.multi)
+        self.assertEqual(status, 200)
+        self.assertEqual([m["id"] for m in data["messages"]], [root["id"], child["id"], amended["id"]])
+        self.assertEqual(self.call("GET", "/api/messages?thread=%d" % root["id"], self.peer)[1]["messages"], [])
+        code, out, error = self.remote_cli("read", "--thread", str(child["id"]), "--channel", "private",
+                                           "--key", self.multi, "--json", "--limit", "1")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(out)["count"], 3)
+
+    def test_files_follow_message_audience_and_authenticated_upload_owner(self):
+        _, own = self.upload("own.txt", b"peer upload", key=self.peer)
+        own_id = own["file"]["id"]
+        _, other = self.upload("other.txt", b"other upload", key=self.multi)
+        other_id = other["file"]["id"]
+        path = "/api/files/%d" % other_id
+        self.assertEqual(self.raw_get(path, self.peer)[0], 404)
+        self.assertEqual(self.raw_get(path, self.multi)[0], 200)
+        self.assertEqual(self.raw_get(path, self.owner)[0], 200)
+        self.assertEqual([f["id"] for f in self.call("GET", "/api/files", self.peer)[1]["files"]], [own_id])
+        self.post("Private attachment", key=self.owner, channel="private", files=[own_id, other_id])
+        # Even an uploader loses access once all attachments belong to a foreign audience.
+        self.assertEqual(self.raw_get("/api/files/%d" % own_id, self.peer)[0], 404)
+        self.assertEqual(self.call("GET", "/api/files", self.peer)[1]["files"], [])
+        self.assertEqual(self.call("POST", "/api/messages", self.peer,
+                                   {"text": "steal attachment", "files": [other_id]})[0], 400)
+        self.post("Shared attachment", key=self.owner, files=[other_id])
+        self.assertEqual(self.raw_get(path, self.peer)[1], b"other upload")
+        self.assertEqual([f["id"] for f in self.call("GET", "/api/files", self.peer)[1]["files"]], [other_id])
+        # The old public uploader label must not act as authenticated ownership.
+        rec = self.store.store_file("spoof.txt", "text/plain", b"spoof", "will-hermes", "other")
+        self.assertEqual(self.raw_get(rec["url"], self.peer)[0], 404)
+
+    def test_asks_cannot_be_closed_from_a_foreign_audience(self):
+        _, secret = self.seed()
+        visible = self.post("Visible answer", key=self.peer)
+        path = "/api/asks/%d/close" % secret["ask_id"]
+        self.assertEqual(self.call("POST", path, self.peer, {"msg_id": visible["id"]})[0], 400)
+        self.assertEqual(self.call("POST", "/api/messages", self.peer,
+                                   {"text": "answer", "answers": secret["ask_id"]})[0], 400)
+        self.assertEqual(self.call("POST", path, self.owner, {"msg_id": visible["id"]})[0], 400)
+        self.assertEqual(self.call("GET", "/api/asks?channel=private", self.owner)[1]["count"], 1)
+
+    def test_invalid_channel_boundaries(self):
+        for slug in ("", "UPPER", "has space", "a/b", "-first", "a" * 33, "*", "é", "a\n"):
+            with self.subTest(slug=slug):
+                self.store.rates.clear()
+                status, data = self.call("POST", "/api/messages", self.owner, {"text": "bad", "channel": slug})
+                self.assertEqual(status, 400)
+                self.assertIn("channel must match", data["error"])
+                status, data = self.call("GET", "/api/messages?channel=" + board.urllib.parse.quote(slug), self.owner)
+                self.assertEqual(status, 400)
+                self.assertIn("channel must match", data["error"])
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    board.main(["read", "--channel", slug])
+                self.assertEqual(error.exception.code, 2)
+        for value in (None, 7, [], True):
+            self.assertEqual(self.call("POST", "/api/messages", self.owner, {"text": "bad", "channel": value})[0], 400)
+        self.assertEqual(self.call("GET", "/api/messages?channel=will&channel=private", self.owner)[0], 400)
+        self.assertEqual(self.post(key=self.owner, channel="a_0-" + "z" * 28)["channel"], "a_0-" + "z" * 28)
+
+    def test_health_channels_discovery_and_channels_cli_no_secrets(self):
+        self.seed()
+        status, data = self.call("GET", "/api/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["channels"], {"will": 1, "private": 1})
+        for field in ("messages", "latest_id", "topics", "files", "delivery", "uptime_s", "inflight", "max_concurrent"):
+            self.assertIn(field, data)
+        code, out, error = self.remote_cli("channels", "--key", self.owner)
+        self.assertEqual(code, 0, error)
+        self.assertIn("private  1  hamish-hermes, other", out)
+        self.assertIn("will  1  hamish-hermes, legacy, other, will-hermes", out)
+        for secret in (KEY, self.owner, self.peer, self.multi):
+            self.assertNotIn(secret, out)
+        code, out, _ = self.remote_cli("channels", "--key", self.peer)
+        self.assertEqual(code, 0)
+        self.assertNotIn("private", out)
+        # Wildcard membership includes future channels without another key-ring edit.
+        self.post(key=self.owner, channel="future")
+        self.assertIn("future", self.remote_cli("channels", "--key", self.owner)[1])
+        self.assertNotIn("house", self.call("GET", "/api/health")[1]["channels"])
+
+    def test_cli_channel_flags_text_file_and_key_membership_round_trips(self):
+        note = os.path.join(self.tmp, "note.txt")
+        with open(note, "w") as fh:
+            fh.write("A narwhal note from the unchanged text-file workflow.")
+        code, _, error = self.remote_cli("post", "--text-file", note, "--key", self.peer)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(self.store.fetch()[0]["channel"], "will")
+        code, _, error = self.remote_cli("post", "--text-file", note, "--channel", "private", "--key", self.multi)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(self.store.fetch()[1]["channel"], "private")
+        self.assertEqual(self.remote_cli("amend", "2", "correction", "--channel", "private", "--key", self.multi)[0], 0)
+        for argv in (("read", "--json"), ("search", "narwhal", "--json"), ("digest",), ("threads",), ("open", "--json")):
+            code, _, error = self.remote_cli(*argv, "--channel", "private", "--key", self.owner)
+            self.assertIn(code, (0, 1), error)  # open returns 1 for an empty ledger
+            self.assertNotIn("failed", error)
+        # Delivery accepts the channel option while retaining its global state.
+        self.assertEqual(self.remote_cli("delivery", "--state", "--channel", "private", "--key", self.owner)[0], 0)
+        with mock.patch.object(board, "request", side_effect=KeyboardInterrupt) as request:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+                board.main(["watch", "--channel", "private", "--key", self.owner, "--url", "http://127.0.0.1:%d" % self.port])
+            self.assertIn("channel=private", request.call_args.args[0])
+        code, _, error = self.cli("key", "add", "--identity", "new-peer", "--label", "New", "--channel", "will", "--channel", "private")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(self.keys.channels_for("new-peer"), ["will", "private"])
+        before = self.keys.entries()
+        self.assertEqual(self.cli("key", "add", "--identity", "remove-me")[0], 0)
+        self.assertEqual(self.cli("key", "revoke", "--identity", "remove-me")[0], 0)
+        self.assertEqual(self.keys.entries(), before)
+
+    def test_web_channel_controls_are_self_contained(self):
+        status, html = self.call("GET", "/")
+        self.assertEqual(status, 200)
+        for text in ('<select id="channel"', "fetch('/api/channels'", "channel: $('#channel').value", "channelCount > 1",
+                     "esc(m.channel)", "channelQuery()", "setReply(null)"):
+            self.assertIn(text, html)
+        self.assertNotIn('<script src=', html)
 
 
 if __name__ == "__main__":

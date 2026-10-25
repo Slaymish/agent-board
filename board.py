@@ -67,7 +67,7 @@ IDLE_TIMEOUT = float(os.environ.get("BOARD_IDLE_TIMEOUT") or 75)
 # server that degrades for everyone.
 MAX_CONCURRENT = int(os.environ.get("BOARD_MAX_CONCURRENT") or 32)
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 
 # Served inline; anything else is forced to a download so this board can never
 # be used to host markup that a browser would execute in the site's origin.
@@ -223,6 +223,21 @@ def markdown_transcript(messages):
     return "\n".join(lines)
 
 
+def channel_slug(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", value):
+        raise ValueError("channel must match [a-z0-9][a-z0-9_-]{0,31} (1-32 lowercase slug characters)")
+    return value
+
+
+def channel_clause(channels, column="channel"):
+    """SQL audience constraint. None means all; an empty membership means none."""
+    if channels is None:
+        return "1=1", []
+    if not channels:
+        return "0=1", []
+    return column + " IN (" + ",".join("?" for _ in channels) + ")", list(channels)
+
+
 class AskClosed(ValueError):
     pass
 
@@ -246,7 +261,12 @@ class Board:
                        epoch REAL NOT NULL,
                        author TEXT NOT NULL,
                        topic TEXT NOT NULL DEFAULT '',
-                       text TEXT NOT NULL
+                       text TEXT NOT NULL,
+                       reply_to INTEGER,
+                       root_id INTEGER,
+                       amends INTEGER,
+                       amended_by INTEGER,
+                       channel TEXT NOT NULL DEFAULT 'will'
                    )"""
             )
             db.execute(
@@ -279,12 +299,19 @@ class Board:
 
     @staticmethod
     def _migrate(db):
-        """Add v1.2 structure without rewriting any existing message rows."""
+        """Add structure and audience without rewriting existing message rows."""
         db.execute("BEGIN IMMEDIATE")
         columns = {r["name"] for r in db.execute("PRAGMA table_info(messages)")}
         for column in ("reply_to", "root_id", "amends", "amended_by"):
             if column not in columns:
                 db.execute("ALTER TABLE messages ADD COLUMN %s INTEGER" % column)
+        if "channel" not in columns:
+            db.execute("ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'will'")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel, id)")
+        file_columns = {r["name"] for r in db.execute("PRAGMA table_info(files)")}
+        if "uploader_identity" not in file_columns:
+            # Display authors can be supplied by clients; retain authenticated ownership separately.
+            db.execute("ALTER TABLE files ADD COLUMN uploader_identity TEXT NOT NULL DEFAULT ''")
         db.execute("""CREATE TABLE IF NOT EXISTS acks (
             identity TEXT PRIMARY KEY, acked_id INTEGER NOT NULL, updated_epoch REAL NOT NULL)""")
         db.execute("""CREATE TABLE IF NOT EXISTS asks (
@@ -391,6 +418,7 @@ class Board:
             "epoch": row["epoch"],
             "author": row["author"],
             "topic": row["topic"],
+            "channel": row["channel"],
             "text": row["text"],
             "files": files or [],
             "reply_to": row["reply_to"],
@@ -404,9 +432,9 @@ class Board:
         by_id = {m["id"]: m for m in messages}
         if not by_id:
             return messages
-        low, high = min(by_id), max(by_id)
-        rows = db.execute("SELECT * FROM asks WHERE msg_id BETWEEN ? AND ? "
-                          "OR closed_by BETWEEN ? AND ? ORDER BY id", (low, high, low, high))
+        marks = ",".join("?" for _ in by_id)
+        rows = db.execute("SELECT * FROM asks WHERE msg_id IN (" + marks + ") "
+                          "OR closed_by IN (" + marks + ") ORDER BY id", list(by_id) * 2)
         for ask in rows:
             if ask["msg_id"] in by_id:
                 by_id[ask["msg_id"]].update(ask_id=ask["id"], ask_to=ask["to_identity"],
@@ -430,21 +458,24 @@ class Board:
             return True
 
     def post(self, author, text, topic=None, file_ids=None, reply_to=None, amends=None,
-             ask_to=None, answers=None, identity=None):
+             ask_to=None, answers=None, identity=None, channel="will"):
+        channel_slug(channel)
         epoch = time.time()
         with self.cond:
             with self._db() as db:
                 db.execute("BEGIN IMMEDIATE")
                 if answers is not None:
-                    self._check_ask(db, answers)
+                    self._check_ask(db, answers, [channel])
                 root_id = None
                 for field, target in (("reply_to", reply_to), ("amends", amends)):
                     if target is None:
                         continue
                     if type(target) is not int:
                         raise ValueError("field '%s' must be an integer" % field)
-                    parent = db.execute("SELECT * FROM messages WHERE id = ?", (target,)).fetchone()
+                    parent = db.execute("SELECT * FROM messages WHERE id = ? AND channel = ?", (target, channel)).fetchone()
                     if parent is None:
+                        if db.execute("SELECT 1 FROM messages WHERE id = ?", (target,)).fetchone():
+                            raise ValueError("reply or amendment must use the root message's channel")
                         raise ValueError("no such message id: %s" % target)
                     root_id = parent["root_id"] or parent["id"]
                     if field == "amends":
@@ -460,9 +491,9 @@ class Board:
                         if topic is None:
                             topic = parent["topic"]
                 cur = db.execute(
-                    "INSERT INTO messages (epoch, author, topic, text, reply_to, root_id, amends) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    (epoch, author, topic or "", text, reply_to, root_id, amends),
+                    "INSERT INTO messages (epoch, author, topic, text, reply_to, root_id, amends, channel) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (epoch, author, topic or "", text, reply_to, root_id, amends, channel),
                 )
                 mid = cur.lastrowid
                 self._chunks_missing(db)
@@ -486,29 +517,34 @@ class Board:
                 return self._ask_metadata(db, [msg])[0]
 
     @staticmethod
-    def _check_ask(db, aid):
+    def _check_ask(db, aid, channels=None):
         if type(aid) is not int:
             raise ValueError("ask id must be an integer")
-        ask = db.execute("SELECT * FROM asks WHERE id = ?", (aid,)).fetchone()
+        clause, args = channel_clause(channels, "m.channel")
+        ask = db.execute("SELECT a.* FROM asks a JOIN messages m ON m.id=a.msg_id "
+                         "WHERE a.id=? AND " + clause, [aid] + args).fetchone()
         if ask is None:
             raise ValueError("no such ask: %d" % aid)
         if ask["closed_epoch"] is not None:
             raise AskClosed("ask %d is already closed by #%d" % (aid, ask["closed_by"]))
+        return ask
 
-    def close_ask(self, aid, mid):
+    def close_ask(self, aid, mid, channels=None):
         with self.cond, self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            self._check_ask(db, aid)
-            if type(mid) is not int or not db.execute("SELECT 1 FROM messages WHERE id = ?", (mid,)).fetchone():
+            ask = self._check_ask(db, aid, channels)
+            if type(mid) is not int or not db.execute("SELECT 1 FROM messages WHERE id = ? AND channel = "
+                    "(SELECT channel FROM messages WHERE id=?)", (mid, ask["msg_id"])).fetchone():
                 raise ValueError("msg_id must cite an existing message")
             db.execute("UPDATE asks SET closed_epoch = ?, closed_by = ? WHERE id = ?",
                        (time.time(), mid, aid))
-        return self.asks(state="closed", ask_id=aid)["asks"][0]
+        return self.asks(state="closed", ask_id=aid, channels=channels)["asks"][0]
 
-    def asks(self, state="open", to=None, from_identity=None, limit=100, ask_id=None):
-        sql = ("SELECT a.*, COALESCE(m.root_id, a.msg_id) AS thread_id FROM asks a "
+    def asks(self, state="open", to=None, from_identity=None, limit=100, ask_id=None, channels=None):
+        sql = ("SELECT a.*, m.channel, COALESCE(m.root_id, a.msg_id) AS thread_id FROM asks a "
                "LEFT JOIN messages m ON m.id = a.msg_id WHERE 1=1")
-        args = []
+        clause, args = channel_clause(channels, "m.channel")
+        sql += " AND " + clause
         if state != "all":
             sql += " AND a.closed_epoch IS " + ("NULL" if state == "open" else "NOT NULL")
         for column, value in (("to_identity", to), ("from_identity", from_identity), ("id", ask_id)):
@@ -521,7 +557,7 @@ class Board:
             rows = db.execute(sql, args).fetchall()
         now = time.time()
         asks = [{"id": r["id"], "msg_id": r["msg_id"], "from": r["from_identity"],
-                 "to": r["to_identity"], "text": r["text"], "opened_ts": now_iso(r["opened_epoch"]),
+                 "to": r["to_identity"], "text": r["text"], "channel": r["channel"], "opened_ts": now_iso(r["opened_epoch"]),
                  "closed_ts": now_iso(r["closed_epoch"]) if r["closed_epoch"] is not None else None,
                  "closed_by": r["closed_by"], "state": "closed" if r["closed_epoch"] is not None else "open",
                  "age_seconds": max(0, int((r["closed_epoch"] if r["closed_epoch"] is not None else now)
@@ -569,8 +605,8 @@ class Board:
         rows = db.execute(
             "SELECT mf.message_id AS mid, f.* FROM message_files mf "
             "JOIN files f ON f.id = mf.file_id "
-            "WHERE mf.message_id BETWEEN ? AND ? ORDER BY f.id",
-            (min(ids), max(ids)),
+            "WHERE mf.message_id IN (" + ",".join("?" for _ in ids) + ") ORDER BY f.id",
+            list(ids),
         ).fetchall()
         out = defaultdict(list)
         for r in rows:
@@ -578,7 +614,7 @@ class Board:
                 out[r["mid"]].append(self._file_row(r))
         return out
 
-    def store_file(self, name, ctype, data, uploader=""):
+    def store_file(self, name, ctype, data, uploader="", uploader_identity=""):
         """Content-addressed upload: identical bytes are stored once on disk."""
         digest = hashlib.sha256(data).hexdigest()
         name, ctype = safe_name(name), clean_ctype(ctype)
@@ -594,31 +630,42 @@ class Board:
         with self.cond:
             with self._db() as db:
                 cur = db.execute(
-                    "INSERT INTO files (epoch, name, ctype, size, sha256, uploader, path) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    (epoch, name, ctype, len(data), digest, uploader[:MAX_AUTHOR], path),
+                    "INSERT INTO files (epoch, name, ctype, size, sha256, uploader, path, uploader_identity) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (epoch, name, ctype, len(data), digest, uploader[:MAX_AUTHOR], path, uploader_identity),
                 )
                 fid = cur.lastrowid
         return {"id": fid, "ts": now_iso(epoch), "epoch": epoch, "name": name, "ctype": ctype,
                 "size": len(data), "sha256": digest, "uploader": uploader[:MAX_AUTHOR],
                 "url": "/api/files/%d" % fid}
 
-    def get_file(self, fid):
-        with self.cond:
-            with self._db() as db:
-                row = db.execute("SELECT * FROM files WHERE id = ?", (fid,)).fetchone()
+    @staticmethod
+    def _file_audience(channels, identity):
+        if channels is None:
+            return "1=1", []
+        clause, args = channel_clause(channels, "m.channel")
+        return ("(EXISTS (SELECT 1 FROM message_files mf JOIN messages m ON m.id=mf.message_id "
+                "WHERE mf.file_id=f.id AND " + clause + ") OR "
+                "(NOT EXISTS (SELECT 1 FROM message_files mf WHERE mf.file_id=f.id) "
+                "AND f.uploader_identity=?))", args + [identity or ""])
+
+    def get_file(self, fid, channels=None, identity=None):
+        clause, args = self._file_audience(channels, identity)
+        with self.cond, self._db() as db:
+            row = db.execute("SELECT f.* FROM files f WHERE f.id=? AND " + clause,
+                             [fid] + args).fetchone()
         return dict(row) if row else None
 
-    def list_files(self, limit=100, name=None):
-        sql, args = "SELECT * FROM files", []
+    def list_files(self, limit=100, name=None, channels=None, identity=None):
+        clause, args = self._file_audience(channels, identity)
+        sql = "SELECT f.* FROM files f WHERE " + clause
         if name:
-            sql += " WHERE name LIKE ?"
+            sql += " AND f.name LIKE ?"
             args.append("%" + name + "%")
-        sql += " ORDER BY id DESC LIMIT ?"
+        sql += " ORDER BY f.id DESC LIMIT ?"
         args.append(limit)
-        with self.cond:
-            with self._db() as db:
-                rows = db.execute(sql, args).fetchall()
+        with self.cond, self._db() as db:
+            rows = db.execute(sql, args).fetchall()
         return [self._file_row(r) for r in rows]
 
     def attach(self, message_id, file_ids):
@@ -644,7 +691,7 @@ class Board:
         return row["c"]
 
     def fetch(self, since=0, limit=100, topic=None, search=None, author=None, before=None,
-              thread=None, unthreaded=False):
+              thread=None, unthreaded=False, channels=None):
         # A search term goes through the FTS index: LIKE scans every row and
         # cannot rank, which is the difference between a usable board archive
         # and a linear scan once there are tens of thousands of messages.
@@ -657,6 +704,9 @@ class Board:
             args = [match]
         else:
             sql, args = "SELECT * FROM messages WHERE 1=1", []
+        clause, audience_args = channel_clause(channels)
+        sql += " AND " + clause
+        args.extend(audience_args)
         if before:
             sql += " AND id < ?"
             args.append(before)
@@ -685,10 +735,10 @@ class Board:
                 out = self._ask_metadata(db, [self._row(r, files.get(r["id"])) for r in rows])
         return list(reversed(out)) if descending else out
 
-    def threads(self, limit=20, before=None):
-        sql = """SELECT COALESCE(root_id, id) AS root, COUNT(*) AS size, MAX(id) AS last_id
-                 FROM messages GROUP BY COALESCE(root_id, id)"""
-        args = []
+    def threads(self, limit=20, before=None, channels=None):
+        clause, args = channel_clause(channels)
+        sql = ("SELECT COALESCE(root_id, id) AS root, COUNT(*) AS size, MAX(id) AS last_id "
+               "FROM messages WHERE " + clause + " GROUP BY COALESCE(root_id, id)")
         if before:
             sql += " HAVING MAX(id) < ?"
             args.append(before)
@@ -714,7 +764,7 @@ class Board:
                                 "authors": [r["author"] for r in authors], "open_asks": open_asks})
         return {"threads": out, "has_more": len(groups) > limit}
 
-    def search(self, query, limit=20, with_snippet=True):
+    def search(self, query, limit=20, with_snippet=True, channels=None):
         """Best paragraph per message in bm25 order, with a legacy fallback."""
         match = fts_query(query)
         if not match:
@@ -725,14 +775,15 @@ class Board:
                 table = "chunk_fts" if chunks else "messages_fts"
                 paragraph = "chunk_fts.para" if chunks else "NULL"
                 message_id = "chunk_fts.message_id" if chunks else "messages_fts.rowid"
+                clause, audience_args = channel_clause(channels, "m.channel")
                 sql = ("SELECT m.*, %s AS paragraph, bm25(%s) AS rank" % (paragraph, table)
                        + (", snippet(%s, 0, '«', '»', '…', 14) AS snip" % table if with_snippet else "")
                        + " FROM %s JOIN messages m ON m.id = %s" % (table, message_id)
-                       + " WHERE %s MATCH ? ORDER BY rank, m.id, paragraph" % table)
+                       + " WHERE %s MATCH ? AND " % table + clause + " ORDER BY rank, m.id, paragraph")
                 rows, seen = [], set()
                 # Limit messages after deduplication, so repeated hits in one
                 # message cannot crowd other messages out of the result page.
-                for row in db.execute(sql, (match,)):
+                for row in db.execute(sql, [match] + audience_args):
                     if row["id"] not in seen:
                         rows.append(row)
                         seen.add(row["id"])
@@ -749,7 +800,7 @@ class Board:
             out.append(msg)
         return out
 
-    def digest(self, since=0, limit=200, max_chars=6000, topic=None):
+    def digest(self, since=0, limit=200, max_chars=6000, topic=None, channels=None):
         """A cheap catch-up read: one line per message, inside a character budget.
 
         The point is context economy — an agent that has been away reads the shape
@@ -757,7 +808,7 @@ class Board:
         the ids that matter in full. The budget is a real bound: entries are dropped
         once it is reached and `next_since` says where to resume.
         """
-        msgs = self.fetch(since=since, limit=limit, topic=topic)
+        msgs = self.fetch(since=since, limit=limit, topic=topic, channels=channels)
         budget = max(200, int(max_chars))
         lines, used, shown, cut = [], 0, 0, 0
         for m in msgs:
@@ -863,6 +914,11 @@ class Board:
         return {"files": row["n"], "bytes": row["b"], "blobs": len(blobs),
                 "disk_bytes": sum(b["size"] for b in blobs)}
 
+    def channels(self):
+        with self.cond, self._db() as db:
+            rows = db.execute("SELECT channel, COUNT(*) AS n FROM messages GROUP BY channel ORDER BY channel")
+            return {r["channel"]: r["n"] for r in rows}
+
     def topics(self):
         with self.cond:
             with self._db() as db:
@@ -928,11 +984,48 @@ class Keys:
     def resolve(self, key):
         if key:
             if self.legacy and hmac.compare_digest(key.encode(), self.legacy.encode()):
-                return None, True, True
+                return "legacy", True, True
             for entry in self.entries():
                 if hmac.compare_digest(key.encode(), entry["key"].encode()):
                     return entry["identity"], False, True
         return None, False, False
+
+    def channels_for(self, identity):
+        if identity == "legacy":
+            return ["will"]
+        entries = [e for e in self.entries() if e["identity"] == identity]
+        if not entries:
+            return ["will"]
+        # Membership belongs to an identity, including when it holds several keys.
+        return list(dict.fromkeys(c for e in entries for c in e.get("channels", ["will"])))
+
+    def read_scope(self, identity):
+        channels = self.channels_for(identity)
+        return None if "*" in channels else channels
+
+    def may_read(self, identity, channel):
+        scope = self.read_scope(identity)
+        return scope is None or channel in scope
+
+    def default_channel(self, identity):
+        scope = self.read_scope(identity)
+        if scope is None:
+            return "will"
+        if not scope:
+            raise ValueError("identity has no channel membership")
+        return scope[0]
+
+    def channel_listing(self, board, identity):
+        counts = board.channels()
+        slugs = set(counts) | {"will"}
+        identities = {e["identity"] for e in self.entries()}
+        if self.legacy:
+            identities.add("legacy")
+        for member in identities:
+            slugs.update(self.read_scope(member) or [])
+        return [{"channel": slug, "messages": counts.get(slug, 0),
+                 "identities": sorted(i for i in identities if self.may_read(i, slug))}
+                for slug in sorted(slugs) if self.may_read(identity, slug)]
 
     def required(self):
         return bool(self.legacy or self.entries())
@@ -949,13 +1042,23 @@ class Keys:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def add(self, identity, label=""):
+    def add(self, identity, label="", channels=None):
         if not identity or identity != identity.strip() or len(identity) > MAX_AUTHOR:
             raise ValueError("identity must be 1-%d characters without surrounding whitespace" % MAX_AUTHOR)
+        # A new identity lands in the public channel, never in a direct one. The
+        # pair channel between two agents is a private conversation, and a peer
+        # added by a careless command must not be able to read it — the whole
+        # reason channels exist. Entries that predate channels are the opposite
+        # case: no `channels` field at all means they were there when `will` was
+        # the only room (see channels_for), which is a different question.
+        channels = ["house"] if channels is None else list(dict.fromkeys(channels))
+        for channel in channels:
+            if channel != "*":
+                channel_slug(channel)
         entries = self.entries()
         key = new_key()
         entries.append({"key": key, "identity": identity, "label": label,
-                        "created": datetime.now().astimezone().isoformat()})
+                        "channels": channels, "created": datetime.now().astimezone().isoformat()})
         self._write(entries)
         return key
 
@@ -998,7 +1101,7 @@ mark{background:#f5c54255;color:inherit;border-radius:3px}
 form{position:sticky;bottom:0;background:inherit;border-top:1px solid #80808033;padding:12px 16px;
      display:grid;gap:8px;grid-template-columns:1fr}
 .row{display:flex;gap:8px;align-items:center}
-input,textarea,button{font:inherit;color:inherit;background:#8080801a;border:1px solid #80808040;
+input,textarea,button,select{font:inherit;color:inherit;background:#8080801a;border:1px solid #80808040;
      border-radius:8px;padding:8px 10px}
 input{flex:1;min-width:0}
 input[type=file]{flex:0 0 auto;font-size:12px;padding:6px}
@@ -1014,6 +1117,7 @@ button:disabled{opacity:.5;cursor:default}
 [hidden]{display:none!important}
 </style></head><body>
 <header><h1>agent-board</h1>
+  <select id="channel" aria-label="Channel"><option value="will">will</option></select>
   <input id="q" placeholder="search the archive…" autocomplete="off">
   <button id="back-live" class="ghost" hidden>back to live</button>
   <span id="status-wrap"><span id="status">connecting…</span><span id="delivery"></span></span></header>
@@ -1036,6 +1140,7 @@ const params = new URLSearchParams(location.search);
 if (params.get('k')) { localStorage.setItem('board_key', params.get('k')); }
 let key = localStorage.getItem('board_key') || '';
 let lastId = 0;
+let channelCount = 1;
 let mode = 'live';           // 'live' | 'search' | 'thread'
 let replyTarget = null;
 let viewVersion = 0;
@@ -1054,6 +1159,29 @@ function setReply(id) {
 }
 $('#clear-reply').onclick = () => setReply(null);
 $('#back-live').onclick = () => {
+  $('#q').value = '';
+  if (location.hash) location.hash = '';
+  else showLive();
+};
+
+function channelQuery() { return '&channel=' + encodeURIComponent($('#channel').value); }
+async function refreshChannels() {
+  const r = await fetch('/api/channels', {headers: auth({})});
+  if (!r.ok) return;
+  const data = await r.json();
+  const slugs = data.channels.map(c => c.channel);
+  const old = $('#channel').value;
+  channelCount = slugs.length;
+  $('#channel').replaceChildren(...slugs.map(slug => {
+    const option = document.createElement('option');
+    option.value = slug; option.textContent = slug;
+    return option;
+  }));
+  $('#channel').value = slugs.includes(old) ? old : (slugs[0] || '');
+  if ($('#channel').value !== old) { setReply(null); showLive(); }
+}
+$('#channel').onchange = () => {
+  setReply(null);
   $('#q').value = '';
   if (location.hash) location.hash = '';
   else showLive();
@@ -1093,6 +1221,7 @@ function messageEl(m, bodyHtml) {
   el.id = 'message-' + m.id;
   el.message = m;
   el.innerHTML = '<div class="meta"><span class="author">' + esc(m.author) + '</span>' +
+    (channelCount > 1 ? '<span class="channel">' + esc(m.channel) + '</span>' : '') +
     (m.topic ? '<span class="topic">' + esc(m.topic) + '</span>' : '') +
     '<a href="#thread/' + (m.root_id || m.id) + '">#' + m.id + '</a><span>' + fmt(m.ts) + '</span>' +
     (m.reply_to ? '<a href="#thread/' + (m.root_id || m.id) + '">↳ #' + m.reply_to + '</a>' : '') +
@@ -1143,6 +1272,7 @@ async function poll() {
     const version = viewVersion;
     pollController = new AbortController();
     try {
+      await refreshChannels();
       await refreshDelivery();
       if (mode !== 'live') {
         for (let tick = 0; tick < 50 && version === viewVersion; tick++) {
@@ -1150,7 +1280,7 @@ async function poll() {
         }
         continue;
       }
-      const r = await fetch('/api/messages?since=' + lastId + '&wait=25&limit=200',
+      const r = await fetch('/api/messages?since=' + lastId + '&wait=25&limit=200' + channelQuery(),
                             {headers: auth({}), signal: pollController.signal});
       if (version !== viewVersion) continue;
       $('#status').textContent = 'live';
@@ -1200,7 +1330,7 @@ async function route() {
     let more = true;
     const messages = [];
     while (more && version === viewVersion) {
-      const r = await fetch('/api/messages?thread=' + match[1] + '&since=' + since + '&limit=1000',
+      const r = await fetch('/api/messages?thread=' + match[1] + '&since=' + since + '&limit=1000' + channelQuery(),
                             {headers: auth({})});
       if (!r.ok) throw new Error('thread failed: ' + r.status);
       const data = await r.json();
@@ -1233,7 +1363,7 @@ async function runSearch(q) {
   const version = viewVersion;
   feed.innerHTML = '<div class="empty">searching…</div>';
   try {
-    const r = await fetch('/api/search?q=' + encodeURIComponent(q) + '&limit=50', {headers: auth({})});
+    const r = await fetch('/api/search?q=' + encodeURIComponent(q) + '&limit=50' + channelQuery(), {headers: auth({})});
     const data = await r.json();
     if (version !== viewVersion) return;
     feed.innerHTML = '';
@@ -1294,6 +1424,7 @@ $('#composer').addEventListener('submit', async (e) => {
       headers: auth({'Content-Type': 'application/json'}),
       body: JSON.stringify({
         ...($('#author').value.trim() ? {author: $('#author').value.trim()} : {}),
+        channel: $('#channel').value,
         topic: $('#topic').value.trim(),
         text: text,
         files: files,
@@ -1326,8 +1457,9 @@ $('#composer').addEventListener('submit', async (e) => {
   } catch (e) {}
   try {
     const identity = await (await fetch('/api/identity', {headers: auth({})})).json();
-    if (identity.identity) $('#author').value = identity.identity;
+    if (identity.identity && !identity.unrestricted) $('#author').value = identity.identity;
   } catch (e) {}
+  await refreshChannels();
   await route();
   poll();
 })();
@@ -1445,12 +1577,18 @@ def make_handler(board, key, name, idle_timeout=None):
 
         def _query(self):
             parsed = urllib.parse.urlparse(self.path)
-            return urllib.parse.parse_qs(parsed.query), parsed.path
+            qs = urllib.parse.parse_qs(parsed.query)
+            # Preserve existing handling of empty query values; only channel
+            # needs to distinguish an omitted filter from an invalid empty slug.
+            channel_values = urllib.parse.parse_qs(parsed.query, keep_blank_values=True).get("channel")
+            if channel_values is not None:
+                qs["channel"] = channel_values
+            return qs, parsed.path
 
         def _delivery(self, peer=None):
             identities = {entry["identity"] for entry in keys.entries()}
             me = getattr(self, "auth_identity", None)
-            if me is None and len(identities) == 1:
+            if (me is None or self.auth_unrestricted) and len(identities) == 1:
                 me = next(iter(identities))
             return board.delivery(identities, me, peer)
 
@@ -1471,6 +1609,16 @@ def make_handler(board, key, name, idle_timeout=None):
             if write:
                 return not keys.required()
             return board.public_read and not keys.required()
+
+        def _audience(self, qs):
+            if "channel" in qs:
+                if len(qs["channel"]) != 1:
+                    raise ValueError("pass one channel per request")
+                channel = channel_slug(qs["channel"][0])
+                if not keys.may_read(self.auth_identity, channel):
+                    raise PermissionError("identity may not read channel '%s'" % channel)
+                return [channel]
+            return keys.read_scope(self.auth_identity)
 
         @staticmethod
         def _parse_body(raw):
@@ -1494,7 +1642,7 @@ def make_handler(board, key, name, idle_timeout=None):
                 fid = int(raw_id)
             except ValueError:
                 return self._err(400, "file id must be an integer")
-            rec = board.get_file(fid)
+            rec = board.get_file(fid, keys.read_scope(self.auth_identity), self.auth_identity)
             if not rec:
                 return self._err(404, "no such file")
             try:
@@ -1530,6 +1678,7 @@ def make_handler(board, key, name, idle_timeout=None):
                     "messages": board.count(),
                     "latest_id": board.latest_id(),
                     "topics": board.topics(),
+                    "channels": board.channels(),
                     "files": board.file_stats(),
                     "max_file": MAX_FILE,
                     "time": now_iso(time.time()),
@@ -1545,6 +1694,14 @@ def make_handler(board, key, name, idle_timeout=None):
             if not self._authed(qs, write=False):
                 self._err(401, "board key required (X-Board-Key header or ?key=)")
                 return
+            try:
+                channels = self._audience(qs)
+            except ValueError as exc:
+                return self._err(400, str(exc))
+            except PermissionError as exc:
+                return self._err(403, str(exc))
+            if path == "/api/channels":
+                return self._send(200, {"channels": keys.channel_listing(board, self.auth_identity)})
             if path == "/api/identity":
                 if not self.auth_known:
                     return self._err(401, "board key required")
@@ -1561,21 +1718,21 @@ def make_handler(board, key, name, idle_timeout=None):
                 except ValueError:
                     return self._err(400, "limit must be an integer")
                 return self._send(200, board.asks(state, (qs.get("to") or [None])[0],
-                                                 (qs.get("from") or [None])[0], limit))
+                                                 (qs.get("from") or [None])[0], limit, channels=channels))
             if path == "/api/messages/threads":
                 try:
                     limit = max(1, min(int((qs.get("limit") or ["20"])[0]), 1000))
                     before = int((qs.get("before") or ["0"])[0])
                 except ValueError:
                     return self._err(400, "limit and before must be integers")
-                return self._send(200, board.threads(limit, before))
+                return self._send(200, board.threads(limit, before, channels=channels))
             if path.startswith("/api/files/"):
                 self._serve_file(path[len("/api/files/"):])
                 return
             if path in ("/api/files", "/api/files.json"):
                 limit = max(1, min(int((qs.get("limit") or ["100"])[0] or 100), 1000))
                 fname = (qs.get("name") or [""])[0]
-                files = board.list_files(limit, fname or None)
+                files = board.list_files(limit, fname or None, keys.read_scope(self.auth_identity), self.auth_identity)
                 self._send(200, {"files": files, "count": len(files), "stats": board.file_stats()})
                 return
             if path in ("/api/search", "/api/search.json"):
@@ -1584,7 +1741,7 @@ def make_handler(board, key, name, idle_timeout=None):
                     self._err(400, "pass ?q=<terms>")
                     return
                 limit = max(1, min(int((qs.get("limit") or ["20"])[0] or 20), 200))
-                results = board.search(query, limit)
+                results = board.search(query, limit, channels=channels)
                 self._send(200, {"query": query, "results": results, "count": len(results)})
                 return
             if path in ("/api/digest", "/api/digest.json", "/api/digest.md"):
@@ -1592,7 +1749,7 @@ def make_handler(board, key, name, idle_timeout=None):
                 limit = max(1, min(int((qs.get("limit") or ["200"])[0] or 200), 1000))
                 budget = max(200, min(int((qs.get("max_chars") or ["6000"])[0] or 6000), 200000))
                 topic = (qs.get("topic") or [""])[0]
-                digest = board.digest(since, limit, budget, topic or None)
+                digest = board.digest(since, limit, budget, topic or None, channels=channels)
                 if path.endswith(".md"):
                     self._send(200, digest["text"].encode(), "text/markdown; charset=utf-8")
                     return
@@ -1616,12 +1773,12 @@ def make_handler(board, key, name, idle_timeout=None):
                 if wait > 0 and not before:
                     msgs = board.wait_for(since, wait, limit + 1, topic or None,
                                           search=search or None, author=author or None,
-                                          thread=thread, unthreaded=unthreaded)
+                                          thread=thread, unthreaded=unthreaded, channels=channels)
                 else:
                     # one extra row: it tells the caller whether more history exists
                     # without a second call or a COUNT over the whole table
                     msgs = board.fetch(since, limit + 1, topic or None, search or None,
-                                       author or None, before or None, thread, unthreaded)
+                                       author or None, before or None, thread, unthreaded, channels=channels)
                 has_more = len(msgs) > limit
                 msgs = msgs[-limit:] if before and has_more else msgs[:limit]
                 if path.endswith(".md"):
@@ -1681,7 +1838,7 @@ def make_handler(board, key, name, idle_timeout=None):
                     ctype = "text/plain"
                 uploader = ((qs.get("author") or [""])[0] or self.headers.get("X-Board-Author")
                             or "anonymous")
-                rec = board.store_file(fname, ctype, data, uploader)
+                rec = board.store_file(fname, ctype, data, uploader, self.auth_identity or "")
                 self._send(201, {"file": rec})
                 return
 
@@ -1702,22 +1859,32 @@ def make_handler(board, key, name, idle_timeout=None):
                 self._err(400, "body must be a JSON object under %d bytes" % MAX_BODY)
                 return
             if path == "/api/ack":
-                if self.auth_identity is None:
+                if self.auth_identity is None or self.auth_unrestricted:
                     return self._err(400, "acks need an identity key")
                 mid = data.get("id")
                 if type(mid) is not int or mid < 0:
                     return self._err(400, "id must be a non-negative integer")
-                if "channel" in data and not isinstance(data["channel"], str):
-                    return self._err(400, "channel must be a string")
+                if "channel" in data:
+                    try:
+                        channel_slug(data["channel"])
+                    except ValueError as exc:
+                        return self._err(400, str(exc))
                 return self._send(200, board.ack(self.auth_identity, mid))
             if close_match:
                 try:
-                    ask = board.close_ask(int(close_match[1]), data.get("msg_id"))
+                    ask = board.close_ask(int(close_match[1]), data.get("msg_id"), keys.read_scope(self.auth_identity))
                 except AskClosed as exc:
                     return self._err(409, str(exc))
                 except ValueError as exc:
                     return self._err(400, str(exc))
                 return self._send(200, {"ask": ask})
+            try:
+                channel = channel_slug(data["channel"] if "channel" in data
+                                       else keys.default_channel(self.auth_identity))
+            except ValueError as exc:
+                return self._err(400, str(exc))
+            if not keys.may_read(self.auth_identity, channel):
+                return self._err(403, "identity may not post to channel '%s'" % channel)
             author = (str(data.get("author") or data.get("from") or "anonymous")).strip()[:MAX_AUTHOR] or "anonymous"
             identity = self.auth_identity
             if self.auth_known and not self.auth_unrestricted:
@@ -1742,7 +1909,8 @@ def make_handler(board, key, name, idle_timeout=None):
             if len(text) > MAX_TEXT:
                 self._err(413, "text longer than %d characters" % MAX_TEXT)
                 return
-            missing = [fid for fid in file_ids if not board.get_file(fid)]
+            missing = [fid for fid in file_ids if not board.get_file(
+                fid, keys.read_scope(self.auth_identity), self.auth_identity)]
             if missing:
                 self._err(400, "no such file id(s): %s" % ", ".join(str(m) for m in missing))
                 return
@@ -1759,7 +1927,7 @@ def make_handler(board, key, name, idle_timeout=None):
             try:
                 msg = board.post(author, text, topic, file_ids,
                                  data.get("reply_to"), data.get("amends"), ask_to,
-                                 data.get("answers"), identity)
+                                 data.get("answers"), identity if not self.auth_unrestricted else None, channel)
             except AskClosed as exc:
                 return self._err(409, str(exc))
             except ValueError as exc:
@@ -1862,7 +2030,8 @@ def cmd_post(args):
     author = args.author
     if author is None:
         status, raw = request(base + "/api/identity", key)
-        author = (json.loads(raw).get("identity") if status == 200 else None) or "hamish-hermes"
+        info = json.loads(raw) if status == 200 else {}
+        author = (info.get("identity") if not info.get("unrestricted") else None) or "hamish-hermes"
     file_ids = []
     for fid in args.file or []:
         file_ids.append(int(fid))
@@ -1880,6 +2049,8 @@ def cmd_post(args):
     else:
         text = args.text if args.text else sys.stdin.read()
     payload = {"author": author, "text": text.strip()}
+    if getattr(args, "channel", None) is not None:
+        payload["channel"] = args.channel
     if args.topic is not None:
         payload["topic"] = args.topic
     if args.reply_to is not None:
@@ -1919,6 +2090,24 @@ def cmd_answer(args):
     return 0
 
 
+def channel_url(url, args):
+    channel = getattr(args, "channel", None)
+    if channel is None:
+        return url
+    return url + ("&" if "?" in url else "?") + "channel=" + urllib.parse.quote(channel)
+
+
+def cmd_channels(args):
+    base, key = client_config(args)
+    status, raw = request(base + "/api/channels", key)
+    if status != 200:
+        print("channels failed (%s): %s" % (status, raw), file=sys.stderr)
+        return 1
+    for row in json.loads(raw)["channels"]:
+        print("%s  %d  %s" % (row["channel"], row["messages"], ", ".join(row["identities"])))
+    return 0
+
+
 def cmd_open(args):
     base, key = client_config(args)
     query = {"state": "all" if args.all else "open", "limit": 1000}
@@ -1926,7 +2115,7 @@ def cmd_open(args):
         query["to"] = args.to
     if args.from_identity:
         query["from"] = args.from_identity
-    status, raw = request(base + "/api/asks?" + urllib.parse.urlencode(query), key)
+    status, raw = request(channel_url(base + "/api/asks?" + urllib.parse.urlencode(query), args), key)
     if status != 200:
         print("asks failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
@@ -1960,7 +2149,7 @@ def cmd_ack(args):
 
 def cmd_delivery(args):
     base, key = client_config(args)
-    status, raw = request(base + "/api/delivery", key)
+    status, raw = request(channel_url(base + "/api/delivery", args), key)
     if status != 200:
         print("delivery failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
@@ -2037,7 +2226,7 @@ def cmd_files(args):
     url = "%s/api/files?limit=%d" % (base, args.limit)
     if args.name:
         url += "&name=" + urllib.parse.quote(args.name)
-    status, raw = request(url, key)
+    status, raw = request(channel_url(url, args), key)
     if status != 200:
         print("files failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
@@ -2057,7 +2246,7 @@ def cmd_files(args):
 def cmd_search(args):
     base, key = client_config(args)
     url = "%s/api/search?q=%s&limit=%d" % (base, urllib.parse.quote(args.query), args.limit)
-    status, raw = request(url, key)
+    status, raw = request(channel_url(url, args), key)
     if status != 200:
         print("search failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
@@ -2083,7 +2272,7 @@ def cmd_digest(args):
            % (base, args.since, args.limit, args.max_chars))
     if args.topic:
         url += "&topic=" + urllib.parse.quote(args.topic)
-    status, raw = request(url, key)
+    status, raw = request(channel_url(url, args), key)
     if status != 200:
         print("digest failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
@@ -2132,7 +2321,7 @@ def cmd_read(args):
         url += "&unthreaded=1"
     if args.md and args.thread is None:
         url = url.replace("/api/messages?", "/api/messages.md?")
-    status, raw = request(url, key)
+    status, raw = request(channel_url(url, args), key)
     if status != 200:
         print("read failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
@@ -2145,7 +2334,7 @@ def cmd_read(args):
         # its remaining messages before computing reply depths.
         while data.get("has_more") and data["messages"] and not args.before:
             next_url = re.sub(r"since=\d+", "since=%d" % data["messages"][-1]["id"], url)
-            status, raw = request(next_url, key)
+            status, raw = request(channel_url(next_url, args), key)
             if status != 200:
                 print("read failed (%s): %s" % (status, raw), file=sys.stderr)
                 return 1
@@ -2189,7 +2378,7 @@ def cmd_read(args):
 
 def cmd_threads(args):
     base, key = client_config(args)
-    status, raw = request("%s/api/messages/threads?limit=%d" % (base, args.limit), key)
+    status, raw = request(channel_url("%s/api/messages/threads?limit=%d" % (base, args.limit), args), key)
     if status != 200:
         print("threads failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
@@ -2206,7 +2395,7 @@ def cmd_watch(args):
     print("watching %s from #%d  (ctrl-c to stop)" % (base, since), file=sys.stderr)
     while True:
         url = "%s/api/messages?since=%d&limit=100&wait=50" % (base, since)
-        status, raw = request(url, key, timeout=90)
+        status, raw = request(channel_url(url, args), key, timeout=90)
         if status != 200:
             print("watch error (%s): %s" % (status, raw), file=sys.stderr)
             time.sleep(5)
@@ -2230,7 +2419,7 @@ def cmd_key(args):
     keys = Keys(read_key(data), data)
     if args.key_action == "add":
         try:
-            print(keys.add(args.identity, args.label))
+            print(keys.add(args.identity, args.label, args.channel))
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -2241,7 +2430,10 @@ def cmd_key(args):
     if args.key_action == "list" or args.list:
         print("legacy (unrestricted): %s" % ("present" if keys.legacy else "absent"))
         for entry in keys.entries():
-            print("%s  %s  %s" % (entry["identity"], entry["label"], entry["created"]))
+            # Membership next to the identity, because that is the thing that
+            # decides who can read a conversation and it was invisible before.
+            print("%s  %s  %s  [%s]" % (entry["identity"], entry["label"], entry["created"],
+                                        ",".join(entry.get("channels") or ["will"])))
         return 0
     if args.new:
         write_key(new_key(), data)
@@ -2321,7 +2513,7 @@ def main(argv=None):
 
     p = sub.add_parser("ack", help="record receipt through a message id")
     p.add_argument("--id", type=int, required=True)
-    p.add_argument("--channel", default=None)
+    p.add_argument("--channel", type=channel_slug, default=None)
     p.add_argument("--url", default=None)
     p.add_argument("--key", default=None)
     p.set_defaults(func=cmd_ack)
@@ -2423,6 +2615,8 @@ def main(argv=None):
             action_parser.add_argument("--identity", required=True)
         if action == "add":
             action_parser.add_argument("--label", default="")
+            action_parser.add_argument("--channel", action="append", default=None,
+                                       type=lambda value: value if value == "*" else channel_slug(value))
     p.set_defaults(func=cmd_key)
 
     p = sub.add_parser("prune", help="archive and drop old messages (dry run by default)")
@@ -2435,6 +2629,14 @@ def main(argv=None):
     p = sub.add_parser("reindex", help="rebuild the message and paragraph search indexes")
     p.add_argument("--data", default=None)
     p.set_defaults(func=cmd_reindex)
+
+    p = sub.add_parser("channels", help="list readable channels, counts and member identities")
+    p.add_argument("--url", default=None)
+    p.add_argument("--key", default=None)
+    p.set_defaults(func=cmd_channels)
+
+    for command in ("post", "amend", "read", "search", "digest", "threads", "open", "watch", "delivery", "ask", "answer"):
+        sub.choices[command].add_argument("--channel", type=channel_slug, default=None)
 
     args = parser.parse_args(argv)
     return args.func(args) or 0
