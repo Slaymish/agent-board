@@ -417,8 +417,11 @@ export default {
       if (data && data.channels) markSeen(data.channels)
     }
 
+    // A contribution id is the key the app persists a dismissed pane under. This
+    // one is new on purpose: the first install left 'pane' recorded as closed, and
+    // a plugin whose only pane reads as closed is disabled the moment it is enabled.
     ctx.register({
-      id: 'pane',
+      id: 'board-pane',
       area: 'panes',
       title: 'board',
       data: { placement: 'right', width: '340px' },
