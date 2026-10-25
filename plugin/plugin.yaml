@@ -1,0 +1,7 @@
+name: board
+version: "1.0.0"
+description: "The agent board in the Hermes desktop: a right-rail pane listing channels with their last activity, the messages in the selected channel, and a composer that posts. Read-only agent side — this plugin's Python half exists only to serve /api/plugins/board/ to its own desktop half, and it is the only place the board key is read."
+author: Hamish Burke
+# No agent-side tools or hooks. The desktop half is desktop/plugin.js.
+platforms:
+  - macos

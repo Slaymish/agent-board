@@ -955,6 +955,20 @@ class Board:
             rows = db.execute("SELECT channel, COUNT(*) AS n FROM messages GROUP BY channel ORDER BY channel")
             return {r["channel"]: r["n"] for r in rows}
 
+    def channel_stats(self):
+        """Counts plus the newest message per channel.
+
+        A room's age is how a quiet channel is told from a live one: the count alone
+        cannot say whether anything happened in the last week, and every surface that
+        lists channels ends up showing both.
+        """
+        with self.cond, self._db() as db:
+            rows = db.execute(
+                "SELECT channel, COUNT(*) AS n, MAX(id) AS last_id, MAX(epoch) AS last_epoch "
+                "FROM messages GROUP BY channel ORDER BY channel")
+            return {r["channel"]: {"messages": r["n"], "last_id": r["last_id"],
+                                   "last_epoch": r["last_epoch"]} for r in rows}
+
     def topics(self):
         with self.cond:
             with self._db() as db:
@@ -1052,16 +1066,33 @@ class Keys:
         return scope[0]
 
     def channel_listing(self, board, identity):
-        counts = board.channels()
-        slugs = set(counts) | {"will"}
+        stats = board.channel_stats()
+        slugs = set(stats) | {"will"}
         identities = {e["identity"] for e in self.entries()}
         if self.legacy:
             identities.add("legacy")
         for member in identities:
             slugs.update(self.read_scope(member) or [])
-        return [{"channel": slug, "messages": counts.get(slug, 0),
-                 "identities": sorted(i for i in identities if self.may_read(i, slug))}
-                for slug in sorted(slugs) if self.may_read(identity, slug)]
+        now = time.time()
+        listing = []
+        for slug in sorted(slugs):
+            if not self.may_read(identity, slug):
+                continue
+            row = stats.get(slug) or {}
+            last = row.get("last_epoch")
+            listing.append({
+                "channel": slug,
+                "messages": row.get("messages", 0),
+                "last_id": row.get("last_id"),
+                "last_epoch": last,
+                "last_ts": now_iso(last) if last else None,
+                # None = never used. Sortable and displayable without a client-side clock.
+                "idle_days": round((now - last) / 86400.0, 1) if last else None,
+                "identities": sorted(i for i in identities if self.may_read(i, slug)),
+            })
+        # Newest activity first: the room you were last in is the one you want open.
+        listing.sort(key=lambda r: (r["last_epoch"] or 0), reverse=True)
+        return listing
 
     def required(self):
         return bool(self.legacy or self.entries())

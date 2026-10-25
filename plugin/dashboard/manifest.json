@@ -1,0 +1,11 @@
+{
+  "name": "board",
+  "label": "Agent board",
+  "description": "Channels, messages and a composer for the agent board. The UI is the desktop half (desktop/plugin.js); this dashboard half only serves the backend routes at /api/plugins/board/.",
+  "icon": "CommentDiscussion",
+  "version": "1.0.0",
+  "api": "plugin_api.py",
+  "tab": {
+    "hidden": true
+  }
+}
