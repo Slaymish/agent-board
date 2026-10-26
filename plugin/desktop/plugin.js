@@ -424,7 +424,7 @@ function useBoardState() {
     queryFn: () => {
       const channel = selectedChannel()
       const topic = activeTopic()
-      const params = []
+      const params = ['limit=200']
       if (channel) params.push(`channel=${encodeURIComponent(channel)}`)
       if (topic) params.push(`topic=${encodeURIComponent(topic)}`)
       return pluginCtx.rest('/state' + (params.length ? `?${params.join('&')}` : ''))
@@ -467,8 +467,14 @@ function BoardBody({ compact }) {
 
   const seen = seenMap()
   const messages = data.messages || []
+  // The picked topic filters locally. The backend also accepts a topic, but a pane that
+  // only responds when a long-lived process happens to have the newer module is a pane
+  // that appears broken; filtering what is already loaded always works, and 200 messages
+  // covers a channel this size whole.
+  const pickedTopic = activeTopic()
+  const visible = pickedTopic ? messages.filter(msg => msg.topic === pickedTopic) : messages
   const lastSeen = active ? seen[active] || 0 : 0
-  const firstNew = messages.find(msg => msg.id > lastSeen)
+  const firstNew = visible.find(msg => msg.id > lastSeen)
 
   // The board's topic index is the accurate count. When the half serving /state predates
   // it, fall back to what is loaded rather than showing nothing: a partial index beats a
@@ -543,7 +549,7 @@ function BoardBody({ compact }) {
       jsx(InboxStrip, { inbox: data.inbox }),
       jsx(TopicStrip, {
         topics,
-        active: data.topic || null,
+        active: pickedTopic,
         partial: !indexAvailable,
         onPick: key => {
           haptic('tap')
@@ -603,8 +609,8 @@ function BoardBody({ compact }) {
                     title: 'Nothing found',
                     description: results.error || `no match for “${searchText}” in ${active}`
                   })
-              : messages.length
-                ? messages.map(msg =>
+              : visible.length
+                ? visible.map(msg =>
                     jsx(
                       Message,
                       {
@@ -621,9 +627,10 @@ function BoardBody({ compact }) {
                     )
                   )
                 : jsx(EmptyState, {
-                    title: 'Nothing here yet',
-                    description:
-                      channels.find(c => c.channel === active && c.state === 'unused') !== undefined
+                    title: pickedTopic ? `Nothing tagged #${pickedTopic}` : 'Nothing here yet',
+                    description: pickedTopic
+                      ? `this channel has no messages tagged #${pickedTopic} in the loaded window`
+                      : channels.find(c => c.channel === active && c.state === 'unused') !== undefined
                         ? 'this room has never been used'
                         : 'no messages in this channel'
                   })
