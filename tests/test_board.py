@@ -109,9 +109,19 @@ class BoardTest(unittest.TestCase):
         status, _ = self.call("POST", "/api/messages", key=KEY,
                               body={"author": "x", "text": "a" * (board.MAX_TEXT + 1)})
         self.assertEqual(status, 413)
-        status, _ = self.call("POST", "/api/messages", key=KEY,
-                              body={"author": "x", "text": "a" * (board.MAX_BODY + 10)})
-        self.assertEqual(status, 413)
+        # The server rejects an oversized Content-Length before reading bytes.
+        # Sending the body races that deliberate close and can reset sendall()
+        # before http.client gets to read the 413 response.
+        c = self.conn()
+        try:
+            c.request("POST", "/api/messages", headers={
+                "X-Board-Key": KEY, "Content-Length": str(board.MAX_BODY + 10)})
+            response = c.getresponse()
+            self.assertEqual(response.status, 413)
+            self.assertEqual(response.getheader("Connection"), "close")
+            response.read()
+        finally:
+            c.close()
 
     def test_rejected_post_does_not_corrupt_the_next_request(self):
         """A 401 must not leave the body in the socket: connection reuse would
@@ -2078,6 +2088,239 @@ class ChannelAckMigrationTest(unittest.TestCase):
             self.assertEqual(rows[0], ("will-hermes", "*", 84, 123.5))
             self.assertEqual(rows[1][:3], ("will-hermes", "house", 2))
             self.assertEqual(len(rows), 2)
+
+
+class InviteTest(unittest.TestCase):
+    call = BoardTest.call
+    conn = BoardTest.conn
+    raw_get = BoardTest.raw_get
+    cli = PhaseOneTest.cli
+    remote_cli = PhaseOneTest.remote_cli
+    start_server = PhaseOneTest.start_server
+
+    def setUp(self):
+        quiet = mock.patch.dict(os.environ, {"BOARD_QUIET": "1"})
+        quiet.start()
+        self.addCleanup(quiet.stop)
+        self.tmp = tempfile.mkdtemp(prefix="agent-board-invite-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.store = board.Board(os.path.join(self.tmp, "board.db"))
+        self.keys = board.Keys(KEY, self.tmp)
+        self.owner = self.keys.add("hamish-hermes", "Hamish", ["*"])
+        self.keys.add("will-hermes", "Will", ["will"])
+        self.start_server()
+
+    def invite(self, *extra):
+        return self.remote_cli("invite", "--identity", "cole-hermes", "--label", "Cole", *extra)
+
+    def entry(self):
+        return next(e for e in self.keys.entries() if e["identity"] == "cole-hermes")
+
+    def test_default_upload_is_the_only_delivery_and_matches_local_sha256(self):
+        local = {}
+        real_upload = board.upload
+
+        def inspect_upload(base, key, path, **kwargs):
+            with open(path, "rb") as fh:
+                local["blob"] = fh.read()
+            local["path"] = path
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            return real_upload(base, key, path, **kwargs)
+
+        with mock.patch.object(board, "upload", side_effect=inspect_upload), \
+             mock.patch.object(board, "request", wraps=board.request) as requests:
+            code, out, err = self.invite()
+        self.assertEqual((code, err), (0, ""))
+        entry = self.entry()
+        self.assertEqual(entry["channels"], ["house"])
+        self.assertEqual(entry["label"], "Cole")
+        self.assertNotIn(entry["key"], out + err)
+        self.assertEqual(local["blob"].count(entry["key"].encode()), 1)
+        self.assertFalse(os.path.exists(local["path"]))
+        files = self.call("GET", "/api/files", KEY)[1]["files"]
+        self.assertEqual(len(files), 1)
+        rec = files[0]
+        self.assertEqual(rec["name"], "invite.md")
+        self.assertEqual(rec["ctype"], "text/markdown")
+        self.assertEqual(rec["sha256"], hashlib.sha256(local["blob"]).hexdigest())
+        self.assertEqual(self.raw_get(rec["url"], KEY)[1], local["blob"])
+        self.assertIn("invited cole-hermes [house]  file #%d  sha256 %s\n" %
+                      (rec["id"], rec["sha256"]), out)
+        self.assertIn("key is in that file and nowhere else. Give it to Cole, not to the board.\n", out)
+        self.assertIn("house  0  never  unused\n", out)
+        self.assertNotIn("will", out)
+        self.assertEqual(self.store.count(), 0)
+        self.assertTrue(all("/api/messages" not in c.args[0] for c in requests.call_args_list))
+        with self.store._db() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM message_files").fetchone()[0], 0)
+
+    def test_repeatable_membership_is_exact_and_unknown_rooms_are_listed(self):
+        code, out, err = self.invite("--channel", "future-room", "--channel", "house",
+                                     "--channel", "future-room")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.entry()["channels"], ["future-room", "house"])
+        key = self.entry()["key"]
+        rows = self.call("GET", "/api/channels", key)[1]["channels"]
+        self.assertEqual({r["channel"] for r in rows}, {"house", "future-room"})
+        self.assertIn("future-room  0  never  unused\n", out)
+        self.assertIn("future-room", self.remote_cli("channels", "--key", key)[1])
+        self.assertEqual(self.call("GET", "/api/messages?channel=will", key)[0], 403)
+        self.assertEqual(self.call("POST", "/api/messages", key,
+                                   {"text": "forbidden", "channel": "will"})[0], 403)
+        self.assertEqual(self.store.count(), 0)
+
+    def test_dry_run_redacts_and_has_no_side_effects_even_with_new_data_directory(self):
+        empty_data = os.path.join(self.tmp, "not-created")
+        with mock.patch.object(board, "new_key") as generate, \
+             mock.patch.object(board, "upload") as upload, \
+             mock.patch.object(board, "request") as request, \
+             mock.patch.object(board.tempfile, "mkstemp") as temporary:
+            code, out, err = self.invite("--dry-run", "--data", empty_data)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("```\n<KEY>\n```", out)
+        self.assertNotIn("ab_", out)
+        self.assertNotIn("will", out)
+        self.assertFalse(os.path.exists(empty_data))
+        for operation in (generate, upload, request, temporary):
+            operation.assert_not_called()
+        self.assertEqual(len(self.keys.entries()), 2)
+        self.assertEqual(self.store.list_files(), [])
+        self.assertEqual(self.store.count(), 0)
+
+    def test_wording_order_examples_and_explicit_privacy(self):
+        code, text, err = self.invite("--dry-run")
+        self.assertEqual((code, err), (0, ""))
+        sections = ["shared message board between Hermes agents", "Your channel membership",
+                    "## Calling the board", "## Etiquette", "## Your key"]
+        self.assertEqual(sorted(text.index(s) for s in sections), [text.index(s) for s in sections])
+        for required in ("http://127.0.0.1:%d" % self.port,
+                         "yours alone and identifies you as `cole-hermes`",
+                         "read and write `house` only; other channels exist and are none of your business",
+                         "GET /api/messages?channel=house", "POST /api/messages",
+                         '"text": "Hello from cole-hermes", "channel": "house"',
+                         "board.py read --channel house", "X-Board-Key", "BOARD_KEY",
+                         "few hundred characters", "one topic per message", "reply_to",
+                         "`via`", "`agent`", "`human`", "a message, a repo or a log",
+                         "git-tracked file"):
+            self.assertIn(required, text)
+        self.assertEqual(text.count("```sh\n"), 3)
+
+    def test_default_invite_url_is_public_and_configurable_without_network_io(self):
+        with mock.patch.dict(os.environ, {"BOARD_URL": ""}), \
+             mock.patch.object(board, "request") as request:
+            code, text, err = self.cli("invite", "--identity", "cole-hermes", "--dry-run")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(board.DEFAULT_INVITE_URL, text)
+        self.assertNotIn("127.0.0.1", text)
+        request.assert_not_called()
+        with mock.patch.dict(os.environ, {"BOARD_URL": "https://configured.example"}):
+            code, text, err = self.cli("invite", "--identity", "cole-hermes", "--dry-run")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("https://configured.example", text)
+
+    def test_invalid_identity_and_every_channel_rejected_before_key_write(self):
+        with open(self.keys.path, "rb") as fh:
+            before = fh.read()
+        invalid = [("--identity", value) for value in ("", " cole", "cole ", "x" * 65, "legacy")]
+        invalid += [("--channel", "house", "--channel", value)
+                    for value in ("", "House", "../will", "a" * 33, "all*", "a,b")]
+        for extra in invalid:
+            with self.subTest(extra=extra), mock.patch.object(board.Keys, "add") as add:
+                try:
+                    code, out, err = self.invite(*extra)
+                except SystemExit as exc:
+                    code = exc.code
+                self.assertNotEqual(code, 0)
+                add.assert_not_called()
+            with open(self.keys.path, "rb") as fh:
+                self.assertEqual(fh.read(), before)
+        self.assertEqual(self.store.list_files(), [])
+
+    def test_existing_identity_cannot_inherit_private_membership(self):
+        old = self.keys.add("cole-hermes", "Cole", ["will"])
+        code, out, err = self.invite()
+        self.assertEqual(code, 1)
+        self.assertIn("identity already exists", err)
+        self.assertNotIn(old, out + err)
+        self.assertEqual(len(self.keys.entries()), 3)
+        self.assertEqual(self.keys.channels_for("cole-hermes"), ["will"])
+        self.assertEqual(self.store.list_files(), [])
+
+    def test_explicit_wildcard_warns_and_lists_owner_scope(self):
+        code, out, err = self.invite("--channel", "*")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.entry()["channels"], ["*"])
+        self.assertEqual(len(err.splitlines()), 1)
+        self.assertIn("owner access to every channel", err)
+        self.assertIn("will  0  never  unused", out)
+        rec = self.store.list_files()[0]
+        document = self.raw_get(rec["url"], KEY)[1].decode()
+        self.assertIn("read and write all channels", document)
+        self.assertNotIn("other channels exist and are none of your business", document)
+
+    def test_channel_states_share_the_existing_cli_thresholds(self):
+        for slug, days in (("live", 0), ("quiet", 14), ("stale", 60)):
+            msg = self.store.post("fixture", "fixture", channel=slug)
+            with self.store._db() as db:
+                db.execute("UPDATE messages SET epoch=? WHERE id=?",
+                           (time.time() - days * 86400, msg["id"]))
+        code, out, err = self.invite("--channel", "live", "--channel", "quiet",
+                                     "--channel", "stale", "--channel", "unused")
+        self.assertEqual((code, err), (0, ""))
+        for line in out.splitlines()[2:]:
+            slug, count, timestamp, state = line.split()
+            self.assertEqual(slug, state)
+            self.assertEqual(count, "0" if slug == "unused" else "1")
+            self.assertEqual(timestamp == "never", slug == "unused")
+
+    def test_failed_upload_removes_new_key_and_temp_file_without_echoing_secret(self):
+        paths = []
+
+        def fail(base, key, path, **kwargs):
+            paths.append(path)
+            return None, "remote echoed secret: " + self.entry()["key"]
+
+        with mock.patch.object(board, "upload", side_effect=fail):
+            code, out, err = self.invite()
+        self.assertEqual(code, 1)
+        self.assertIn("invite upload failed", err)
+        self.assertNotIn("remote echoed", out + err)
+        self.assertEqual(len(self.keys.entries()), 2)
+        self.assertTrue(paths)
+        self.assertFalse(os.path.exists(paths[0]))
+        self.assertEqual(self.store.count(), 0)
+
+    def test_checksum_mismatch_is_failure_and_revokes_the_undelivered_key(self):
+        real_upload = board.upload
+
+        def corrupt(*args, **kwargs):
+            rec, err = real_upload(*args, **kwargs)
+            rec["sha256"] = "0" * 64
+            return rec, err
+
+        with mock.patch.object(board, "upload", side_effect=corrupt):
+            code, out, err = self.invite()
+        self.assertEqual(code, 1)
+        self.assertIn("sha256 does not match", err)
+        self.assertNotIn("invited cole-hermes", out)
+        self.assertEqual(len(self.keys.entries()), 2)
+        self.assertEqual(self.store.count(), 0)
+
+    def test_failed_or_inexact_channel_discovery_rolls_back_before_upload(self):
+        for response in ((401, '{}'),
+                         (200, json.dumps({"channels": [{"channel": "will"}]}))):
+            with self.subTest(response=response), \
+                 mock.patch.object(board, "request", return_value=response), \
+                 mock.patch.object(board, "upload") as upload, \
+                 mock.patch.object(board.tempfile, "mkstemp", wraps=board.tempfile.mkstemp) as temporary:
+                code, out, err = self.invite()
+            self.assertEqual(code, 1)
+            self.assertIn("invite failed", err)
+            upload.assert_not_called()
+            # Only the key-ring's atomic write and rollback need temporary files.
+            self.assertTrue(all(c.kwargs.get("prefix") == ".keys-" for c in temporary.call_args_list))
+            self.assertEqual(len(self.keys.entries()), 2)
+            self.assertEqual(self.store.list_files(), [])
 
 
 if __name__ == "__main__":

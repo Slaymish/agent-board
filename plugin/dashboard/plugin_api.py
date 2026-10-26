@@ -196,6 +196,62 @@ async def state(channel: Optional[str] = None, since: int = 0, limit: int = 40) 
         return _fail("board unreachable: %s" % exc.__class__.__name__)
 
 
+@router.get("/search")
+async def search(q: str = "", channel: Optional[str] = None, limit: int = 30) -> Dict[str, Any]:
+    """Ranked full-text search. The agent has `board.py search`; this is the same index."""
+    key = _key()
+    if not key or not q.strip():
+        return {"ok": False, "error": "nothing to search for", "results": []}
+    query: Dict[str, Any] = {"q": q.strip(), "limit": max(1, min(int(limit), 100))}
+    if channel:
+        query["channel"] = channel
+    try:
+        status, body = _call("/api/search?" + urllib.parse.urlencode(query), key)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": "board unreachable: %s" % exc.__class__.__name__, "results": []}
+    if status != 200:
+        return {"ok": False, "error": body.get("error") or ("board answered %s" % status),
+                "results": []}
+    return {"ok": True, "query": q.strip(), "count": body.get("count", 0),
+            "results": body.get("results", [])}
+
+
+@router.get("/file/{fid}")
+async def file_preview(fid: int) -> Dict[str, Any]:
+    """One attachment: metadata always, the text itself when it is text and small.
+
+    A pane that can read an attached note without leaving the app is the difference
+    between "see #50" and actually reading it; a binary is described instead, because
+    rendering a download inside a chat surface is not this plugin's job.
+    """
+    key = _key()
+    if not key:
+        return {"ok": False, "error": "no board key"}
+    url = BASE_URL + "/api/files/%d" % fid
+    request = urllib.request.Request(url, headers={"X-Board-Key": key})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_S) as resp:
+            blob = resp.read()
+            name = resp.headers.get("X-File-Name") or ("file-%d" % fid)
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0]
+            sha = resp.headers.get("X-File-Sha256") or ""
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "error": "board answered %s" % exc.code}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": "board unreachable: %s" % exc.__class__.__name__}
+
+    text_like = ctype.startswith("text/") or ctype in ("application/json", "application/xml")
+    body: Dict[str, Any] = {"ok": True, "id": fid, "name": name, "ctype": ctype,
+                            "size": len(blob), "sha256": sha, "text": None}
+    if text_like and len(blob) <= 40_000:
+        body["text"] = blob.decode("utf-8", "replace")
+    elif text_like:
+        body["note"] = "too large to show here (%d bytes) — use board.py get %d" % (len(blob), fid)
+    else:
+        body["note"] = "%s · %d bytes — use board.py get %d" % (ctype or "binary", len(blob), fid)
+    return body
+
+
 @router.post("/post")
 async def post(body: Dict[str, Any]) -> Dict[str, Any]:
     """Post as hamish-hermes. Same validation as the CLI, done by the board itself."""

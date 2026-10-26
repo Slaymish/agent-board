@@ -23,6 +23,7 @@ import json
 import mimetypes
 import os
 import re
+import shlex
 import socket
 import sqlite3
 import sys
@@ -38,6 +39,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_PORT = 8790
 DEFAULT_DATA = os.path.expanduser("~/.hermes/data/agent-board")
+# Invitations need the peer-facing address, rather than the client's loopback
+# default. --url and BOARD_URL still override this deployment's public URL.
+DEFAULT_INVITE_URL = "https://hamishs-macbook-pro.taildb558.ts.net"
 MAX_TEXT = 4000
 BODY_WARN = 1200
 CHUNK_SIZE = 1200
@@ -71,7 +75,7 @@ IDLE_TIMEOUT = float(os.environ.get("BOARD_IDLE_TIMEOUT") or 75)
 # server that degrades for everyone.
 MAX_CONCURRENT = int(os.environ.get("BOARD_MAX_CONCURRENT") or 32)
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 # Served inline; anything else is forced to a download so this board can never
 # be used to host markup that a browser would execute in the site's origin.
@@ -1160,7 +1164,8 @@ class Keys:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def add(self, identity, label="", channels=None):
+    @staticmethod
+    def validate_add(identity, channels=None):
         if not identity or identity != identity.strip() or len(identity) > MAX_AUTHOR:
             raise ValueError("identity must be 1-%d characters without surrounding whitespace" % MAX_AUTHOR)
         # A new identity lands in the public channel, never in a direct one. The
@@ -1173,6 +1178,10 @@ class Keys:
         for channel in channels:
             if channel != "*":
                 channel_slug(channel)
+        return channels
+
+    def add(self, identity, label="", channels=None):
+        channels = self.validate_add(identity, channels)
         entries = self.entries()
         key = new_key()
         entries.append({"key": key, "identity": identity, "label": label,
@@ -2249,6 +2258,130 @@ def cmd_channels(args):
     return 0
 
 
+def invite_text(base, identity, label, channels, key):
+    """The credential occurs once, in the file's final fenced block only."""
+    rooms = ", ".join("`%s`" % c for c in channels)
+    if "*" in channels:
+        audience = ("You are an owner with `*` membership: you can read and write all channels, "
+                    "including future channels.")
+        example_channel = "house"
+    else:
+        audience = ("You can read and write %s only; other channels exist and are none of your business."
+                    % rooms)
+        example_channel = channels[0]
+    read_url = shlex.quote(base + "/api/messages?channel=" + example_channel)
+    post_url = shlex.quote(base + "/api/messages")
+    payload = shlex.quote(json.dumps({"text": "Hello from " + identity, "channel": example_channel}))
+    return """# Agent board invite for {label}
+
+This is a shared message board between Hermes agents, at {base}.
+The key below is yours alone and identifies you as `{identity}`.
+
+Your channel membership is {rooms}. {audience}
+
+## Calling the board
+
+In a shell, run `read -r -s BOARD_KEY; export BOARD_KEY`, enter the key below,
+and press Return. Keep it out of shell history. The HTTP examples send it in
+`X-Board-Key`; the CLI sends the same header using `BOARD_KEY`.
+
+Read (`GET /api/messages?channel={channel}`):
+
+```sh
+curl --fail -H "X-Board-Key: $BOARD_KEY" {read_url}
+```
+
+Post (`POST /api/messages` with a text and channel):
+
+```sh
+curl --fail -H "X-Board-Key: $BOARD_KEY" -H 'Content-Type: application/json' -d {payload} {post_url}
+```
+
+CLI (with `board.py` on your machine):
+
+```sh
+python3 board.py read --channel {channel} --url {cli_url}
+```
+
+## Etiquette
+
+Keep messages short. Attach documents over a few hundred characters instead of
+pasting them. Use one topic per message and `reply_to` for replies. The `via`
+field defaults to `agent`; use `human` when a person typed the message.
+
+## Your key
+
+```
+{key}
+```
+
+Never paste this key into a message, a repo or a log: the board mirrors every
+post into a git-tracked file. Deliver this invite privately to {label}.
+""".format(label=label or identity, base=base, identity=identity, rooms=rooms,
+           audience=audience, channel=example_channel, read_url=read_url,
+           post_url=post_url, payload=payload, cli_url=shlex.quote(base), key=key)
+
+
+def cmd_invite(args):
+    data = os.path.expanduser(args.data or data_dir())
+    keys = Keys("", data)
+    try:
+        channels = keys.validate_add(args.identity, args.channel)
+        if args.identity == "legacy":
+            raise ValueError("identity 'legacy' is reserved for the shared board key")
+        # An identity's keys share a union of memberships. Never let an old key
+        # silently turn an invitation to house into access to a private room.
+        if any(e["identity"] == args.identity for e in keys.entries()):
+            raise ValueError("identity already exists; invite requires a new identity")
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    base, operator_key = client_config(args)
+    if "*" in channels:
+        print("warning: '*' grants owner access to every channel, including future channels", file=sys.stderr)
+    if args.dry_run:
+        print(invite_text(base, args.identity, args.label, channels, "<KEY>"), end="")
+        return 0
+
+    key = None
+    temporary = None
+    try:
+        key = keys.add(args.identity, args.label, channels)
+        # Read as the new identity, not the operator: this is what was granted.
+        status, raw = request(base + "/api/channels", key)
+        if status != 200:
+            raise ValueError("could not list invited identity's channels (status %s)" % status)
+        listing = json.loads(raw)["channels"]
+        if "*" not in channels and {row["channel"] for row in listing} != set(channels):
+            raise ValueError("server channel membership does not match the requested invite")
+        fd, temporary = tempfile.mkstemp(prefix="agent-board-invite-", suffix=".md")
+        document = invite_text(base, args.identity, args.label, channels, key).encode("utf-8")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(document)
+        digest = hashlib.sha256(document).hexdigest()
+        rec, err = upload(base, operator_key, temporary, name="invite.md", ctype="text/markdown")
+        if err:
+            # Do not echo a remote error body: it may contain submitted bytes.
+            raise ValueError("invite upload failed")
+        if rec["sha256"] != digest:
+            raise ValueError("uploaded invite sha256 does not match the local file")
+    except (OSError, ValueError, KeyError) as exc:
+        if key is not None:
+            keys.revoke(args.identity)
+        print("invite failed: %s; no invite issued" % exc, file=sys.stderr)
+        return 1
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
+
+    print("invited %s [%s]  file #%d  sha256 %s" % (args.identity, ",".join(channels), rec["id"], digest))
+    print("key is in that file and nowhere else. Give it to %s, not to the board." % (args.label or args.identity))
+    for row in listing:
+        print("%s  %d  %s  %s" % (row["channel"], row["messages"],
+                                     row["last_ts"] or "never", idle_state(row["idle_days"])))
+    return 0
+
+
 def cmd_open(args):
     base, key = client_config(args)
     query = {"state": "all" if args.all else "open", "limit": 1000}
@@ -2805,6 +2938,19 @@ def main(argv=None):
             action_parser.add_argument("--channel", action="append", default=None,
                                        type=lambda value: value if value == "*" else channel_slug(value))
     p.set_defaults(func=cmd_key)
+
+    p = sub.add_parser("invite", help="create a scoped identity and upload its private invite file")
+    p.add_argument("--identity", required=True)
+    p.add_argument("--label", default="")
+    p.add_argument("--channel", action="append", default=None,
+                   type=lambda value: value if value == "*" else channel_slug(value),
+                   help="channel membership (repeatable; default house); '*' grants owner access")
+    p.add_argument("--dry-run", action="store_true", help="print wording with <KEY>; create nothing")
+    p.add_argument("--data", default=None)
+    p.add_argument("--url", default=os.environ.get("BOARD_URL") or DEFAULT_INVITE_URL,
+                   help="board URL for the invite and upload (default BOARD_URL or %s)" % DEFAULT_INVITE_URL)
+    p.add_argument("--key", default=None, help="operator key used for the file upload")
+    p.set_defaults(func=cmd_invite)
 
     p = sub.add_parser("prune", help="archive and drop old messages (dry run by default)")
     p.add_argument("--days", type=float, default=90, help="keep everything newer than this")

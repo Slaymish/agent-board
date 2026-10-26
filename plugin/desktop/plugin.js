@@ -178,7 +178,7 @@ function ChannelRow({ channel, active, unread, delivery, onSelect }) {
   })
 }
 
-function Message({ msg, expanded, onToggle, showNewMarker }) {
+function Message({ msg, expanded, onToggle, onFile, showNewMarker }) {
   const long = (msg.text || '').length > CLAMP
   const shown = long && !expanded ? `${msg.text.slice(0, CLAMP).trimEnd()}…` : msg.text
   return jsxs('div', {
@@ -224,8 +224,20 @@ function Message({ msg, expanded, onToggle, showNewMarker }) {
         : null,
       (msg.files || []).length > 0
         ? jsx('div', {
-            className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
-            children: msg.files.map(f => `#${f.id} ${f.name}`).join('  ')
+            className: 'flex flex-wrap gap-2 text-[0.6875rem] text-(--ui-text-quaternary)',
+            children: msg.files.map(f =>
+              jsx(
+                'button',
+                {
+                  type: 'button',
+                  className: 'underline decoration-dotted hover:text-(--ui-text-secondary)',
+                  title: `read ${f.name} in the pane`,
+                  onClick: () => onFile(f),
+                  children: `#${f.id} ${f.name}`
+                },
+                f.id
+              )
+            )
           })
         : null
     ]
@@ -359,6 +371,11 @@ function BoardBody({ compact }) {
   const query = useBoardState()
   const data = query.data
   const [expanded, setExpanded] = useState({})
+  // Search and file preview are local to this view: the board answers them, the pane
+  // does not remember them, and leaving the channel clears nothing the board owns.
+  const [searchText, setSearchText] = useState('')
+  const [results, setResults] = useState(null)
+  const [preview, setPreview] = useState(null)
 
   if (query.isPending) {
     return jsx('div', {
@@ -386,6 +403,30 @@ function BoardBody({ compact }) {
   const messages = data.messages || []
   const lastSeen = active ? seen[active] || 0 : 0
   const firstNew = messages.find(msg => msg.id > lastSeen)
+
+  // Search runs on submit rather than on every keystroke: the index is the board's,
+  // and a ranked query per character would be noise for a human reading three results.
+  const runSearch = () => {
+    const text = searchText.trim()
+    if (!text) {
+      setResults(null)
+      return
+    }
+    haptic('tap')
+    pluginCtx
+      .rest('/search?q=' + encodeURIComponent(text) + (active ? `&channel=${encodeURIComponent(active)}` : ''))
+      .then(found => setResults(found && found.ok !== false ? found : { results: [] }))
+      .catch(exc => setResults({ results: [], error: String(exc && exc.message ? exc.message : exc) }))
+  }
+
+  const openFile = file => {
+    haptic('tap')
+    setPreview({ loading: true, id: file.id, name: file.name })
+    pluginCtx
+      .rest('/file/' + file.id)
+      .then(body => setPreview(body || { error: 'no answer' }))
+      .catch(exc => setPreview({ error: String(exc && exc.message ? exc.message : exc) }))
+  }
 
   return jsxs('div', {
     className: 'flex h-full min-h-0 flex-col',
@@ -415,35 +456,116 @@ function BoardBody({ compact }) {
         )
       }),
       jsx(InboxStrip, { inbox: data.inbox }),
+      jsxs('div', {
+        className: 'flex shrink-0 items-center gap-1 border-t border-(--ui-stroke-secondary) px-2 py-1',
+        children: [
+          jsx('input', {
+            value: searchText,
+            placeholder: 'search this channel',
+            onChange: event => setSearchText(event.target.value),
+            onKeyDown: event => {
+              if (event.key === 'Enter') runSearch()
+              if (event.key === 'Escape') {
+                setSearchText('')
+                setResults(null)
+              }
+            },
+            className:
+              'min-w-0 flex-1 rounded border border-(--ui-stroke-secondary) bg-transparent px-2 py-0.5 text-[0.6875rem] outline-none focus:border-(--ui-accent)'
+          }),
+          jsx('button', {
+            type: 'button',
+            className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)',
+            onClick: results === null ? runSearch : () => {
+              setSearchText('')
+              setResults(null)
+            },
+            children: results === null ? 'find' : 'clear'
+          })
+        ]
+      }),
       jsx(ScrollArea, {
         className: 'min-h-0 flex-1 border-t border-(--ui-stroke-secondary)',
         children: jsx('div', {
           className: 'flex flex-col px-2',
-          children: messages.length
-            ? messages.map(msg =>
-                jsx(
-                  Message,
-                  {
-                    msg,
-                    expanded: Boolean(expanded[msg.id]),
-                    showNewMarker: firstNew !== undefined && msg.id === firstNew.id,
-                    onToggle: () => {
-                      haptic('tap')
-                      setExpanded(prev => ({ ...prev, [msg.id]: !prev[msg.id] }))
-                    }
-                  },
-                  msg.id
-                )
-              )
-            : jsx(EmptyState, {
-                title: 'Nothing here yet',
-                description:
-                  channels.find(c => c.channel === active && c.state === 'unused') !== undefined
-                    ? 'this room has never been used'
-                    : 'no messages in this channel'
-              })
+          children:
+            results !== null
+              ? results.results && results.results.length
+                ? results.results.map(hit =>
+                    jsx(
+                      Message,
+                      {
+                        msg: { ...hit, text: hit.snippet || hit.text },
+                        expanded: true,
+                        onToggle: () => {},
+                        onFile: openFile,
+                        showNewMarker: false
+                      },
+                      `hit-${hit.id}`
+                    )
+                  )
+                : jsx(EmptyState, {
+                    title: 'Nothing found',
+                    description: results.error || `no match for “${searchText}” in ${active}`
+                  })
+              : messages.length
+                ? messages.map(msg =>
+                    jsx(
+                      Message,
+                      {
+                        msg,
+                        expanded: Boolean(expanded[msg.id]),
+                        showNewMarker: firstNew !== undefined && msg.id === firstNew.id,
+                        onFile: openFile,
+                        onToggle: () => {
+                          haptic('tap')
+                          setExpanded(prev => ({ ...prev, [msg.id]: !prev[msg.id] }))
+                        }
+                      },
+                      msg.id
+                    )
+                  )
+                : jsx(EmptyState, {
+                    title: 'Nothing here yet',
+                    description:
+                      channels.find(c => c.channel === active && c.state === 'unused') !== undefined
+                        ? 'this room has never been used'
+                        : 'no messages in this channel'
+                  })
         })
       }),
+      preview
+        ? jsxs('div', {
+            className:
+              'flex max-h-56 shrink-0 flex-col gap-1 overflow-y-auto border-t border-(--ui-stroke-secondary) bg-(--ui-fill-secondary) px-2 py-1.5 text-[0.6875rem]',
+            children: [
+              jsxs('div', {
+                className: 'flex items-center gap-2',
+                children: [
+                  jsx('span', { className: 'min-w-0 flex-1 truncate font-medium', children: preview.name || `#${preview.id}` }),
+                  preview.size ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: `${preview.size} B` }) : null,
+                  jsx('button', {
+                    type: 'button',
+                    className: 'shrink-0 text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)',
+                    onClick: () => setPreview(null),
+                    children: 'close'
+                  })
+                ]
+              }),
+              preview.loading
+                ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'loading…' })
+                : preview.error
+                  ? jsx('span', { className: 'text-(--ui-danger)', children: preview.error })
+                  : preview.text
+                    ? jsx('pre', {
+                        className: 'whitespace-pre-wrap text-[0.6875rem] leading-snug text-(--ui-text-secondary)',
+                        style: { userSelect: 'text' },
+                        children: preview.text
+                      })
+                    : jsx('span', { className: 'text-(--ui-text-quaternary)', children: preview.note || 'no preview' })
+            ]
+          })
+        : null,
       jsx(Composer, { channel: active })
     ]
   })
