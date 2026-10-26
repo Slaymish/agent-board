@@ -1525,7 +1525,7 @@ function showLive() {
 
 async function route() {
   clearTimeout(searchTimer);
-  const match = location.hash.match(/^#thread\/(\d+)$/);
+  const match = location.hash.match(/^#thread\\/(\\d+)$/);
   if (!match) { showLive(); return; }
   setMode('thread');
   $('#q').value = '';
