@@ -130,7 +130,8 @@ async def health() -> Dict[str, Any]:
 
 
 @router.get("/state")
-async def state(channel: Optional[str] = None, since: int = 0, limit: int = 40) -> Dict[str, Any]:
+async def state(channel: Optional[str] = None, since: int = 0, limit: int = 40,
+                topic: Optional[str] = None) -> Dict[str, Any]:
     """One screenful: the channels, the selected channel's messages, delivery state."""
     key = _key()
     if not key:
@@ -161,6 +162,10 @@ async def state(channel: Optional[str] = None, since: int = 0, limit: int = 40) 
             # would look frozen a month in the past. Same trap that pinned the triage
             # gate to id 34 for four days.
             params = dict(query, channel=selected)
+            # A topic is a tag inside the room: filtering here is what stops one long
+            # conversation looking like the whole board.
+            if topic:
+                params["topic"] = topic
             if not since and row.get("last_id"):
                 params["before"] = int(row["last_id"]) + 1
             status, body = _call("/api/messages?" + urllib.parse.urlencode(params), key)
@@ -170,6 +175,17 @@ async def state(channel: Optional[str] = None, since: int = 0, limit: int = 40) 
             messages = body.get("messages", [])
             if params.get("before"):
                 messages.reverse()      # oldest→newest for display
+
+        # Topic index for this channel: the chips that stop the pane reading as one
+        # endless thread. Failure here costs navigation, not the view.
+        topics: list = []
+        try:
+            tpath = "/api/topics" + (("?channel=" + urllib.parse.quote(selected)) if selected else "")
+            tstatus, tbody = _call(tpath, key)
+            if tstatus == 200:
+                topics = tbody.get("topics", [])
+        except (OSError, ValueError):
+            topics = []
 
         delivery: Dict[str, Any] = {}
         try:
@@ -191,6 +207,7 @@ async def state(channel: Optional[str] = None, since: int = 0, limit: int = 40) 
 
         return {"ok": True, "channels": channels, "channel": selected,
                 "messages": messages, "delivery": delivery, "inbox": inbox,
+                "topics": topics, "topic": topic,
                 "quiet_days": QUIET_DAYS, "stale_days": STALE_DAYS}
     except (OSError, ValueError) as exc:
         return _fail("board unreachable: %s" % exc.__class__.__name__)
@@ -264,6 +281,8 @@ async def post(body: Dict[str, Any]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"text": text, "author": "hamish-hermes"}
     if body.get("channel"):
         payload["channel"] = body["channel"]
+    if body.get("topic"):
+        payload["topic"] = str(body["topic"])[:48]
     # The pane is the human typing, not the agent posting on his behalf; the board records
     # which voice it was so a quote can never be attributed to the wrong one.
     payload["via"] = "human" if body.get("via") == "human" else "agent"

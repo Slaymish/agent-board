@@ -481,7 +481,7 @@ class PhaseOneTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.store = board.Board(os.path.join(self.tmp, "board.db"))
         self.keys = board.Keys(KEY, self.tmp)
-        self.identity_key = self.keys.add("will-hermes", "Will", ["will"])
+        self.identity_key = self.keys.add("will-hermes", "Will", ["elio-zeta"])
         self.start_server()
 
     def start_server(self, legacy=KEY):
@@ -499,7 +499,7 @@ class PhaseOneTest(unittest.TestCase):
     def cli(self, *argv):
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, {"BOARD_DATA": self.tmp, "BOARD_AUTHOR": "",
-                                         "BOARD_KEY": KEY}, clear=False):
+                                         "BOARD_KEY": KEY, "BOARD_QUIET": "1"}, clear=False):
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 result = board.main(list(argv))
         return result, stdout.getvalue(), stderr.getvalue()
@@ -982,10 +982,10 @@ class PhaseTwoTest(unittest.TestCase):
         # room with nothing pending behind it.
         self.assertIn("unknown: hamish-hermes", out)
         self.assertNotIn("unknown: hamish-hermes, will-hermes", out)
-        self.assertEqual(self.remote_cli("ack", "--id", "0", "--channel", "will", "--key", self.identity_key)[0], 0)
+        self.assertEqual(self.remote_cli("ack", "--id", "0", "--channel", "elio-zeta", "--key", self.identity_key)[0], 0)
         self.receipt(0)
         self.receipt(0, self.hamish_key)
-        self.store.ack("hamish-hermes", 0, "will")
+        self.store.ack("hamish-hermes", 0, "elio-zeta")
         self.assertEqual(self.remote_cli("delivery", "--key", self.identity_key)[0], 0)
         mid = self.post(author="hamish-hermes")["id"]
         self.age_message(mid, 700)
@@ -994,7 +994,7 @@ class PhaseTwoTest(unittest.TestCase):
         self.assertEqual(json.loads(out)["me"]["state"], "behind")
         self.assertIn("will-hermes", err)
         self.receipt(mid)
-        self.store.ack("will-hermes", mid, "will")
+        self.store.ack("will-hermes", mid, "elio-zeta")
         self.keys.revoke("hamish-hermes")
         code, out, _ = self.remote_cli("delivery", "--key", self.identity_key)
         self.assertEqual(code, 0)
@@ -1466,7 +1466,7 @@ class ChannelStorageTest(unittest.TestCase):
             self.assertEqual([tuple(r) for r in db.execute("PRAGMA table_info(messages)")], schema)
             rows = [tuple(r) for r in db.execute("SELECT * FROM messages ORDER BY id")]
             self.assertEqual([r[:-2] for r in rows], before)
-            self.assertEqual([r[-2:] for r in rows], [("will", "agent"), ("will", "agent")])
+            self.assertEqual([r[-2:] for r in rows], [("elio-zeta", "agent"), ("elio-zeta", "agent")])
             self.assertEqual([tuple(r) for r in db.execute("PRAGMA table_info(messages_fts)")], fts)
             self.assertEqual([r[2] for r in db.execute("PRAGMA index_info(idx_messages_channel)")],
                              ["channel", "id"])
@@ -1480,24 +1480,24 @@ class ChannelStorageTest(unittest.TestCase):
     def test_membership_matrix_and_key_round_trips(self):
         keys = board.Keys(KEY, self.tmp)
         owner = keys.add("hamish-hermes", "Hamish", ["*"])
-        peer = keys.add("will-hermes", "Will", ["will"])
+        peer = keys.add("will-hermes", "Will", ["elio-zeta"])
         old = keys.add("old", "Older ring")
         entries = keys.entries()
         entries[-1].pop("channels")
         keys._write(entries)
         self.assertEqual(keys.resolve(KEY), ("legacy", True, True))
         for key, identity, channels in ((owner, "hamish-hermes", ["*"]),
-                                         (peer, "will-hermes", ["will"]),
-                                         (old, "old", ["will"]), (KEY, "legacy", ["will"])):
+                                         (peer, "will-hermes", ["elio-zeta"]),
+                                         (old, "old", ["elio-zeta"]), (KEY, "legacy", ["elio-zeta"])):
             self.assertEqual(keys.resolve(key)[0], identity)
             self.assertEqual(keys.channels_for(identity), channels)
-            self.assertTrue(keys.may_read(identity, "will"))
+            self.assertTrue(keys.may_read(identity, "elio-zeta"))
             self.assertEqual(keys.may_read(identity, "future"), identity == "hamish-hermes")
-        keys.add("temporary", channels=["another", "will"])
+        keys.add("temporary", channels=["another", "elio-zeta"])
         self.assertEqual(keys.revoke("temporary"), 1)
         self.assertEqual(keys.entries(), entries)
-        self.assertEqual(keys.default_channel("hamish-hermes"), "will")
-        self.assertEqual(keys.default_channel("old"), "will")
+        self.assertEqual(keys.default_channel("hamish-hermes"), "elio-zeta")
+        self.assertEqual(keys.default_channel("old"), "elio-zeta")
 
     def test_a_new_identity_lands_in_the_public_channel_not_a_direct_one(self):
         # The whole point of channels is that a peer added later cannot read the
@@ -1505,12 +1505,12 @@ class ChannelStorageTest(unittest.TestCase):
         # one careless `key add` leak the direct channel to a flatmate.
         keys = board.Keys(KEY, self.tmp)
         keys.add("hamish-hermes", "Hamish", ["*"])
-        keys.add("will-hermes", "Will", ["will"])
+        keys.add("will-hermes", "Will", ["elio-zeta"])
         flatmate = keys.add("cole-hermes", "Cole")
         self.assertEqual(keys.resolve(flatmate)[0], "cole-hermes")
         self.assertEqual(keys.channels_for("cole-hermes"), ["house"])
         self.assertTrue(keys.may_read("cole-hermes", "house"))
-        self.assertFalse(keys.may_read("cole-hermes", "will"),
+        self.assertFalse(keys.may_read("cole-hermes", "elio-zeta"),
                          "a new identity must not read a direct channel by default")
 
 
@@ -1530,8 +1530,8 @@ class ChannelAPITest(unittest.TestCase):
         self.store = board.Board(os.path.join(self.tmp, "board.db"))
         self.keys = board.Keys(KEY, self.tmp)
         self.owner = self.keys.add("hamish-hermes", "Hamish", ["*"])
-        self.peer = self.keys.add("will-hermes", "Will", ["will"])
-        self.multi = self.keys.add("other", "Other", ["private", "will"])
+        self.peer = self.keys.add("will-hermes", "Will", ["elio-zeta"])
+        self.multi = self.keys.add("other", "Other", ["private", "elio-zeta"])
         self.start_server()
 
     def seed(self):
@@ -1542,12 +1542,12 @@ class ChannelAPITest(unittest.TestCase):
         return public, secret
 
     def test_default_write_channels_and_read_union(self):
-        self.assertEqual(self.post(key=self.owner)["channel"], "will")
-        self.assertEqual(self.post(key=self.peer)["channel"], "will")
+        self.assertEqual(self.post(key=self.owner)["channel"], "elio-zeta")
+        self.assertEqual(self.post(key=self.peer)["channel"], "elio-zeta")
         self.assertEqual(self.post(key=self.multi)["channel"], "private")
-        self.assertEqual(self.post(author="any-author")["channel"], "will")
-        for key, expected in ((self.owner, {"will", "private"}), (self.multi, {"will", "private"}),
-                              (self.peer, {"will"}), (KEY, {"will"})):
+        self.assertEqual(self.post(author="any-author")["channel"], "elio-zeta")
+        for key, expected in ((self.owner, {"elio-zeta", "private"}), (self.multi, {"elio-zeta", "private"}),
+                              (self.peer, {"elio-zeta"}), (KEY, {"elio-zeta"})):
             status, data = self.call("GET", "/api/messages", key)
             self.assertEqual(status, 200)
             self.assertEqual({m["channel"] for m in data["messages"]}, expected)
@@ -1591,6 +1591,31 @@ class ChannelAPITest(unittest.TestCase):
         # Nonexistent channels still require membership: do not bypass the 403 rule.
         self.assertEqual(self.call("GET", "/api/messages?channel=unknown", self.peer)[0], 403)
 
+    def test_topics_are_counted_per_channel_and_scoped_to_membership(self):
+        # The pane's topic chips come from here. A topic list drawn from the whole board
+        # would mix rooms the reader is not looking at, which is the flat-stream problem
+        # one level up.
+        # Explicit channels: the module default is `elio-zeta`, and `will` is only an
+        # alias for it now, so the fixture names the rooms it means.
+        self.post("narwhal one", key=self.owner, channel="elio-zeta", topic="same")
+        self.post("narwhal two", key=self.owner, channel="elio-zeta", topic="same")
+        self.post("a different thread", key=self.owner, channel="elio-zeta", topic="other")
+
+        status, data = self.call("GET", "/api/topics?channel=elio-zeta", self.owner)
+        self.assertEqual(status, 200)
+        counts = {row["topic"]: row["messages"] for row in data["topics"]}
+        self.assertEqual(counts, {"same": 2, "other": 1})
+        # Highest count first, so the biggest conversation is the first chip.
+        self.assertEqual([row["topic"] for row in data["topics"]][0], "same")
+
+        scoped = {row["topic"] for row in self.call("GET", "/api/topics?channel=private", self.owner)[1]["topics"]}
+        self.assertNotIn("other", scoped)
+
+        # The peer is not in `private`, so it cannot ask for that room's topics.
+        self.assertEqual(self.call("GET", "/api/topics?channel=private", self.peer)[0], 403)
+        peer_topics = {row["topic"] for row in self.call("GET", "/api/topics", self.peer)[1]["topics"]}
+        self.assertEqual(peer_topics, {"same", "other"})
+
     def test_search_digest_markdown_threads_and_asks_do_not_leak(self):
         public, secret = self.seed()
         paths = ("/api/messages", "/api/messages.md", "/api/messages?search=narwhal", "/api/search?q=narwhal",
@@ -1620,7 +1645,7 @@ class ChannelAPITest(unittest.TestCase):
         later = self.post("Second readable narwhal evidence for pagination.", key=self.peer)
         original = self.store._row
         def check_row(row, files=None):
-            self.assertEqual(row["channel"], "will", "forbidden row fetched before Python conversion")
+            self.assertEqual(row["channel"], "elio-zeta", "forbidden row fetched before Python conversion")
             return original(row, files)
         with mock.patch.object(self.store, "_row", side_effect=check_row):
             for path in ("/api/messages?limit=1", "/api/messages?before=999&limit=1", "/api/search?q=narwhal&limit=1",
@@ -1645,7 +1670,7 @@ class ChannelAPITest(unittest.TestCase):
         child = self.post("Child", key=self.multi, channel="private", reply_to=root["id"])
         for field in ("reply_to", "amends"):
             status, data = self.call("POST", "/api/messages", self.owner,
-                                     {"text": "wrong audience", "channel": "will", field: child["id"]})
+                                     {"text": "wrong audience", "channel": "elio-zeta", field: child["id"]})
             self.assertEqual(status, 400)
             self.assertIn("channel", data["error"])
         amended = self.post("Amended", key=self.owner, channel="private", amends=root["id"])
@@ -1707,20 +1732,22 @@ class ChannelAPITest(unittest.TestCase):
                 self.assertEqual(error.exception.code, 2)
         for value in (None, 7, [], True):
             self.assertEqual(self.call("POST", "/api/messages", self.owner, {"text": "bad", "channel": value})[0], 400)
-        self.assertEqual(self.call("GET", "/api/messages?channel=will&channel=private", self.owner)[0], 400)
+        self.assertEqual(self.call("GET", "/api/messages?channel=elio-zeta&channel=private", self.owner)[0], 400)
         self.assertEqual(self.post(key=self.owner, channel="a_0-" + "z" * 28)["channel"], "a_0-" + "z" * 28)
 
     def test_health_channels_discovery_and_channels_cli_no_secrets(self):
         self.seed()
         status, data = self.call("GET", "/api/health")
         self.assertEqual(status, 200)
-        self.assertEqual(data["channels"], {"will": 1, "private": 1})
+        self.assertEqual(data["channels"], {"elio-zeta": 1, "private": 1})
         for field in ("messages", "latest_id", "topics", "files", "delivery", "uptime_s", "inflight", "max_concurrent"):
             self.assertIn(field, data)
         code, out, error = self.remote_cli("channels", "--key", self.owner)
         self.assertEqual(code, 0, error)
         self.assertIn("private  1  live  hamish-hermes, other", out)
-        self.assertIn("will  1  live  hamish-hermes, legacy, other, will-hermes", out)
+        # The slug first, the human label only where it adds something: the listing is
+        # what commands are copied from, so a label can never replace the slug.
+        self.assertIn("elio-zeta (Elio ↔ Zeta)  1  live  hamish-hermes, legacy, other, will-hermes", out)
         for secret in (KEY, self.owner, self.peer, self.multi):
             self.assertNotIn(secret, out)
         code, out, _ = self.remote_cli("channels", "--key", self.peer)
@@ -1756,7 +1783,7 @@ class ChannelAPITest(unittest.TestCase):
             fh.write("A narwhal note from the unchanged text-file workflow.")
         code, _, error = self.remote_cli("post", "--text-file", note, "--key", self.peer)
         self.assertEqual(code, 0, error)
-        self.assertEqual(self.store.fetch()[0]["channel"], "will")
+        self.assertEqual(self.store.fetch()[0]["channel"], "elio-zeta")
         code, _, error = self.remote_cli("post", "--text-file", note, "--channel", "private", "--key", self.multi)
         self.assertEqual(code, 0, error)
         self.assertEqual(self.store.fetch()[1]["channel"], "private")
@@ -1771,9 +1798,9 @@ class ChannelAPITest(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt):
                 board.main(["watch", "--channel", "private", "--key", self.owner, "--url", "http://127.0.0.1:%d" % self.port])
             self.assertIn("channel=private", request.call_args.args[0])
-        code, _, error = self.cli("key", "add", "--identity", "new-peer", "--label", "New", "--channel", "will", "--channel", "private")
+        code, _, error = self.cli("key", "add", "--identity", "new-peer", "--label", "New", "--channel", "elio-zeta", "--channel", "private")
         self.assertEqual(code, 0, error)
-        self.assertEqual(self.keys.channels_for("new-peer"), ["will", "private"])
+        self.assertEqual(self.keys.channels_for("new-peer"), ["elio-zeta", "private"])
         before = self.keys.entries()
         self.assertEqual(self.cli("key", "add", "--identity", "remove-me")[0], 0)
         self.assertEqual(self.cli("key", "revoke", "--identity", "remove-me")[0], 0)
@@ -1786,11 +1813,11 @@ class ChannelAPITest(unittest.TestCase):
                                         {"id": secret["id"], "channel": value})
             self.assertEqual(status, 200, receipt)
             self.assertNotIn("channel", receipt)
-        self.call("POST", "/api/ack", self.owner, {"id": public["id"], "channel": "will"})
+        self.call("POST", "/api/ack", self.owner, {"id": public["id"], "channel": "elio-zeta"})
         data = self.call("GET", "/api/delivery", self.owner)[1]
         mine = {r["channel"]: r for r in data["channels"] if r["identity"] == "hamish-hermes"}
         self.assertEqual(data["me"]["acked_id"], secret["id"])
-        self.assertEqual(mine["will"]["acked_id"], public["id"])
+        self.assertEqual(mine["elio-zeta"]["acked_id"], public["id"])
         # No receipt of its own: the whole-board floor covers it, and it says so
         # rather than reporting a backlog that was delivered before channels existed.
         self.assertEqual(mine["private"]["acked_id"], secret["id"])
@@ -1808,7 +1835,7 @@ class ChannelAPITest(unittest.TestCase):
         self.assertEqual({r["channel"] for r in data["channels"]}, {"private"})
         self.assertEqual(next(r for r in data["channels"] if r["identity"] == "hamish-hermes")["acked_id"], secret["id"])
         peer_data = self.call("GET", "/api/delivery", self.peer)[1]
-        self.assertEqual({r["channel"] for r in peer_data["channels"]}, {"will"})
+        self.assertEqual({r["channel"] for r in peer_data["channels"]}, {"elio-zeta"})
         self.assertEqual(self.call("GET", "/api/delivery?channel=private", self.peer)[0], 403)
 
     def test_a_whole_board_ack_covers_rooms_it_predates(self):
@@ -1828,7 +1855,7 @@ class ChannelAPITest(unittest.TestCase):
         self.seed()
         with self.store._db() as db:
             db.execute("UPDATE messages SET epoch=?", (time.time() - 700,))
-        self.store.ack("hamish-hermes", 0, "will")
+        self.store.ack("hamish-hermes", 0, "elio-zeta")
         data = self.call("GET", "/api/delivery", self.owner)[1]
         mine = {r["channel"]: r for r in data["channels"] if r["identity"] == "hamish-hermes"}
         # An ack in `will` says nothing about `private`, and there is no
@@ -1838,18 +1865,18 @@ class ChannelAPITest(unittest.TestCase):
         self.assertEqual(mine["private"]["state"], "unknown")
         self.assertIsNone(mine["private"]["ack_source"])
         self.assertEqual(self.remote_cli("delivery", "--channels-state", "--key", self.owner)[1].strip(), "ok")
-        self.store.ack("will-hermes", 0, "will")
+        self.store.ack("will-hermes", 0, "elio-zeta")
         self.assertEqual(self.remote_cli("delivery", "--channels-state", "--key", self.owner)[1].strip(), "behind")
         code, output, _ = self.remote_cli("delivery", "--key", self.owner)
         self.assertEqual(code, 1)
-        self.assertIn("channel will", output)
+        self.assertIn("channel elio-zeta", output)
         self.assertIn("channel private", output)
         code, output, _ = self.remote_cli("delivery", "--channel", "private", "--key", self.owner)
         self.assertEqual(code, 2)
-        self.assertNotIn("channel will", output)
-        self.assertEqual(self.remote_cli("delivery", "--state", "--channel", "will", "--key", self.peer)[1].strip(), "behind")
-        self.store.ack("will-hermes", self.store.latest_id(), "will")
-        self.assertEqual(self.remote_cli("delivery", "--state", "--channel", "will", "--key", self.peer)[1].strip(), "ok")
+        self.assertNotIn("channel elio-zeta", output)
+        self.assertEqual(self.remote_cli("delivery", "--state", "--channel", "elio-zeta", "--key", self.peer)[1].strip(), "behind")
+        self.store.ack("will-hermes", self.store.latest_id(), "elio-zeta")
+        self.assertEqual(self.remote_cli("delivery", "--state", "--channel", "elio-zeta", "--key", self.peer)[1].strip(), "ok")
 
     def test_web_channel_controls_are_self_contained(self):
         status, html = self.call("GET", "/")
@@ -1870,7 +1897,7 @@ class HumanVoiceStorageTest(unittest.TestCase):
                         epoch REAL NOT NULL, author TEXT NOT NULL,
                         topic TEXT NOT NULL DEFAULT '', text TEXT NOT NULL,
                         reply_to INTEGER, root_id INTEGER, amends INTEGER, amended_by INTEGER,
-                        channel TEXT NOT NULL DEFAULT 'will');
+                        channel TEXT NOT NULL DEFAULT 'elio-zeta');
                     INSERT INTO messages(epoch,author,text,channel)
                         VALUES(123,'hamish-hermes','Original words','private');
                     CREATE TABLE row_updates (n INTEGER);
@@ -1948,7 +1975,7 @@ class HumanVoiceInboxTest(unittest.TestCase):
                      ("post", "These too", "--via", "human"),
                      ("amend", "1", "Corrected words", "--via", "human"),
                      ("post", "Agent words")):
-            code, output, error = self.remote_cli(*argv, "--key", self.owner, "--channel", "will")
+            code, output, error = self.remote_cli(*argv, "--key", self.owner, "--channel", "elio-zeta")
             self.assertEqual(code, 0, error)
             self.assertIn("posted #", output)
         messages = self.store.fetch()
@@ -1976,7 +2003,7 @@ class HumanVoiceInboxTest(unittest.TestCase):
             for msg, days in incoming + [(outgoing, 6.2)]:
                 db.execute("UPDATE asks SET opened_epoch=? WHERE id=?", (now - days * 86400, msg["ask_id"]))
         with mock.patch.object(board.time, "time", return_value=now):
-            data = self.inbox(channel="will")
+            data = self.inbox(channel="elio-zeta")
         self.assertEqual(set(data), {"asks", "asks_by_me", "latest", "counts"})
         self.assertEqual(data["counts"], {"open_to_me": 5, "open_by_me": 1})
         self.assertEqual([a["msg_id"] for a in data["asks"]], [m["id"] for m, _ in reversed(incoming)])
@@ -1984,14 +2011,14 @@ class HumanVoiceInboxTest(unittest.TestCase):
         for ask, (msg, days) in zip(data["asks"], reversed(incoming)):
             self.assertEqual(ask["id"], msg["ask_id"])
             self.assertEqual(ask["from"], "will-hermes")
-            self.assertEqual(ask["channel"], "will")
+            self.assertEqual(ask["channel"], "elio-zeta")
             self.assertEqual(ask["text"], msg["text"])
             self.assertEqual(ask["opened"], board.now_iso(now - days * 86400))
             self.assertAlmostEqual(ask["age_days"], days)
         self.assertEqual(data["asks_by_me"][0]["to"], "will-hermes")
         self.assertAlmostEqual(data["asks_by_me"][0]["age_days"], 6.2)
         self.assertEqual(data["asks_by_me"][0]["ageing"], "ok")
-        self.assertEqual(data["latest"], {"channel": "will", "id": closed["id"], "ts": closed["ts"]})
+        self.assertEqual(data["latest"], {"channel": "elio-zeta", "id": closed["id"], "ts": closed["ts"]})
 
     def test_inbox_omits_unreadable_asks_and_latest_and_filters_channel(self):
         visible = self.post("Visible ask", key=self.owner, ask_to="will-hermes")
@@ -2002,16 +2029,16 @@ class HumanVoiceInboxTest(unittest.TestCase):
         self.assertEqual(data["counts"], {"open_to_me": 1, "open_by_me": 0})
         # Authorship alone must not make an unreadable outgoing ask visible either.
         entries = self.keys.entries()
-        entries[0]["channels"] = ["will"]
+        entries[0]["channels"] = ["elio-zeta"]
         self.keys._write(entries)
         self.assertEqual([a["msg_id"] for a in self.inbox()["asks_by_me"]], [visible["id"]])
         self.assertNotIn(hidden["text"], json.dumps(data))
-        filtered = self.inbox(self.peer, "will")
+        filtered = self.inbox(self.peer, "elio-zeta")
         self.assertEqual([a["msg_id"] for a in filtered["asks"]], [visible["id"]])
         self.assertEqual(filtered["latest"], data["latest"])
         self.assertEqual(self.call("GET", "/api/inbox?channel=private", self.peer)[0], 403)
         self.assertEqual(self.call("GET", "/api/inbox")[0], 401)
-        for suffix in ("?channel=", "?channel=BAD", "?channel=will&channel=private"):
+        for suffix in ("?channel=", "?channel=BAD", "?channel=elio-zeta&channel=private"):
             self.assertEqual(self.call("GET", "/api/inbox" + suffix, self.owner)[0], 400)
 
     def test_inbox_has_no_ledger_limit_and_does_not_ack_on_view(self):
@@ -2020,11 +2047,11 @@ class HumanVoiceInboxTest(unittest.TestCase):
         self.assertEqual(self.inbox()["counts"]["open_to_me"], 105)
         with self.store._db() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM acks").fetchone()[0], 0)
-        self.store.ack("hamish-hermes", 105, "will")
+        self.store.ack("hamish-hermes", 105, "elio-zeta")
         self.assertEqual(self.inbox()["counts"]["open_to_me"], 105)
 
     def test_empty_inbox_cli_and_json(self):
-        code, output, error = self.remote_cli("inbox", "--channel", "will", "--key", self.owner)
+        code, output, error = self.remote_cli("inbox", "--channel", "elio-zeta", "--key", self.owner)
         self.assertEqual((code, output, error), (0, "inbox: nothing waiting\n", ""))
         code, output, error = self.remote_cli("inbox", "--json", "--key", self.owner)
         self.assertEqual((code, error), (0, ""))
@@ -2038,11 +2065,11 @@ class HumanVoiceInboxTest(unittest.TestCase):
         with self.store._db() as db:
             db.execute("UPDATE asks SET opened_epoch=? WHERE id=?",
                        (time.time() - 12 * 86400, incoming["ask_id"]))
-        code, output, error = self.remote_cli("inbox", "--channel", "will", "--key", self.owner)
+        code, output, error = self.remote_cli("inbox", "--channel", "elio-zeta", "--key", self.owner)
         self.assertEqual((code, error), (0, ""))
         lines = output.splitlines()
         self.assertEqual(len(lines), 3)
-        self.assertIn("[will]  12.0d warn  from will-hermes", lines[0])
+        self.assertIn("[Elio ↔ Zeta]  12.0d warn  from will-hermes", lines[0])
         self.assertIn("to will-hermes", lines[1])
         self.assertEqual(lines[-1], "1 waiting on you, 1 you are waiting on, oldest 12d")
         code, output, error = self.remote_cli("inbox", "--json", "--key", self.peer)
@@ -2056,21 +2083,21 @@ class ChannelAckMigrationTest(unittest.TestCase):
     def test_channel_grace_boundary_and_whole_board_row_are_independent(self):
         with tempfile.TemporaryDirectory() as directory:
             store = board.Board(os.path.join(directory, "board.db"))
-            will = store.post("will-hermes", "delivered", channel="will")["id"]
+            will = store.post("will-hermes", "delivered", channel="elio-zeta")["id"]
             store.post("house-peer", "still pending", channel="house")
             with store._db() as db:
                 db.execute("UPDATE messages SET epoch=1000")
             store.ack("hamish-hermes", 0)
-            store.ack("hamish-hermes", will, "will")
+            store.ack("hamish-hermes", will, "elio-zeta")
             store.ack("hamish-hermes", 0, "house")
             with mock.patch.object(board.time, "time", return_value=1600):
                 data = store.delivery(["hamish-hermes"], "hamish-hermes")
-                self.assertEqual({r["channel"]: r["state"] for r in data["channels"]}, {"will": "ok", "house": "ok"})
+                self.assertEqual({r["channel"]: r["state"] for r in data["channels"]}, {"elio-zeta": "ok", "house": "ok"})
             with mock.patch.object(board.time, "time", return_value=1601):
                 data = store.delivery(["hamish-hermes"], "hamish-hermes")
                 self.assertEqual(data["me"]["state"], "behind")
-                self.assertEqual({r["channel"]: r["state"] for r in data["channels"]}, {"will": "ok", "house": "behind"})
-                self.assertEqual({r["channel"]: r["pending_count"] for r in data["channels"]}, {"will": 0, "house": 1})
+                self.assertEqual({r["channel"]: r["state"] for r in data["channels"]}, {"elio-zeta": "ok", "house": "behind"})
+                self.assertEqual({r["channel"]: r["pending_count"] for r in data["channels"]}, {"elio-zeta": 0, "house": 1})
 
     def test_migration_preserves_legacy_row_timestamp_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2107,7 +2134,7 @@ class InviteTest(unittest.TestCase):
         self.store = board.Board(os.path.join(self.tmp, "board.db"))
         self.keys = board.Keys(KEY, self.tmp)
         self.owner = self.keys.add("hamish-hermes", "Hamish", ["*"])
-        self.keys.add("will-hermes", "Will", ["will"])
+        self.keys.add("will-hermes", "Will", ["elio-zeta"])
         self.start_server()
 
     def invite(self, *extra):
@@ -2148,7 +2175,7 @@ class InviteTest(unittest.TestCase):
                       (rec["id"], rec["sha256"]), out)
         self.assertIn("key is in that file and nowhere else. Give it to Cole, not to the board.\n", out)
         self.assertIn("house  0  never  unused\n", out)
-        self.assertNotIn("will", out)
+        self.assertNotIn("elio-zeta", out)
         self.assertEqual(self.store.count(), 0)
         self.assertTrue(all("/api/messages" not in c.args[0] for c in requests.call_args_list))
         with self.store._db() as db:
@@ -2164,9 +2191,9 @@ class InviteTest(unittest.TestCase):
         self.assertEqual({r["channel"] for r in rows}, {"house", "future-room"})
         self.assertIn("future-room  0  never  unused\n", out)
         self.assertIn("future-room", self.remote_cli("channels", "--key", key)[1])
-        self.assertEqual(self.call("GET", "/api/messages?channel=will", key)[0], 403)
+        self.assertEqual(self.call("GET", "/api/messages?channel=elio-zeta", key)[0], 403)
         self.assertEqual(self.call("POST", "/api/messages", key,
-                                   {"text": "forbidden", "channel": "will"})[0], 403)
+                                   {"text": "forbidden", "channel": "elio-zeta"})[0], 403)
         self.assertEqual(self.store.count(), 0)
 
     def test_dry_run_redacts_and_has_no_side_effects_even_with_new_data_directory(self):
@@ -2179,7 +2206,7 @@ class InviteTest(unittest.TestCase):
         self.assertEqual((code, err), (0, ""))
         self.assertIn("```\n<KEY>\n```", out)
         self.assertNotIn("ab_", out)
-        self.assertNotIn("will", out)
+        self.assertNotIn("elio-zeta", out)
         self.assertFalse(os.path.exists(empty_data))
         for operation in (generate, upload, request, temporary):
             operation.assert_not_called()
@@ -2223,7 +2250,7 @@ class InviteTest(unittest.TestCase):
             before = fh.read()
         invalid = [("--identity", value) for value in ("", " cole", "cole ", "x" * 65, "legacy")]
         invalid += [("--channel", "house", "--channel", value)
-                    for value in ("", "House", "../will", "a" * 33, "all*", "a,b")]
+                    for value in ("", "House", "../elio-zeta", "a" * 33, "all*", "a,b")]
         for extra in invalid:
             with self.subTest(extra=extra), mock.patch.object(board.Keys, "add") as add:
                 try:
@@ -2237,13 +2264,13 @@ class InviteTest(unittest.TestCase):
         self.assertEqual(self.store.list_files(), [])
 
     def test_existing_identity_cannot_inherit_private_membership(self):
-        old = self.keys.add("cole-hermes", "Cole", ["will"])
+        old = self.keys.add("cole-hermes", "Cole", ["elio-zeta"])
         code, out, err = self.invite()
         self.assertEqual(code, 1)
         self.assertIn("identity already exists", err)
         self.assertNotIn(old, out + err)
         self.assertEqual(len(self.keys.entries()), 3)
-        self.assertEqual(self.keys.channels_for("cole-hermes"), ["will"])
+        self.assertEqual(self.keys.channels_for("cole-hermes"), ["elio-zeta"])
         self.assertEqual(self.store.list_files(), [])
 
     def test_explicit_wildcard_warns_and_lists_owner_scope(self):
@@ -2252,7 +2279,7 @@ class InviteTest(unittest.TestCase):
         self.assertEqual(self.entry()["channels"], ["*"])
         self.assertEqual(len(err.splitlines()), 1)
         self.assertIn("owner access to every channel", err)
-        self.assertIn("will  0  never  unused", out)
+        self.assertIn("elio-zeta  0  never  unused", out)
         rec = self.store.list_files()[0]
         document = self.raw_get(rec["url"], KEY)[1].decode()
         self.assertIn("read and write all channels", document)
@@ -2308,7 +2335,7 @@ class InviteTest(unittest.TestCase):
 
     def test_failed_or_inexact_channel_discovery_rolls_back_before_upload(self):
         for response in ((401, '{}'),
-                         (200, json.dumps({"channels": [{"channel": "will"}]}))):
+                         (200, json.dumps({"channels": [{"channel": "elio-zeta"}]}))):
             with self.subTest(response=response), \
                  mock.patch.object(board, "request", return_value=response), \
                  mock.patch.object(board, "upload") as upload, \

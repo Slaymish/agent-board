@@ -37,6 +37,9 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+DEFAULT_CHANNEL = "elio-zeta"
+CHANNEL_LABELS = {"elio-zeta": "Elio ↔ Zeta"}
+
 DEFAULT_PORT = 8790
 DEFAULT_DATA = os.path.expanduser("~/.hermes/data/agent-board")
 # Invitations need the peer-facing address, rather than the client's loopback
@@ -75,7 +78,7 @@ IDLE_TIMEOUT = float(os.environ.get("BOARD_IDLE_TIMEOUT") or 75)
 # server that degrades for everyone.
 MAX_CONCURRENT = int(os.environ.get("BOARD_MAX_CONCURRENT") or 32)
 
-VERSION = "1.4.1"
+VERSION = "1.5.1"
 
 # Served inline; anything else is forced to a download so this board can never
 # be used to host markup that a browser would execute in the site's origin.
@@ -249,6 +252,10 @@ def channel_slug(value):
     return value
 
 
+def channel_label(slug):
+    return CHANNEL_LABELS.get(slug, slug)
+
+
 def channel_clause(channels, column="channel"):
     """SQL audience constraint. None means all; an empty membership means none."""
     if channels is None:
@@ -276,7 +283,7 @@ class Board:
         with self._db() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute(
-                """CREATE TABLE IF NOT EXISTS messages (
+                f"""CREATE TABLE IF NOT EXISTS messages (
                        id INTEGER PRIMARY KEY AUTOINCREMENT,
                        epoch REAL NOT NULL,
                        author TEXT NOT NULL,
@@ -286,7 +293,7 @@ class Board:
                        root_id INTEGER,
                        amends INTEGER,
                        amended_by INTEGER,
-                       channel TEXT NOT NULL DEFAULT 'will',
+                       channel TEXT NOT NULL DEFAULT '{DEFAULT_CHANNEL}',
                        via TEXT NOT NULL DEFAULT 'agent'
                    )"""
             )
@@ -327,7 +334,7 @@ class Board:
             if column not in columns:
                 db.execute("ALTER TABLE messages ADD COLUMN %s INTEGER" % column)
         if "channel" not in columns:
-            db.execute("ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'will'")
+            db.execute("ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT '%s'" % DEFAULT_CHANNEL)
         if "via" not in columns:
             db.execute("ALTER TABLE messages ADD COLUMN via TEXT NOT NULL DEFAULT 'agent'")
         db.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel, id)")
@@ -492,7 +499,7 @@ class Board:
             return True
 
     def post(self, author, text, topic=None, file_ids=None, reply_to=None, amends=None,
-             ask_to=None, answers=None, identity=None, channel="will", via="agent"):
+             ask_to=None, answers=None, identity=None, channel=DEFAULT_CHANNEL, via="agent"):
         channel_slug(channel)
         if via not in ("agent", "human"):
             raise ValueError("via must be agent or human")
@@ -648,7 +655,7 @@ class Board:
         states, breakdown = [], []
         with self.cond, self._db() as db:
             slugs = sorted(set(channels if channels is not None else self.channels()) |
-                           ({"will"} if channels is None else set()))
+                           ({DEFAULT_CHANNEL} if channels is None else set()))
             for channel in ["*"] + slugs:
                 for identity in sorted(set(identities)):
                     if channel != "*" and memberships is not None and identity not in memberships.get(channel, []):
@@ -1010,6 +1017,23 @@ class Board:
             rows = db.execute("SELECT channel, COUNT(*) AS n FROM messages GROUP BY channel ORDER BY channel")
             return {r["channel"]: r["n"] for r in rows}
 
+    def resolve_channel(self, slug, known):
+        """Resolve compatibility aliases only when the final room still exists.
+
+        Read meta each time so a running server sees an operator's rename.
+        Broken chains and cycles leave the supplied slug unknown, as before.
+        """
+        original, seen = slug, set()
+        with self.cond, self._db() as db:
+            while slug not in seen:
+                seen.add(slug)
+                row = db.execute("SELECT value FROM meta WHERE key=?",
+                                 ("channel_alias:" + slug,)).fetchone()
+                if row is None:
+                    return slug if slug in known else original
+                slug = row["value"]
+        return original
+
     def channel_stats(self):
         """Counts plus the newest message per channel.
 
@@ -1024,12 +1048,19 @@ class Board:
             return {r["channel"]: {"messages": r["n"], "last_id": r["last_id"],
                                    "last_epoch": r["last_epoch"]} for r in rows}
 
-    def topics(self):
+    def topics(self, channels=None):
+        """Topic counts, optionally scoped to the channels an identity may read.
+
+        The pane needs this per channel: a topic list drawn from the whole board mixes
+        conversations the reader is not looking at, which is the flat stream problem one
+        level up. `channels=None` keeps the global view the health endpoint reports.
+        """
+        clause, args = channel_clause(channels)
         with self.cond:
             with self._db() as db:
                 rows = db.execute(
-                    "SELECT topic, COUNT(*) AS n FROM messages WHERE topic != '' "
-                    "GROUP BY topic ORDER BY topic"
+                    "SELECT topic, COUNT(*) AS n FROM messages WHERE topic != '' AND " + clause +
+                    " GROUP BY topic ORDER BY topic", args
                 ).fetchall()
         return {r["topic"]: r["n"] for r in rows}
 
@@ -1075,6 +1106,7 @@ class Keys:
         self.legacy = legacy
         self.directory = directory
         self.path = os.path.join(directory, "keys.json")
+        self.board = None
 
     def entries(self):
         try:
@@ -1097,16 +1129,31 @@ class Keys:
 
     def channels_for(self, identity):
         if identity == "legacy":
-            return ["will"]
+            return [DEFAULT_CHANNEL]
         entries = [e for e in self.entries() if e["identity"] == identity]
         if not entries:
-            return ["will"]
+            return [DEFAULT_CHANNEL]
         # Membership belongs to an identity, including when it holds several keys.
-        return list(dict.fromkeys(c for e in entries for c in e.get("channels", ["will"])))
+        return list(dict.fromkeys(c for e in entries for c in e.get("channels", [DEFAULT_CHANNEL])))
 
     def read_scope(self, identity):
         channels = self.channels_for(identity)
-        return None if "*" in channels else channels
+        if "*" in channels:
+            return None
+        return list(dict.fromkeys(self.resolve_channel(c) for c in channels))
+
+    def known_channels(self):
+        slugs = {DEFAULT_CHANNEL}
+        for entry in self.entries():
+            slugs.update(c for c in entry.get("channels", [DEFAULT_CHANNEL]) if c != "*")
+        if self.board is not None:
+            slugs.update(self.board.channels())
+        return slugs
+
+    def resolve_channel(self, channel):
+        if self.board is None:
+            return channel
+        return self.board.resolve_channel(channel, self.known_channels())
 
     def may_read(self, identity, channel):
         scope = self.read_scope(identity)
@@ -1115,14 +1162,14 @@ class Keys:
     def default_channel(self, identity):
         scope = self.read_scope(identity)
         if scope is None:
-            return "will"
+            return self.resolve_channel(DEFAULT_CHANNEL)
         if not scope:
-            raise ValueError("identity has no channel membership")
+            return DEFAULT_CHANNEL
         return scope[0]
 
     def channel_listing(self, board, identity):
         stats = board.channel_stats()
-        slugs = set(stats) | {"will"}
+        slugs = set(stats) | {self.resolve_channel(DEFAULT_CHANNEL)}
         identities = {e["identity"] for e in self.entries()}
         if self.legacy:
             identities.add("legacy")
@@ -1244,7 +1291,7 @@ button:disabled{opacity:.5;cursor:default}
 [hidden]{display:none!important}
 </style></head><body>
 <header><h1>agent-board</h1>
-  <select id="channel" aria-label="Channel"><option value="will">will</option></select>
+  <select id="channel" aria-label="Channel"><option value="elio-zeta">elio-zeta</option></select>
   <input id="q" placeholder="search the archive…" autocomplete="off">
   <button id="back-live" class="ghost" hidden>back to live</button>
   <span id="status-wrap"><span id="status">connecting…</span><span id="delivery"></span></span></header>
@@ -1671,6 +1718,7 @@ class BoardServer(ThreadingHTTPServer):
 
 def make_handler(board, key, name, idle_timeout=None):
     keys = key if isinstance(key, Keys) else Keys(key, os.path.dirname(board.db_path))
+    keys.board = board
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "agent-board/" + VERSION
@@ -1689,6 +1737,8 @@ def make_handler(board, key, name, idle_timeout=None):
             body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            if getattr(self, "resolved_channel", None) is not None:
+                self.send_header("X-Board-Channel", self.resolved_channel)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -1703,6 +1753,7 @@ def make_handler(board, key, name, idle_timeout=None):
             self._send(code, {"error": message}, extra={"Connection": "close"} if close else None)
 
         def _query(self):
+            self.resolved_channel = None
             parsed = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(parsed.query)
             # Preserve existing handling of empty query values; only channel
@@ -1744,11 +1795,17 @@ def make_handler(board, key, name, idle_timeout=None):
             if "channel" in qs:
                 if len(qs["channel"]) != 1:
                     raise ValueError("pass one channel per request")
-                channel = channel_slug(qs["channel"][0])
+                channel = self._resolve_channel(channel_slug(qs["channel"][0]))
                 if not keys.may_read(self.auth_identity, channel):
                     raise PermissionError("identity may not read channel '%s'" % channel)
                 return [channel]
             return keys.read_scope(self.auth_identity)
+
+        def _resolve_channel(self, slug):
+            resolved = keys.resolve_channel(slug)
+            if resolved != slug:
+                self.resolved_channel = resolved
+            return resolved
 
         @staticmethod
         def _parse_body(raw):
@@ -1832,6 +1889,13 @@ def make_handler(board, key, name, idle_timeout=None):
                 return self._err(403, str(exc))
             if path == "/api/channels":
                 return self._send(200, {"channels": keys.channel_listing(board, self.auth_identity)})
+            if path == "/api/topics":
+                # Per channel, ordered by count: the pane's topic chips. A topic is a tag
+                # inside a room, so the list is scoped to what this identity may read.
+                scoped = board.topics(channels) if channels is not None else board.topics()
+                ordered = sorted(scoped.items(), key=lambda kv: (-kv[1], kv[0]))
+                return self._send(200, {"channel": (qs.get("channel") or [None])[0],
+                                        "topics": [{"topic": t, "messages": n} for t, n in ordered]})
             if path == "/api/identity":
                 if not self.auth_known:
                     return self._err(401, "board key required")
@@ -1999,11 +2063,8 @@ def make_handler(board, key, name, idle_timeout=None):
                 # Older clients used channel for a notification route (e.g. conduit).
                 # Only known board channels select a row; every other value is legacy.
                 supplied = data.get("channel")
-                known = {"will"}
-                for entry in keys.entries():
-                    known.update(c for c in keys.channels_for(entry["identity"]) if c != "*")
-                known.update(board.channels())
-                channel = supplied if isinstance(supplied, str) and supplied in known else "*"
+                resolved = self._resolve_channel(supplied) if isinstance(supplied, str) else supplied
+                channel = resolved if isinstance(resolved, str) and resolved in keys.known_channels() else "*"
                 if channel != "*" and not keys.may_read(self.auth_identity, channel):
                     return self._err(403, "identity may not ack channel '%s'" % channel)
                 return self._send(200, board.ack(self.auth_identity, mid, channel))
@@ -2016,8 +2077,8 @@ def make_handler(board, key, name, idle_timeout=None):
                     return self._err(400, str(exc))
                 return self._send(200, {"ask": ask})
             try:
-                channel = channel_slug(data["channel"] if "channel" in data
-                                       else keys.default_channel(self.auth_identity))
+                channel = self._resolve_channel(channel_slug(data["channel"] if "channel" in data
+                                       else keys.default_channel(self.auth_identity)))
             except ValueError as exc:
                 return self._err(400, str(exc))
             if not keys.may_read(self.auth_identity, channel):
@@ -2088,6 +2149,18 @@ def client_config(args):
     return base, key
 
 
+_alias_notes = set()
+
+
+def alias_note(headers, url, payload=None):
+    resolved = headers.get("X-Board-Channel")
+    supplied = ((payload or {}).get("channel") or
+                (urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("channel") or [None])[0])
+    if resolved and supplied and supplied != resolved and (supplied, resolved) not in _alias_notes:
+        print("%s is an alias for %s; update your command" % (supplied, resolved), file=sys.stderr)
+        _alias_notes.add((supplied, resolved))
+
+
 def request(url, key, method="GET", payload=None, timeout=90):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -2097,9 +2170,11 @@ def request(url, key, method="GET", payload=None, timeout=90):
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            alias_note(resp.headers, url, payload)
             raw = resp.read().decode("utf-8", "replace")
             return resp.status, raw
     except urllib.error.HTTPError as exc:
+        alias_note(exc.headers, url, payload)
         return exc.code, exc.read().decode("utf-8", "replace")
     except urllib.error.URLError as exc:
         return 0, json.dumps({"error": str(exc.reason)})
@@ -2114,8 +2189,10 @@ def request_bytes(url, key, blob=None, ctype=None, method=None, timeout=600):
         req.add_header("Content-Type", ctype)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            alias_note(resp.headers, url)
             return resp.status, resp.read(), dict(resp.headers)
     except urllib.error.HTTPError as exc:
+        alias_note(exc.headers, url)
         return exc.code, exc.read(), dict(exc.headers)
     except urllib.error.URLError as exc:
         return 0, json.dumps({"error": str(exc.reason)}).encode(), {}
@@ -2253,8 +2330,12 @@ def cmd_channels(args):
         print("channels failed (%s): %s" % (status, raw), file=sys.stderr)
         return 1
     for row in json.loads(raw)["channels"]:
-        print("%s  %d  %s  %s" % (row["channel"], row["messages"],
-                                     idle_state(row["idle_days"]), ", ".join(row["identities"])))
+        # The slug is what every command takes, so it always comes first. The label is
+        # appended only when it says something the slug does not: `room (room)` is noise.
+        label = channel_label(row["channel"])
+        name = row["channel"] if label == row["channel"] else "%s (%s)" % (row["channel"], label)
+        print("%s  %d  %s  %s" % (name, row["messages"], idle_state(row["idle_days"]),
+                                  ", ".join(row["identities"])))
     return 0
 
 
@@ -2424,7 +2505,7 @@ def cmd_inbox(args):
                                 ("you are waiting on", data["asks_by_me"], "to")):
         for ask in asks:
             print("ask %d  #%d  [%s]  %.1fd %s  %s %s  %s: %s" % (
-                ask["id"], ask["msg_id"], ask["channel"], ask["age_days"], ask["ageing"],
+                ask["id"], ask["msg_id"], channel_label(ask["channel"]), ask["age_days"], ask["ageing"],
                 person, ask[person], label, " ".join(ask["text"].split())))
     oldest = max(a["age_days"] for a in data["asks"] + data["asks_by_me"])
     print("%d waiting on you, %d you are waiting on, oldest %dd" % (
@@ -2741,7 +2822,7 @@ def cmd_key(args):
             # Membership next to the identity, because that is the thing that
             # decides who can read a conversation and it was invisible before.
             print("%s  %s  %s  [%s]" % (entry["identity"], entry["label"], entry["created"],
-                                        ",".join(entry.get("channels") or ["will"])))
+                                        ",".join(entry.get("channels") or [DEFAULT_CHANNEL])))
         return 0
     if args.new:
         write_key(new_key(), data)
@@ -2753,7 +2834,108 @@ def cmd_key(args):
     return 0
 
 
+def rename_channel(directory, old, new, apply=False):
+    """Rename local storage, without starting/migrating a board or touching cursors.
+
+    SQLite owns the row/alias transaction. keys.json is staged and replaced
+    atomically before commit, with an exact backup restored if commit fails.
+    A process/OS crash between replacement and commit cannot be made atomic
+    across SQLite and a JSON file; callers should run this with writers idle.
+    """
+    channel_slug(old)
+    channel_slug(new)
+    if old == new:
+        raise ValueError("old and new channel must differ")
+    keys = Keys("", directory)
+    # Read-only mode also prevents a typo in BOARD_DATA creating a fresh board.
+    path = os.path.join(directory, "board.db")
+    uri = "file:" + urllib.parse.quote(os.path.abspath(path)) + "?mode=" + ("rw" if apply else "ro")
+    db = sqlite3.connect(uri, uri=True, timeout=15)
+    staged = backup = None
+    replaced = False
+    try:
+        db.execute("BEGIN IMMEDIATE" if apply else "BEGIN")
+        entries = keys.entries()
+        messages = db.execute("SELECT COUNT(*) FROM messages WHERE channel=?", (old,)).fetchone()[0]
+        acks = db.execute("SELECT COUNT(*) FROM acks WHERE channel=?", (old,)).fetchone()[0]
+        if db.execute("SELECT 1 FROM messages WHERE channel=? LIMIT 1", (new,)).fetchone():
+            raise ValueError("target channel '%s' already has messages" % new)
+        for slug in (old, new):
+            if db.execute("SELECT 1 FROM meta WHERE key=?", ("channel_alias:" + slug,)).fetchone():
+                raise ValueError("channel '%s' is already an alias" % slug)
+        changed = set()
+        for entry in entries:
+            channels = entry.get("channels", [DEFAULT_CHANNEL])
+            if old in channels:
+                entry["channels"] = list(dict.fromkeys(new if c == old else c for c in channels))
+                changed.add(entry["identity"])
+        if not messages and not acks and not changed and old != DEFAULT_CHANNEL:
+            raise ValueError("unknown channel '%s'" % old)
+        if apply:
+            if changed:
+                # Prepare both files before mutating the database or key ring.
+                with open(keys.path, "rb") as fh:
+                    original = fh.read()
+                with open(keys.path, encoding="utf-8") as fh:
+                    ring = json.load(fh)
+                ring["keys"] = entries
+                for content, is_backup in ((original, True),
+                        ((json.dumps(ring, indent=2) + "\n").encode("utf-8"), False)):
+                    fd, temporary = tempfile.mkstemp(prefix=".channel-rename-", dir=directory)
+                    if is_backup:
+                        backup = temporary
+                    else:
+                        staged = temporary
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(content)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+            db.execute("UPDATE messages SET channel=? WHERE channel=?", (new, old))
+            # An empty target may already have a receipt. Keep the strongest
+            # cursor and newest timestamp when its identity also has an old row.
+            db.execute("INSERT INTO acks (identity, channel, acked_id, updated_epoch) "
+                       "SELECT identity, ?, acked_id, updated_epoch FROM acks WHERE channel=? "
+                       "ON CONFLICT(identity, channel) DO UPDATE SET "
+                       "acked_id=MAX(acked_id, excluded.acked_id), "
+                       "updated_epoch=MAX(updated_epoch, excluded.updated_epoch)", (new, old))
+            db.execute("DELETE FROM acks WHERE channel=?", (old,))
+            db.execute("INSERT INTO meta(key, value) VALUES (?, ?)", ("channel_alias:" + old, new))
+            if staged:
+                os.replace(staged, keys.path)
+                replaced = True
+            db.commit()
+        return {"messages": messages, "acks": acks, "identities": len(changed)}
+    except BaseException:
+        db.rollback()
+        if replaced:
+            os.replace(backup, keys.path)
+        raise
+    finally:
+        db.close()
+        for temporary in (staged, backup):
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def cmd_channel_rename(args):
+    directory = os.path.expanduser(args.data or data_dir())
+    try:
+        counts = rename_channel(directory, args.old, args.new, args.apply)
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        print("channel rename failed: %s" % exc, file=sys.stderr)
+        return 1
+    print("%s %s → %s: %d messages, %d acks, %d identities; alias %s → %s" % (
+        "changed" if args.apply else "would change", args.old, args.new,
+        counts["messages"], counts["acks"], counts["identities"], args.old, args.new))
+    print("external files: operator must rewrite channel keys in "
+          "~/.hermes/data/agent-board/watcher.cursor.json, "
+          "~/.hermes/data/agent-board/acked.cursor.json, "
+          "~/.hermes/data/agent-board/triage.cursor.json")
+    return 0
+
+
 def main(argv=None):
+    _alias_notes.clear()
     parser = argparse.ArgumentParser(prog="board.py", description="tiny shared message board for agents")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -2967,6 +3149,15 @@ def main(argv=None):
     p.add_argument("--url", default=None)
     p.add_argument("--key", default=None)
     p.set_defaults(func=cmd_channels)
+
+    p = sub.add_parser("channel", help="manage local channels")
+    actions = p.add_subparsers(dest="channel_action", required=True)
+    p = actions.add_parser("rename", help="rename a channel (dry run by default)")
+    p.add_argument("old", type=channel_slug)
+    p.add_argument("new", type=channel_slug)
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--data", default=None)
+    p.set_defaults(func=cmd_channel_rename)
 
     for command in ("post", "amend", "say", "inbox", "read", "search", "digest", "threads", "open", "watch", "delivery", "ask", "answer"):
         sub.choices[command].add_argument("--channel", type=channel_slug, default=None)

@@ -46,6 +46,7 @@ const ID = 'board'
 const STATE_KEY = [ID, 'state']
 const POLL_MS = 15_000
 const SELECTED_LS = 'board.selectedChannel'
+const TOPIC_LS = 'board.topic'
 const SEEN_LS = 'board.lastSeen'
 
 /** Long agent messages collapse; 400 characters is about four lines in this pane. */
@@ -57,6 +58,18 @@ const VOICES = {
   'will-hermes': 'Zeta',
   legacy: 'shared key'
 }
+
+/**
+ * Channel slugs read badly on their own: `elio-zeta` is a direct channel between two
+ * agents and should say so. The slug stays what the CLI takes; this is the label the
+ * human sees, and an unknown channel falls back to its slug.
+ */
+const CHANNELS = {
+  'elio-zeta': 'Elio ↔ Zeta',
+  house: 'house · everyone'
+}
+
+const channelLabel = slug => CHANNELS[slug] || slug
 
 /** Bound in register() — components reach the backend through this. */
 let pluginCtx = null
@@ -82,6 +95,8 @@ function writeLS(key, value) {
 
 const selectedChannel = () => readLS(SELECTED_LS, null)
 const setSelectedChannel = channel => writeLS(SELECTED_LS, channel)
+const activeTopic = () => readLS(TOPIC_LS, null)
+const setActiveTopic = topic => writeLS(TOPIC_LS, topic)
 const seenMap = () => readLS(SEEN_LS, {})
 
 function markSeen(channels) {
@@ -159,9 +174,12 @@ function ChannelRow({ channel, active, unread, delivery, onSelect }) {
       active ? 'bg-(--ui-fill-secondary) text-(--ui-text-primary)' : 'text-(--ui-text-tertiary)',
       'hover:bg-(--ui-fill-secondary)'
     ),
-    title: channel.identities ? channel.identities.join(', ') : '',
+    title: channel.identities ? `${channel.channel} · ${channel.identities.join(', ')}` : channel.channel,
     children: [
-      jsx('span', { className: 'min-w-0 flex-1 truncate font-medium', children: channel.channel }),
+      jsx('span', {
+        className: 'min-w-0 flex-1 truncate font-medium',
+        children: channelLabel(channel.channel)
+      }),
       unread ? jsx(Badge, { children: 'new' }) : null,
       jsx('span', {
         className: cn('shrink-0 tabular-nums', word === 'stale' && 'text-(--ui-text-quaternary)'),
@@ -244,6 +262,35 @@ function Message({ msg, expanded, onToggle, onFile, showNewMarker }) {
   })
 }
 
+/** One row of topic chips: the topics in this channel, by count, with an "all" escape. */
+function TopicStrip({ topics, active, onPick }) {
+  if (!topics || !topics.length) return null
+  const total = topics.reduce((sum, entry) => sum + (entry.messages || 0), 0)
+  const chip = (key, label, count, selected) =>
+    jsxs(
+      'button',
+      {
+        type: 'button',
+        onClick: () => onPick(key),
+        className: cn(
+          'shrink-0 rounded-full border px-2 py-0.5 text-[0.625rem]',
+          selected
+            ? 'border-(--ui-accent) text-(--ui-accent)'
+            : 'border-(--ui-stroke-secondary) text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)'
+        ),
+        children: [label, jsx('span', { className: 'ml-1 tabular-nums opacity-70', children: count })]
+      },
+      key || 'all'
+    )
+  return jsx('div', {
+    className: 'flex shrink-0 items-center gap-1 overflow-x-auto border-t border-(--ui-stroke-secondary) px-2 py-1',
+    children: [
+      chip(null, 'all', total, active === null),
+      ...topics.map(entry => chip(entry.topic, `#${entry.topic}`, entry.messages, active === entry.topic))
+    ]
+  })
+}
+
 function InboxStrip({ inbox }) {
   const asks = (inbox && inbox.asks) || []
   if (!asks.length) return null
@@ -292,7 +339,7 @@ function InboxStrip({ inbox }) {
   })
 }
 
-function Composer({ channel }) {
+function Composer({ channel, topic }) {
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -303,8 +350,12 @@ function Composer({ channel }) {
     setBusy(true)
     setError('')
     haptic('tap')
+    const payload = { text: body, channel, via: 'human' }
+    // Posting while a topic is selected tags the message with it: the filter is then
+    // also the destination, rather than a view that silently applies to nothing.
+    if (topic) payload.topic = topic
     pluginCtx
-      .rest('/post', { method: 'POST', body: { text: body, channel, via: 'human' } })
+      .rest('/post', { method: 'POST', body: payload })
       .then(result => {
         if (!result || result.ok === false) {
           setError((result && result.error) || 'post failed')
@@ -323,7 +374,9 @@ function Composer({ channel }) {
       jsx('textarea', {
         value: text,
         rows: 2,
-        placeholder: channel ? `type as yourself into ${channel}` : 'no channel',
+        placeholder: channel
+          ? `type as yourself into ${channelLabel(channel)}${topic ? ` · #${topic}` : ''}`
+          : 'no channel',
         disabled: !channel,
         onChange: event => setText(event.target.value),
         onKeyDown: event => {
@@ -361,7 +414,11 @@ function useBoardState() {
     queryKey: STATE_KEY,
     queryFn: () => {
       const channel = selectedChannel()
-      return pluginCtx.rest('/state' + (channel ? `?channel=${encodeURIComponent(channel)}` : ''))
+      const topic = activeTopic()
+      const params = []
+      if (channel) params.push(`channel=${encodeURIComponent(channel)}`)
+      if (topic) params.push(`topic=${encodeURIComponent(topic)}`)
+      return pluginCtx.rest('/state' + (params.length ? `?${params.join('&')}` : ''))
     },
     refetchInterval: POLL_MS
   })
@@ -447,6 +504,7 @@ function BoardBody({ compact }) {
               onSelect: () => {
                 haptic('tap')
                 setSelectedChannel(channel.channel)
+                setActiveTopic(null)     // topics belong to a channel; do not carry one over
                 markSeen([channel])
                 void queryClient.invalidateQueries({ queryKey: STATE_KEY })
               }
@@ -456,6 +514,15 @@ function BoardBody({ compact }) {
         )
       }),
       jsx(InboxStrip, { inbox: data.inbox }),
+      jsx(TopicStrip, {
+        topics: data.topics,
+        active: data.topic || null,
+        onPick: key => {
+          haptic('tap')
+          setActiveTopic(key)
+          void queryClient.invalidateQueries({ queryKey: STATE_KEY })
+        }
+      }),
       jsxs('div', {
         className: 'flex shrink-0 items-center gap-1 border-t border-(--ui-stroke-secondary) px-2 py-1',
         children: [
@@ -566,7 +633,7 @@ function BoardBody({ compact }) {
             ]
           })
         : null,
-      jsx(Composer, { channel: active })
+      jsx(Composer, { channel: active, topic: data.topic || null })
     ]
   })
 }
