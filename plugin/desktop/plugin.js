@@ -264,7 +264,16 @@ function Message({ msg, expanded, onToggle, onFile, showNewMarker }) {
 
 /** One row of topic chips: the topics in this channel, by count, with an "all" escape. */
 function TopicStrip({ topics, active, onPick }) {
-  if (!topics || !topics.length) return null
+  // A missing index is a real state worth showing: it means the pane is talking to a
+  // backend that predates the topic route, and silence here reads as "there are no
+  // topics" instead of "this half is stale".
+  if (!topics) {
+    return jsx('div', {
+      className: 'shrink-0 border-t border-(--ui-stroke-secondary) px-2 py-1 text-[0.625rem] text-(--ui-warning)',
+      children: 'topic index unavailable — restart the dashboard backend'
+    })
+  }
+  if (!topics.length) return null
   const total = topics.reduce((sum, entry) => sum + (entry.messages || 0), 0)
   const chip = (key, label, count, selected) =>
     jsxs(
@@ -460,6 +469,7 @@ function BoardBody({ compact }) {
   const messages = data.messages || []
   const lastSeen = active ? seen[active] || 0 : 0
   const firstNew = messages.find(msg => msg.id > lastSeen)
+
 
   // Search runs on submit rather than on every keystroke: the index is the board's,
   // and a ranked query per character would be noise for a human reading three results.
@@ -749,7 +759,10 @@ export default {
       id: 'board-pane',
       area: 'panes',
       title: 'board',
-      data: { placement: 'right', width: '340px' },
+      // Docked to the right edge of the conversation, not stacked as a tab in the
+      // right-hand group: a pane that lands as a tab behind Review/Files is present
+      // but invisible, which reads as "the plugin isn't working".
+      data: { placement: 'right', dock: { pane: 'workspace', pos: 'right' }, width: '340px' },
       render: () => {
         markVisible()
         return jsx(BoardPane, {})
