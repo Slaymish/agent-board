@@ -263,17 +263,8 @@ function Message({ msg, expanded, onToggle, onFile, showNewMarker }) {
 }
 
 /** One row of topic chips: the topics in this channel, by count, with an "all" escape. */
-function TopicStrip({ topics, active, onPick }) {
-  // A missing index is a real state worth showing: it means the pane is talking to a
-  // backend that predates the topic route, and silence here reads as "there are no
-  // topics" instead of "this half is stale".
-  if (!topics) {
-    return jsx('div', {
-      className: 'shrink-0 border-t border-(--ui-stroke-secondary) px-2 py-1 text-[0.625rem] text-(--ui-warning)',
-      children: 'topic index unavailable — restart the dashboard backend'
-    })
-  }
-  if (!topics.length) return null
+function TopicStrip({ topics, active, onPick, partial }) {
+  if (!topics || !topics.length) return null
   const total = topics.reduce((sum, entry) => sum + (entry.messages || 0), 0)
   const chip = (key, label, count, selected) =>
     jsxs(
@@ -295,7 +286,16 @@ function TopicStrip({ topics, active, onPick }) {
     className: 'flex shrink-0 items-center gap-1 overflow-x-auto border-t border-(--ui-stroke-secondary) px-2 py-1',
     children: [
       chip(null, 'all', total, active === null),
-      ...topics.map(entry => chip(entry.topic, `#${entry.topic}`, entry.messages, active === entry.topic))
+      ...topics.map(entry => chip(entry.topic, `#${entry.topic}`, entry.messages, active === entry.topic)),
+      // Counts taken from the loaded window rather than the board's index: say so, so a
+      // small number is not read as "this topic has three messages".
+      partial
+        ? jsx('span', {
+            className: 'shrink-0 pl-1 text-[0.625rem] text-(--ui-text-quaternary)',
+            title: 'the board topic index was unavailable; these counts cover the loaded messages only',
+            children: 'loaded'
+          })
+        : null
     ]
   })
 }
@@ -470,6 +470,23 @@ function BoardBody({ compact }) {
   const lastSeen = active ? seen[active] || 0 : 0
   const firstNew = messages.find(msg => msg.id > lastSeen)
 
+  // The board's topic index is the accurate count. When the half serving /state predates
+  // it, fall back to what is loaded rather than showing nothing: a partial index beats a
+  // pane that looks broken, as long as it says it is partial.
+  const indexAvailable = Array.isArray(data.topics)
+  const topics = indexAvailable
+    ? data.topics
+    : (() => {
+        const counts = new Map()
+        for (const msg of messages) {
+          if (!msg.topic) continue
+          counts.set(msg.topic, (counts.get(msg.topic) || 0) + 1)
+        }
+        return [...counts.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([topic, count]) => ({ topic, messages: count }))
+      })()
+
 
   // Search runs on submit rather than on every keystroke: the index is the board's,
   // and a ranked query per character would be noise for a human reading three results.
@@ -525,8 +542,9 @@ function BoardBody({ compact }) {
       }),
       jsx(InboxStrip, { inbox: data.inbox }),
       jsx(TopicStrip, {
-        topics: data.topics,
+        topics,
         active: data.topic || null,
+        partial: !indexAvailable,
         onPick: key => {
           haptic('tap')
           setActiveTopic(key)
