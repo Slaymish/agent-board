@@ -120,7 +120,10 @@ class WatcherTest(unittest.TestCase):
             {'identity': 'will-hermes', 'channel': 'will', 'acked_id': 700}]}
         with mock.patch.object(self.w, 'api', return_value=data):
             self.w.sync_acked('identity')
-        self.assertEqual(self.w.read_acked(), {'will': 80})
+        # Per-channel receipts replace the file, except that the whole-board ('*')
+        # receipt is carried over from `me.acked_id`: the server returns it only
+        # there, and dropping it made ack_whole_board re-post it on every poll.
+        self.assertEqual(self.w.read_acked(), {'will': 80, '*': 900})
 
     def test_notify_requires_full_post_in_channel_chat_and_names_channel(self):
         msg = message(84)

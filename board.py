@@ -78,7 +78,7 @@ IDLE_TIMEOUT = float(os.environ.get("BOARD_IDLE_TIMEOUT") or 75)
 # server that degrades for everyone.
 MAX_CONCURRENT = int(os.environ.get("BOARD_MAX_CONCURRENT") or 32)
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 # Served inline; anything else is forced to a download so this board can never
 # be used to host markup that a browser would execute in the site's origin.
@@ -650,6 +650,36 @@ class Board:
             result["channel"] = channel
         return result
 
+    @staticmethod
+    def _whole_board_ack(db, identity):
+        """The newest id every room has cleared, and where that floor comes from.
+
+        A room's cleared id is ``max(whole-board ack, that room's own ack)`` —
+        a whole-board receipt covers every room up to its id, and a room receipt
+        covers only that room. The board-wide answer is the SMALLEST cleared id
+        across the rooms this identity holds a receipt for: min, not max, or one
+        busy room would hide another room's backlog.
+
+        Without this the whole-board row keeps reporting the pre-channel ack and
+        `board.py delivery --state` says `behind` forever, long after every room
+        cleared — which is exactly the signal `system-watch.sh` gates on.
+        """
+        receipts = db.execute("SELECT channel, acked_id, updated_epoch FROM acks "
+                              "WHERE identity = ?", (identity,)).fetchall()
+        legacy = next((r for r in receipts if r["channel"] == "*"), None)
+        rooms = [r for r in receipts if r["channel"] != "*"]
+        if not rooms:
+            return legacy, "whole-board" if legacy else None
+        base = legacy["acked_id"] if legacy else 0
+        cleared = [max(base, r["acked_id"]) for r in rooms]
+        floor = min(cleared)
+        # The timestamp of whichever receipt actually set the floor, so the pane
+        # can say when this side last delivered rather than when it last acked.
+        achiever = next((r for r in rooms if max(base, r["acked_id"]) == floor), rooms[0])
+        ts = legacy["updated_epoch"] if legacy and base >= achiever["acked_id"] \
+            else achiever["updated_epoch"]
+        return {"acked_id": floor, "updated_epoch": ts}, "channel"
+
     def delivery(self, identities, me=None, peer=None, memberships=None, channels=None):
         grace = max(0, float(os.environ.get("BOARD_ACK_GRACE") or 600))
         states, breakdown = [], []
@@ -672,6 +702,9 @@ class Board:
                         "SELECT * FROM acks WHERE identity = ? AND channel = '*'",
                         (identity,)).fetchone()
                     source = ack or fallback
+                    source_label = "channel" if ack else "whole-board" if fallback else None
+                    if channel == "*":
+                        source, source_label = self._whole_board_ack(db, identity)
                     acked = source["acked_id"] if source else 0
                     latest = db.execute("SELECT MAX(id) FROM messages WHERE author != ? AND " + clause,
                                         [identity] + args).fetchone()[0] or 0
@@ -683,7 +716,7 @@ class Board:
                     state = "unknown" if source is None else "behind" if stats[0] and age > grace else "ok"
                     row = {"identity": identity, "acked_id": acked if source else None,
                            "acked_ts": now_iso(source["updated_epoch"]) if source else None,
-                           "ack_source": "channel" if ack else "whole-board" if fallback else None,
+                           "ack_source": source_label,
                            "latest_from_peer": latest, "pending": [r["id"] for r in pending],
                            "pending_count": stats[0], "age_seconds": age, "state": state}
                     if channel == "*":
