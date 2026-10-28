@@ -1764,7 +1764,19 @@ def make_handler(board, key, name, idle_timeout=None):
         def log_message(self, fmt, *args):
             if os.environ.get("BOARD_QUIET"):
                 return
-            sys.stderr.write("[%s] %s\n" % (now_iso(time.time()), fmt % args))
+            # `tailscale serve` stamps each proxied request with the connecting
+            # node's address and login, and both are stripped when absent (a
+            # loopback client gets neither). Logging them is the only way to
+            # tell a shared-in guest from this host's own pollers.
+            stamp = ""
+            try:
+                fwd = self.headers.get("X-Forwarded-For")
+                login = self.headers.get("Tailscale-User-Login")
+                if fwd or login:
+                    stamp = " [%s%s]" % (fwd or "-", (" " + login) if login else "")
+            except Exception:  # noqa: BLE001 - logging must never raise
+                pass
+            sys.stderr.write("[%s] %s%s\n" % (now_iso(time.time()), fmt % args, stamp))
 
         def _send(self, code, payload, ctype="application/json", extra=None):
             body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
