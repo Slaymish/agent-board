@@ -34,6 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -433,10 +434,25 @@ class Board:
                 self._chunks_missing(db)
         return self.count()
 
+    @contextmanager
     def _db(self):
+        """A connection scoped to the block.
+
+        `with sqlite3.connect(...) as db:` is a *transaction* context: it
+        commits and rolls back but never closes, so every call left a handle
+        for the garbage collector and Python 3.14 reports those as
+        `ResourceWarning: unclosed database` on stderr. The CLI tests assert
+        stderr is clean, and they are right to: a writer holding thousands of
+        open handles is a leak, not a detail. This keeps the transaction
+        semantics and closes the connection on the way out.
+        """
         db = sqlite3.connect(self.db_path, timeout=15)
         db.row_factory = sqlite3.Row
-        return db
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
     @staticmethod
     def _file_row(row):

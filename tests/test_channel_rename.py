@@ -69,7 +69,7 @@ class ChannelRenameTest(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def snapshot(self):
-        with contextlib.closing(self.store._db()) as db:
+        with self.store._db() as db:
             tables = {name: db.execute("SELECT * FROM " + name + " ORDER BY 1, 2").fetchall()
                       for name in ("messages", "acks", "meta")}
             tables = {name: [tuple(row) for row in rows] for name, rows in tables.items()}
@@ -123,7 +123,7 @@ class ChannelRenameTest(unittest.TestCase):
         self.assertEqual(list(self.directory.glob(".channel-rename-*")), [])
 
     def test_database_failure_leaves_keys_and_rows_unchanged(self):
-        with contextlib.closing(self.store._db()) as db, db:
+        with self.store._db() as db:
             db.execute("CREATE TRIGGER fail_alias BEFORE INSERT ON meta "
                        "WHEN new.key LIKE 'channel_alias:%' BEGIN SELECT RAISE(ABORT, 'test alias failure'); END")
         before = self.snapshot()
@@ -158,7 +158,7 @@ class ChannelRenameTest(unittest.TestCase):
     def test_empty_target_receipt_collision_keeps_strongest_cursor(self):
         self.store.ack("zeta", 9, "elio-zeta")
         self.apply()
-        with contextlib.closing(self.store._db()) as db:
+        with self.store._db() as db:
             self.assertEqual(db.execute("SELECT acked_id FROM acks WHERE identity='zeta' "
                                         "AND channel='elio-zeta'").fetchone()[0], 9)
 
@@ -208,7 +208,7 @@ class ChannelRenameTest(unittest.TestCase):
 
     def test_missing_target_alias_is_inert_including_ack_legacy_routing(self):
         self.start_server()
-        with contextlib.closing(self.store._db()) as db, db:
+        with self.store._db() as db:
             db.execute("INSERT INTO meta VALUES ('channel_alias:retired', 'missing')")
         self.assertEqual(self.call("GET", "/api/messages?channel=retired", key=self.owner),
                          self.call("GET", "/api/messages?channel=missing", key=self.owner))
@@ -217,7 +217,7 @@ class ChannelRenameTest(unittest.TestCase):
         status, receipt = self.call("POST", "/api/ack", payload={"id": 2, "channel": "retired"})
         self.assertEqual(status, 200)
         self.assertNotIn("channel", receipt)  # Same as an unknown legacy notification route.
-        with contextlib.closing(self.store._db()) as db:
+        with self.store._db() as db:
             self.assertFalse(db.execute("SELECT 1 FROM messages WHERE channel='missing'").fetchone())
 
     def test_cli_alias_note_once_and_display_labels_only_for_humans(self):
