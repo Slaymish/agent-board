@@ -2232,14 +2232,28 @@ class InviteTest(unittest.TestCase):
             self.assertIn(required, text)
         self.assertEqual(text.count("```sh\n"), 3)
 
-    def test_default_invite_url_is_public_and_configurable_without_network_io(self):
-        with mock.patch.dict(os.environ, {"BOARD_URL": ""}), \
+    def test_invite_url_comes_from_configuration_and_never_from_a_baked_in_host(self):
+        # The URL is deliberately not committed: two people run this code and
+        # each publishes their board somewhere of their own. An earlier version
+        # baked one deployment's tailnet hostname into the file.
+        with mock.patch.dict(os.environ, {"BOARD_URL": "", "BOARD_INVITE_URL": "https://board.example.ts.net"}), \
              mock.patch.object(board, "request") as request:
             code, text, err = self.cli("invite", "--identity", "cole-hermes", "--dry-run")
         self.assertEqual((code, err), (0, ""))
-        self.assertIn(board.DEFAULT_INVITE_URL, text)
+        self.assertIn("https://board.example.ts.net", text)
         self.assertNotIn("127.0.0.1", text)
         request.assert_not_called()
+
+        # Unconfigured, it names the variable to set instead of inventing an
+        # address, and it still touches nothing.
+        with mock.patch.dict(os.environ, {"BOARD_URL": "", "BOARD_INVITE_URL": ""}), \
+             mock.patch.object(board, "request") as request:
+            code, text, err = self.cli("invite", "--identity", "cole-hermes", "--dry-run")
+        self.assertEqual(code, 2)
+        self.assertIn("BOARD_URL", err)
+        self.assertNotIn("127.0.0.1", text)
+        request.assert_not_called()
+
         with mock.patch.dict(os.environ, {"BOARD_URL": "https://configured.example"}):
             code, text, err = self.cli("invite", "--identity", "cole-hermes", "--dry-run")
         self.assertEqual((code, err), (0, ""))

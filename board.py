@@ -43,9 +43,10 @@ CHANNEL_LABELS = {"elio-zeta": "Elio ↔ Zeta"}
 
 DEFAULT_PORT = 8790
 DEFAULT_DATA = os.path.expanduser("~/.hermes/data/agent-board")
-# Invitations need the peer-facing address, rather than the client's loopback
-# default. --url and BOARD_URL still override this deployment's public URL.
-DEFAULT_INVITE_URL = "https://hamishs-macbook-pro.taildb558.ts.net"
+# No deployment URL is baked in. Two people run this code and each publishes
+# their board somewhere of their own, so an invitation names whatever --url,
+# BOARD_URL or BOARD_INVITE_URL says at the time it is written.
+DEFAULT_INVITE_URL = ""
 MAX_TEXT = 4000
 BODY_WARN = 1200
 CHUNK_SIZE = 1200
@@ -2464,8 +2465,27 @@ post into a git-tracked file. Deliver this invite privately to {label}.
            post_url=post_url, payload=payload, cli_url=shlex.quote(base), key=key)
 
 
+def invite_base(args):
+    """The peer-facing address an invitation names, or None when unconfigured.
+
+    Read at call time rather than import time so a shell can set BOARD_URL (or
+    BOARD_INVITE_URL) per command, which is what the two people sharing this
+    code need: neither of them has a URL that would be right for the other.
+    """
+    return (getattr(args, "url", None) or os.environ.get("BOARD_URL") or
+            os.environ.get("BOARD_INVITE_URL") or DEFAULT_INVITE_URL or None)
+
+
 def cmd_invite(args):
     data = os.path.expanduser(args.data or data_dir())
+    base = invite_base(args)
+    if not base:
+        print("an invitation must name the address the friend will reach:\n"
+              "  set BOARD_URL (or BOARD_INVITE_URL), or pass --url "
+              "(e.g. https://board.example.ts.net)",
+              file=sys.stderr)
+        return 2
+    args.url = base
     keys = Keys("", data)
     try:
         channels = keys.validate_add(args.identity, args.channel)
@@ -3190,8 +3210,8 @@ def main(argv=None):
                    help="channel membership (repeatable; default house); '*' grants owner access")
     p.add_argument("--dry-run", action="store_true", help="print wording with <KEY>; create nothing")
     p.add_argument("--data", default=None)
-    p.add_argument("--url", default=os.environ.get("BOARD_URL") or DEFAULT_INVITE_URL,
-                   help="board URL for the invite and upload (default BOARD_URL or %s)" % DEFAULT_INVITE_URL)
+    p.add_argument("--url", default=os.environ.get("BOARD_URL") or DEFAULT_INVITE_URL or None,
+                   help="board URL for the invite and upload (default BOARD_URL or BOARD_INVITE_URL)")
     p.add_argument("--key", default=None, help="operator key used for the file upload")
     p.set_defaults(func=cmd_invite)
 
