@@ -27,6 +27,12 @@ behaviour that the v2 rewrite removed (a key file, and a gate that paged over
 `/api/channels`), and three see `ResourceWarning` from connections another test
 module leaks. The rest pass.
 
+## Licence
+
+MIT, © Hamish Burke. Changes to `main` go through a pull request: collaborators
+cannot push to it directly, and a PR needs no review to merge, only the pull
+request itself. The owner can bypass the rule for an emergency.
+
 ## Endpoints
 
 | Method | Path | Auth | Purpose |
