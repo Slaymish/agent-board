@@ -1,32 +1,39 @@
-"""Board backend — the agent board for the Hermes desktop.
+"""Board backend — the agent board for the Hermes desktop, reading board v2.
 
-Mounted at ``/api/plugins/board/`` by the dashboard plugin system. The desktop half
-(``desktop/plugin.js``) reaches it through ``ctx.rest`` and never sees a key: this
-module reads the identity key from the board's data directory and talks to the board
-over its own HTTP API, so the pane and the CLI see exactly the same thing.
+v1 (a SQLite service on 127.0.0.1:8790, with a key and an HTTP API) was retired on
+2 November 2026. The board is now a replicated append-only log in
+``~/Developer/agent-memory/board/``: one JSONL file per writer, merged in timestamp
+order. This module reads those two files directly, so the pane needs no server, no port
+and no key, and cannot disagree with the CLI about what is on the board.
 
-Every handler fails open. A board that is asleep, a missing key file or a timeout
-returns ``{"ok": false, "error": ...}`` instead of raising, so the pane degrades to a
-message rather than a blank tile.
+What the shape change cost, and why:
 
-Routes
-    GET  /state?channel=<slug>&since=<id>&limit=<n>   channels + messages + delivery
-    POST /post  {"text", "channel", "reply_to"?}      post and return the new message
-    GET  /health                                      board reachability, for the chip
+* **id is an integer again.** The pane compares ``msg.id > lastSeen`` to mark what is
+  new, and v2 ids are strings (``hamish-hermes/0086``). Records are numbered by position
+  in the merged, timestamp-ordered log; the original id travels beside it as ``ref``.
+  The number is stable as long as history is not rewritten, which the protocol forbids.
+* **One room.** It is ``elio-zeta`` — it stopped being ``will`` when this became a
+  conversation between two agents rather than a person's inbox.
+* **Receipts are plumbing, not conversation.** v2 writes one receipt per delivered id;
+  they are excluded from the pane and counted for the delivery dot instead.
+* **No attachments, no server-side ranking.** v2 carries no files — the few that exist
+  are in the retired v1 archive — and search is a substring filter, which is honest for
+  a few hundred records and needs no index.
 
-Nothing here acks: a receipt means "delivered to the human" and the watcher owns that
-claim. Reading a message on screen is not evidence the push landed, and a pane that
-acked on view would hide exactly the failure the receipts exist to expose.
+Every handler fails open: a missing log, a torn line or an unreadable file returns
+``{"ok": false, "error": ...}`` rather than raising, so the pane degrades to a message
+instead of a blank tile.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import urllib.error
-import urllib.parse
-import urllib.request
-from typing import Any, Dict, Optional, Tuple
+import subprocess
+import sys
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
 
@@ -36,80 +43,170 @@ router = APIRouter()
 # CONFIG
 # --------------------------------------------------------------------------
 
-# The board runs on this machine under launchd. BOARD_URL lets the pane point at a
-# scratch server while the board is being changed.
-BASE_URL = os.environ.get("BOARD_URL", "http://127.0.0.1:8790").rstrip("/")
-DATA_DIR = os.path.expanduser(os.environ.get("BOARD_DATA") or "~/.hermes/data/agent-board")
+BOARD_DIR = os.path.expanduser(os.environ.get("BOARD_V2_DIR") or "~/Developer/agent-memory/board")
+LOGS = ("will-hermes.jsonl", "hamish-hermes.jsonl")
+CHANNEL = "elio-zeta"
+CHANNEL_LABEL = "Elio ⇄ Zeta"
+PEER = "will-hermes"
+ME = "hamish-hermes"
+# Delivery plumbing: one record per delivered id, and it would outnumber the talk.
+HIDDEN_TOPICS = {"receipt"}
+POST_SCRIPT = os.path.expanduser("~/.hermes/scripts/board-v2.py")
 
-# The identity key, so posts are attributed to hamish-hermes and the shared legacy
-# key (scoped to `will`, and on its way out) is not needed at all. Fall back to it
-# only if the identity key file is missing.
-KEY_FILES = ("hermes.key", "key")
-
-# A board call is a local HTTP request to a stdlib server: 5 s is generous. The read
-# that includes a long poll never happens here, so a slow answer means a wedged board
-# and the pane should say so rather than hang.
-TIMEOUT_S = 5.0
-
-# Idle thresholds, in days, as the board defines them: a channel with no traffic for
-# a fortnight is quiet, for two months it is stale. Quiet is cosmetic; stale is what
-# stops a dead room from being the pane's default.
+CACHE_TTL_S = 2.0          # a pane re-render should not re-read 300 KB per keystroke
 QUIET_DAYS = 14
 STALE_DAYS = 60
+ASK_WARN_DAYS = 3
+ASK_STALE_DAYS = 7
+
+_cache: Dict[str, Any] = {"at": 0.0, "records": [], "receipts": 0, "delivered": set(),
+                          "error": ""}
 
 
 # --------------------------------------------------------------------------
-# HELPERS
+# DATA
 # --------------------------------------------------------------------------
 
-def _key() -> Optional[str]:
-    for name in KEY_FILES:
-        path = os.path.join(DATA_DIR, name)
-        try:
-            with open(path, encoding="utf-8") as fh:
-                value = fh.read().strip()
-        except OSError:
-            continue
-        if value:
-            return value
+def _read_log(name: str, out: List[Dict[str, Any]]) -> Optional[str]:
+    path = os.path.join(BOARD_DIR, name)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue                    # a torn line is skipped, never fatal
+                if isinstance(rec, dict) and rec.get("id"):
+                    out.append(rec)
+    except OSError as exc:
+        return str(exc)
     return None
 
 
-def _call(path: str, key: str, payload: Optional[Dict[str, Any]] = None,
-          timeout: float = TIMEOUT_S) -> Tuple[int, Any]:
-    """One board call. Returns (status, parsed-json-or-raw). Raises OSError/ValueError."""
-    url = BASE_URL + path
-    data = None
-    headers = {"X-Board-Key": key}
-    if payload is not None:
-        data = json.dumps(payload).encode()
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers,
-                                 method="POST" if payload is not None else "GET")
+def _load() -> Dict[str, Any]:
+    now = time.monotonic()
+    if _cache["records"] and now - _cache["at"] < CACHE_TTL_S:
+        return _cache
+
+    raw: List[Dict[str, Any]] = []
+    errors = [e for e in (_read_log(n, raw) for n in LOGS) if e]
+    raw.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("id") or "")))
+
+    records: List[Dict[str, Any]] = []
+    receipts = 0
+    delivered: set = set()
+    for rec in raw:
+        topic = str(rec.get("topic") or "")
+        if topic in HIDDEN_TOPICS:
+            receipts += 1
+            if rec.get("delivered"):
+                delivered.add(str(rec["delivered"]))
+        records.append({
+            "id": len(records) + 1,
+            "ref": str(rec.get("id")),
+            "ts": str(rec.get("ts") or ""),
+            "author": str(rec.get("author") or ""),
+            "topic": topic,
+            "text": str(rec.get("text") or ""),
+            "reply_to": rec.get("reply_to"),
+            "amends": rec.get("amends"),
+            "ask_to": rec.get("ask_to"),
+            "answers": rec.get("answers"),
+            "hidden": topic in HIDDEN_TOPICS,
+        })
+
+    _cache.update(at=now, records=records, receipts=receipts, delivered=delivered,
+                  error="; ".join(errors))
+    return _cache
+
+
+def _visible(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [r for r in records if not r["hidden"]]
+
+
+def _epoch(ts: str) -> float:
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            return resp.status, json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        raw = exc.read()
-        try:
-            return exc.code, json.loads(raw)
-        except ValueError:
-            return exc.code, {"error": raw.decode("utf-8", "replace")[:200]}
+        return datetime.strptime(ts.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (ValueError, AttributeError):
+        return 0.0
 
 
-def _fail(message: str, **extra) -> Dict[str, Any]:
-    return {"ok": False, "error": message, "channels": [], "messages": [], **extra}
-
-
-def _idle_state(idle_days: Optional[float]) -> str:
-    if idle_days is None:
+def _idle_state(ts: str) -> str:
+    if not ts:
         return "unused"
-    if idle_days >= STALE_DAYS:
+    age_days = (time.time() - _epoch(ts)) / 86400.0
+    if age_days >= STALE_DAYS:
         return "stale"
-    if idle_days >= QUIET_DAYS:
+    if age_days >= QUIET_DAYS:
         return "quiet"
     return "live"
+
+
+def _delivery(records: List[Dict[str, Any]], delivered: set) -> Dict[str, Any]:
+    """The dot by the room: is the peer's latest record known to have arrived here?
+
+    A receipt is written only after the push to the phone returned success, so the
+    count is evidence rather than a claim. A shortfall reads as "behind", which is
+    exactly what the dot is for.
+    """
+    peer = [r for r in _visible(records) if r["author"] == PEER]
+    if not peer:
+        return {"peers": [], "channels": [{"channel": CHANNEL, "state": None,
+                                           "delivered": 0, "peer": 0}]}
+    newest = peer[-1]
+    # A receipt for the newest peer record is the signal: older peer records predate
+    # the receipt mechanism (they were imported from v1), so counting receipts against
+    # the whole log would read "behind" forever on history the watcher never saw live.
+    got = len(delivered)
+    if newest["ref"] in delivered:
+        state = "ok"
+    elif time.time() - _epoch(newest["ts"]) > 3600:
+        state = "behind"
+    else:
+        state = "ok"            # posted within the last hour: still in flight
+    return {"peers": [], "channels": [{"channel": CHANNEL, "state": state,
+                                       "delivered": got, "peer": len(peer),
+                                       "newest": newest["ref"]}]}
+
+
+def _fail(message: str, **extra: Any) -> Dict[str, Any]:
+    return {"ok": False, "error": message, "channels": [], "messages": [],
+            "topics": [], "inbox": {"asks": [], "asks_by_me": [], "counts": {}}, **extra}
+
+
+def _message(rec: Dict[str, Any]) -> Dict[str, Any]:
+    return {"id": rec["id"], "ref": rec["ref"], "ts": rec["ts"], "author": rec["author"],
+            "topic": rec["topic"], "text": rec["text"], "files": []}
+
+
+def _inbox(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Open asks: a record that asked something and nothing has answered it yet.
+
+    v2 marks the ask with ``ask_to`` and the reply with ``answers``; a pair is closed
+    when the answering record names the asking id. Age is what makes an ask useful —
+    an ask three days old is a nudge, ten days old is a finding.
+    """
+    answered = {str(r["answers"]) for r in records if r.get("answers")}
+    asks, mine = [], []
+    for rec in _visible(records):
+        target = rec.get("ask_to")
+        if not target or rec["ref"] in answered:
+            continue
+        age_days = (time.time() - _epoch(rec["ts"])) / 86400.0
+        row = {"ref": rec["ref"], "id": rec["id"], "from": rec["author"],
+               "to": target, "topic": rec["topic"], "ts": rec["ts"],
+               "age_days": round(age_days, 1),
+               "ageing": "stale" if age_days >= ASK_STALE_DAYS
+                         else ("warn" if age_days >= ASK_WARN_DAYS else "ok"),
+               "text": rec["text"][:280]}
+        (asks if target == ME else mine).append(row)
+    asks.sort(key=lambda r: -r["age_days"])
+    mine.sort(key=lambda r: -r["age_days"])
+    return {"asks": asks, "asks_by_me": mine,
+            "counts": {"waiting": len(asks), "outstanding": len(mine)}}
 
 
 # --------------------------------------------------------------------------
@@ -118,182 +215,111 @@ def _idle_state(idle_days: Optional[float]) -> str:
 
 @router.get("/health")
 async def health() -> Dict[str, Any]:
-    """Is the board answering, and with what version. Never raises."""
-    try:
-        status, body = _call("/api/health", _key() or "", timeout=3.0)
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "error": "board unreachable: %s" % exc.__class__.__name__}
-    if status != 200:
-        return {"ok": False, "error": "board answered %s" % status}
-    return {"ok": True, "version": body.get("version"), "messages": body.get("messages"),
-            "channels": body.get("channels", {}), "delivery": body.get("delivery", {})}
+    """Is the log readable, and how much of it is there. Never raises."""
+    data = _load()
+    records = data["records"]
+    if not records:
+        return {"ok": False, "error": data["error"] or "no records in %s" % BOARD_DIR}
+    peer = sum(1 for r in records if r["author"] == PEER)
+    return {"ok": True, "board": "v2", "records": len(records), "receipts": data["receipts"],
+            "latest": records[-1]["ref"],
+            "writers": {PEER: peer, ME: len(records) - peer},
+            "read_error": data["error"] or None}
 
 
 @router.get("/state")
-async def state(channel: Optional[str] = None, since: int = 0, limit: int = 40,
+async def state(channel: Optional[str] = None, since: int = 0, limit: int = 200,
                 topic: Optional[str] = None) -> Dict[str, Any]:
-    """One screenful: the channels, the selected channel's messages, delivery state."""
-    key = _key()
-    if not key:
-        return _fail("no board key at %s" % os.path.join(DATA_DIR, KEY_FILES[0]))
-    query: Dict[str, Any] = {"limit": max(1, min(int(limit), 200))}
-    if channel:
-        query["channel"] = channel
+    """One screenful: the room, its messages oldest→newest, topics, asks, delivery."""
+    data = _load()
+    records = _visible(data["records"])
+    if not records:
+        return _fail(data["error"] or "no records in %s" % BOARD_DIR)
+
+    limit = max(1, min(int(limit or 200), 400))
+    messages = records[-limit:]
     if since:
-        query["since"] = int(since)
-    try:
-        status, listing = _call("/api/channels", key)
-        if status != 200:
-            return _fail("channels refused (%s): %s" % (status, listing.get("error", "")))
-        channels = listing.get("channels", [])
-        for entry in channels:
-            entry["state"] = _idle_state(entry.get("idle_days"))
-        # Newest activity first, with an unused room kept but last: a room nobody has
-        # ever spoken in must not be the default just because it sorts first.
-        channels.sort(key=lambda c: (c.get("last_epoch") or 0), reverse=True)
+        messages = [m for m in messages if m["id"] > int(since)]
+    if topic:
+        messages = [m for m in messages if m["topic"] == topic]
 
-        selected = channel or (channels[0]["channel"] if channels else None)
-        messages: list = []
-        if selected:
-            row = next((c for c in channels if c["channel"] == selected), {})
-            # Read BACKWARDS from the newest id. `GET /api/messages` with no `since`
-            # starts at the oldest page (ORDER BY id ASC), so asking for the latest
-            # screenful that way returns the beginning of the archive and the pane
-            # would look frozen a month in the past. Same trap that pinned the triage
-            # gate to id 34 for four days.
-            params = dict(query, channel=selected)
-            # A topic is a tag inside the room: filtering here is what stops one long
-            # conversation looking like the whole board.
-            if topic:
-                params["topic"] = topic
-            if not since and row.get("last_id"):
-                params["before"] = int(row["last_id"]) + 1
-            status, body = _call("/api/messages?" + urllib.parse.urlencode(params), key)
-            if status != 200:
-                return _fail("messages refused (%s): %s" % (status, body.get("error", "")),
-                             channels=channels)
-            messages = body.get("messages", [])
-            if params.get("before"):
-                messages.reverse()      # oldest→newest for display
+    counts: Dict[str, int] = {}
+    for rec in records:
+        if rec["topic"]:
+            counts[rec["topic"]] = counts.get(rec["topic"], 0) + 1
 
-        # Topic index for this channel: the chips that stop the pane reading as one
-        # endless thread. Failure here costs navigation, not the view.
-        topics: list = []
-        try:
-            tpath = "/api/topics" + (("?channel=" + urllib.parse.quote(selected)) if selected else "")
-            tstatus, tbody = _call(tpath, key)
-            if tstatus == 200:
-                topics = tbody.get("topics", [])
-        except (OSError, ValueError):
-            topics = []
-
-        delivery: Dict[str, Any] = {}
-        try:
-            _, dbody = _call("/api/delivery", key)
-            delivery = {"peers": dbody.get("peers", []), "channels": dbody.get("channels", [])}
-        except (OSError, ValueError):
-            delivery = {}      # the pane is still useful without it
-
-        # The inbox is what the human opens the pane for: what is waiting on him. A
-        # board that cannot answer that is a log, and a log is what the agent reads.
-        inbox: Dict[str, Any] = {"asks": [], "asks_by_me": [], "counts": {}}
-        try:
-            path = "/api/inbox" + (("?channel=" + urllib.parse.quote(selected)) if selected else "")
-            status, ibody = _call(path, key)
-            if status == 200:
-                inbox = ibody
-        except (OSError, ValueError):
-            inbox = {"asks": [], "asks_by_me": [], "counts": {}, "error": "inbox unavailable"}
-
-        return {"ok": True, "channels": channels, "channel": selected,
-                "messages": messages, "delivery": delivery, "inbox": inbox,
-                "topics": topics, "topic": topic,
-                "quiet_days": QUIET_DAYS, "stale_days": STALE_DAYS}
-    except (OSError, ValueError) as exc:
-        return _fail("board unreachable: %s" % exc.__class__.__name__)
+    last = records[-1]
+    return {
+        "ok": True,
+        "channel": CHANNEL,
+        "channels": [{
+            "channel": CHANNEL,
+            "label": CHANNEL_LABEL,
+            "messages": len(records),
+            "last_id": last["id"],
+            "last_ts": last["ts"],
+            "last_epoch": _epoch(last["ts"]),
+            "state": _idle_state(last["ts"]),
+            "identities": ["Will (Zeta)", "Hamish (Elio)"],
+        }],
+        "messages": [_message(m) for m in messages],
+        "topics": [{"topic": t, "messages": n}
+                   for t, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))],
+        "delivery": _delivery(data["records"], data.get("delivered") or set()),
+        "inbox": _inbox(data["records"]),
+        "topic": topic,
+        "quiet_days": QUIET_DAYS,
+        "stale_days": STALE_DAYS,
+    }
 
 
 @router.get("/search")
 async def search(q: str = "", channel: Optional[str] = None, limit: int = 30) -> Dict[str, Any]:
-    """Ranked full-text search. The agent has `board.py search`; this is the same index."""
-    key = _key()
-    if not key or not q.strip():
+    """Substring search over the merged log, newest first: no index, no ranking."""
+    needle = (q or "").strip().lower()
+    if not needle:
         return {"ok": False, "error": "nothing to search for", "results": []}
-    query: Dict[str, Any] = {"q": q.strip(), "limit": max(1, min(int(limit), 100))}
-    if channel:
-        query["channel"] = channel
-    try:
-        status, body = _call("/api/search?" + urllib.parse.urlencode(query), key)
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "error": "board unreachable: %s" % exc.__class__.__name__, "results": []}
-    if status != 200:
-        return {"ok": False, "error": body.get("error") or ("board answered %s" % status),
-                "results": []}
-    return {"ok": True, "query": q.strip(), "count": body.get("count", 0),
-            "results": body.get("results", [])}
+    records = _visible(_load()["records"])
+    hits: List[Dict[str, Any]] = []
+    for rec in reversed(records):
+        text = rec["text"]
+        at = text.lower().find(needle)
+        if at < 0:
+            continue
+        start = max(0, at - 80)
+        item = _message(rec)
+        item["snippet"] = ("…" if start else "") + text[start:at + len(needle) + 160].strip()
+        hits.append(item)
+        if len(hits) >= max(1, min(int(limit or 30), 100)):
+            break
+    return {"ok": True, "query": q.strip(), "count": len(hits), "results": hits}
 
 
 @router.get("/file/{fid}")
 async def file_preview(fid: int) -> Dict[str, Any]:
-    """One attachment: metadata always, the text itself when it is text and small.
-
-    A pane that can read an attached note without leaving the app is the difference
-    between "see #50" and actually reading it; a binary is described instead, because
-    rendering a download inside a chat surface is not this plugin's job.
-    """
-    key = _key()
-    if not key:
-        return {"ok": False, "error": "no board key"}
-    url = BASE_URL + "/api/files/%d" % fid
-    request = urllib.request.Request(url, headers={"X-Board-Key": key})
-    try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_S) as resp:
-            blob = resp.read()
-            name = resp.headers.get("X-File-Name") or ("file-%d" % fid)
-            ctype = (resp.headers.get("Content-Type") or "").split(";")[0]
-            sha = resp.headers.get("X-File-Sha256") or ""
-    except urllib.error.HTTPError as exc:
-        return {"ok": False, "error": "board answered %s" % exc.code}
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "error": "board unreachable: %s" % exc.__class__.__name__}
-
-    text_like = ctype.startswith("text/") or ctype in ("application/json", "application/xml")
-    body: Dict[str, Any] = {"ok": True, "id": fid, "name": name, "ctype": ctype,
-                            "size": len(blob), "sha256": sha, "text": None}
-    if text_like and len(blob) <= 40_000:
-        body["text"] = blob.decode("utf-8", "replace")
-    elif text_like:
-        body["note"] = "too large to show here (%d bytes) — use board.py get %d" % (len(blob), fid)
-    else:
-        body["note"] = "%s · %d bytes — use board.py get %d" % (ctype or "binary", len(blob), fid)
-    return body
+    """v2 has no attachment store. Say so rather than showing an empty preview."""
+    return {"ok": False,
+            "error": "board v2 carries no attachments — the few that exist are in the "
+                     "retired v1 archive at ~/.hermes/data/agent-board/files/"}
 
 
 @router.post("/post")
 async def post(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Post as hamish-hermes. Same validation as the CLI, done by the board itself."""
-    key = _key()
-    if not key:
-        return {"ok": False, "error": "no board key at %s" % os.path.join(DATA_DIR, KEY_FILES[0])}
-    text = (body.get("text") or "").strip()
+    """Append to our own log. The author is pinned by the wrapper, not by this pane."""
+    text = str((body or {}).get("text") or "").strip()
     if not text:
         return {"ok": False, "error": "nothing to post"}
-    payload: Dict[str, Any] = {"text": text, "author": "hamish-hermes"}
-    if body.get("channel"):
-        payload["channel"] = body["channel"]
-    if body.get("topic"):
-        payload["topic"] = str(body["topic"])[:48]
-    # The pane is the human typing, not the agent posting on his behalf; the board records
-    # which voice it was so a quote can never be attributed to the wrong one.
-    payload["via"] = "human" if body.get("via") == "human" else "agent"
-    if body.get("reply_to"):
-        payload["reply_to"] = int(body["reply_to"])
+    topic = str((body or {}).get("topic") or "meta").strip()[:48] or "meta"
+    if not os.path.exists(POST_SCRIPT):
+        return {"ok": False, "error": "post wrapper missing at %s" % POST_SCRIPT}
     try:
-        status, answer = _call("/api/messages", key, payload)
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "error": "board unreachable: %s" % exc.__class__.__name__}
-    if status not in (200, 201):
-        return {"ok": False, "error": answer.get("error") or ("board answered %s" % status)}
-    # The POST answers with nulls for author/topic/files, which is not a failed write;
-    # the pane re-reads the channel rather than trusting the echo.
-    return {"ok": True, "message": answer.get("message", {})}
+        done = subprocess.run([sys.executable, POST_SCRIPT, "post",
+                               "--topic", topic, "--text", text],
+                              capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": "post failed: %s" % exc}
+    if done.returncode != 0:
+        return {"ok": False, "error": (done.stderr or done.stdout or "post failed").strip()[:400]}
+    _cache["at"] = 0.0                      # force the next read to see it
+    line = (done.stdout or "").strip().splitlines()
+    return {"ok": True, "message": {"ref": line[-1] if line else ""}}
