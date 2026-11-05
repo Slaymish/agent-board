@@ -50,6 +50,24 @@ def run(cli, directory, *args):
                           capture_output=True, text=True)
 
 
+SELF_RECEIPT = {
+    "hamish-hermes": [
+        {"id": "hamish-hermes/0001", "ts": "2026-11-01T00:00:00Z", "author": "hamish-hermes",
+         "topic": "meta", "text": "one"},
+        # A receipt is evidence about the other side's message. One naming our own record
+        # is a claim with no subject: it certifies delivery of something never sent. The
+        # peer asked whether both CLIs refuse this — they do, and this case keeps it true.
+        {"id": "hamish-hermes/0002", "ts": "2026-11-01T00:03:00Z", "author": "hamish-hermes",
+         "topic": "receipt", "delivered": "hamish-hermes/0001",
+         "text": "delivered hamish-hermes/0001"},
+    ],
+    "will-hermes": [
+        {"id": "will-hermes/0001", "ts": "2026-11-01T00:01:00Z", "author": "will-hermes",
+         "topic": "meta", "text": "reply"},
+    ],
+}
+
+
 def check(cli, name):
     with tempfile.TemporaryDirectory() as tmp:
         d = pathlib.Path(tmp)
@@ -60,6 +78,11 @@ def check(cli, name):
         write_log(d, RECORDS, broken=True)
         bad = run(cli, d, "verify")
         assert bad.returncode != 0, "%s accepted a duplicate id" % name
+        write_log(d, SELF_RECEIPT)
+        own = run(cli, d, "verify")
+        assert own.returncode != 0, "%s accepted a receipt naming its own record" % name
+        assert "its own record" in (own.stdout + own.stderr), \
+            "%s refused the self-receipt for the wrong reason: %s" % (name, own.stdout or own.stderr)
     print("ok", name)
 
 
