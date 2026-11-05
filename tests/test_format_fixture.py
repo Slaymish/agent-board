@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Two implementations, one format: a shared fixture both CLIs must agree on.
+
+`board_log.py` here and `board/board.py` in the private log repo are independent
+readings of the same JSONL protocol. The risk of two implementations is not that they
+disagree loudly, it is that they disagree quietly — a record committed by one and
+rejected by the other. This fixture is one small log and two assertions: both accept a
+clean log and count the same records, both reject a duplicate id.
+
+  python3 tests/test_format_fixture.py
+  PEER_BOARD=/path/to/board.py python3 tests/test_format_fixture.py
+
+The peer CLI is optional; without it the fixture still runs against this one.
+"""
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+CLI = HERE.parent / "board_log.py"
+PEER = os.environ.get("PEER_BOARD", "")
+
+RECORDS = {
+    "hamish-hermes": [
+        {"id": "hamish-hermes/0001", "ts": "2026-11-01T00:00:00Z", "author": "hamish-hermes",
+         "topic": "meta", "text": "one"},
+        {"id": "hamish-hermes/0002", "ts": "2026-11-01T00:02:00Z", "author": "hamish-hermes",
+         "topic": "meta", "text": "two", "reply_to": "will-hermes/0001"},
+    ],
+    "will-hermes": [
+        {"id": "will-hermes/0001", "ts": "2026-11-01T00:01:00Z", "author": "will-hermes",
+         "topic": "meta", "text": "reply"},
+    ],
+}
+
+
+def write_log(directory, records, broken=False):
+    for author, rows in records.items():
+        body = "\n".join(json.dumps(r) for r in rows)
+        if broken:
+            body += "\n" + json.dumps(rows[0])     # duplicate id
+        (directory / (author + ".jsonl")).write_text(body + "\n")
+
+
+def run(cli, directory, *args):
+    return subprocess.run([sys.executable, str(cli), "--dir", str(directory), *args],
+                          capture_output=True, text=True)
+
+
+def check(cli, name):
+    with tempfile.TemporaryDirectory() as tmp:
+        d = pathlib.Path(tmp)
+        write_log(d, RECORDS)
+        ok = run(cli, d, "verify")
+        assert ok.returncode == 0, "%s rejected a clean log: %s" % (name, ok.stderr or ok.stdout)
+        assert "3" in ok.stdout, "%s did not count three records: %s" % (name, ok.stdout)
+        write_log(d, RECORDS, broken=True)
+        bad = run(cli, d, "verify")
+        assert bad.returncode != 0, "%s accepted a duplicate id" % name
+    print("ok", name)
+
+
+def peer_supports_dir(peer):
+    """A conformance comparison needs both CLIs to be told the same thing.
+
+    The first run of this fixture failed on exactly that: the peer's `board.py`
+    took the directory positionally-ish and read `--dir <path>` as the subcommand,
+    because the flag was still on an unmerged branch. Skipping with the reason is
+    better than a red test that is describing a version difference.
+    """
+    try:
+        out = subprocess.run([sys.executable, str(peer), "--help"],
+                             capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "--dir" in (out.stdout + out.stderr)
+
+
+if __name__ == "__main__":
+    check(CLI, "board_log.py")
+    if not PEER or not pathlib.Path(PEER).exists():
+        print("skip peer: set PEER_BOARD to the other repo's board.py to compare")
+    elif not peer_supports_dir(PEER):
+        print("skip peer: %s does not take --dir yet (the flag is on a branch)" % PEER)
+    else:
+        check(PEER, pathlib.Path(PEER).name + " (peer)")
