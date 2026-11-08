@@ -74,7 +74,11 @@ def check(cli, name):
         write_log(d, RECORDS)
         ok = run(cli, d, "verify")
         assert ok.returncode == 0, "%s rejected a clean log: %s" % (name, ok.stderr or ok.stdout)
-        assert "3" in ok.stdout, "%s did not count three records: %s" % (name, ok.stdout)
+        # Pin the whole rendered line. `"3" in stdout` passed on a 13-record log and on
+        # anything containing a 3 in a date or a sha — a count assertion that cannot fail
+        # for the reason it exists. (Zeta's finding, 9 Nov 2026.)
+        assert "3 record(s), hamish-hermes=2, will-hermes=1" in " ".join(ok.stdout.split()), \
+            "%s counted records wrongly: %s" % (name, ok.stdout)
         write_log(d, RECORDS, broken=True)
         bad = run(cli, d, "verify")
         assert bad.returncode != 0, "%s accepted a duplicate id" % name
@@ -83,7 +87,42 @@ def check(cli, name):
         assert own.returncode != 0, "%s accepted a receipt naming its own record" % name
         assert "its own record" in (own.stdout + own.stderr), \
             "%s refused the self-receipt for the wrong reason: %s" % (name, own.stdout or own.stderr)
+    extra_cases(cli, name)
     print("ok", name)
+
+
+OUT_OF_ORDER = {
+    "hamish-hermes": [
+        {"id": "hamish-hermes/0002", "ts": "2026-11-01T00:02:00Z", "author": "hamish-hermes",
+         "topic": "meta", "text": "two"},
+        {"id": "hamish-hermes/0001", "ts": "2026-11-01T00:00:00Z", "author": "hamish-hermes",
+         "topic": "meta", "text": "one"},
+    ],
+}
+
+MISFILED_AUTHOR = {
+    # A record claiming to be the peer's, sitting in our file. Both CLIs refuse it; the
+    # fixture did not say so, which is how a format rule becomes folklore.
+    "hamish-hermes": [
+        {"id": "will-hermes/0009", "ts": "2026-11-01T00:00:00Z", "author": "will-hermes",
+         "topic": "meta", "text": "not mine to write"},
+    ],
+}
+
+
+def extra_cases(cli, name):
+    with tempfile.TemporaryDirectory() as tmp:
+        d = pathlib.Path(tmp)
+        write_log(d, OUT_OF_ORDER)
+        out = run(cli, d, "verify")
+        assert out.returncode != 0, "%s accepted ids out of order in one file" % name
+        assert "out of order" in (out.stdout + out.stderr).lower(), \
+            "%s refused out-of-order ids for the wrong reason: %s" % (name, out.stdout or out.stderr)
+        write_log(d, MISFILED_AUTHOR)
+        out = run(cli, d, "verify")
+        assert out.returncode != 0, "%s accepted a record filed under another author" % name
+        assert "author" in (out.stdout + out.stderr).lower(), \
+            "%s refused a misfiled author for the wrong reason: %s" % (name, out.stdout or out.stderr)
 
 
 def peer_supports_dir(peer):
