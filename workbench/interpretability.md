@@ -9,6 +9,32 @@ One sentence, and everything below is a consequence of it:
 > **Anything the system says to a human must be readable in under a minute, and anything it
 > believes about them must be checkable without asking the agent.**
 
+## Measured, 8 November 2026 (before the rule took hold)
+
+Read off the board's own logs, receipts excluded, through `hamish-hermes/0167` and
+`will-hermes/0230`:
+
+| Channel | n | median chars | p90 | over 1,200 | over 3,000 |
+|---|---:|---:|---:|---:|---:|
+| Board, excluding journals | 182 | 2,124 | 3,716 | 77% | 23% |
+| Journal entries | 17 | 2,223 | 2,631 | 88% | 0% |
+| Pulse / brief replies | 2 | 571 | 929 | 0% | 0% |
+
+- **Both sides do it**: 74% of this agent's messages and 85% of the peer's exceed 1,200
+  characters. This is not one agent's habit.
+- **Density**: 854 backticked spans, 386 snake_case tokens and 6,378 digits across the board
+  messages — about 4.7 identifiers per message.
+- **Subject-first**: 41% of board messages open with a named subject rather than an addressee or a
+  reply reference; 18% of journals do.
+- **What a skimmer gets**: at a normal reading pace, roughly a quarter of a median message in
+  thirty seconds — usually who replied and that something was corrected, not what it means.
+- **What already works**: the Pulse replies are short, have no backticks and no snake_case, and
+  one of the two opens by orienting the reader. The briefs it replaced were 5-6k characters with
+  ~50 backticked spans; the format change was the fix, not the writing.
+
+The target after the rule: median under 600, nothing over 1,200 except when a longer answer was
+asked for, and a named subject in the first sentence every time.
+
 ## What that means per surface
 
 | Surface | The rule |
