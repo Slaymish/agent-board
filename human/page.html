@@ -132,7 +132,21 @@
   .result .snip { display: block; margin-top: 2px; color: var(--quiet); font-size: 14px; }
   .result b { font-weight: 600; background: rgba(127, 118, 100, .16); border-radius: 2px; }
 
-  /* ---------- review: a form over the fact store's own questions ---------- */
+  /* ---------- today: what ran, what exists, what is actually known ---------- */
+  .outcomes { display: grid; gap: 20px; max-width: var(--measure); }
+  .ocard { display: grid; gap: 4px; border-left: 2px solid var(--rule); padding-left: 12px; }
+  .ocard .head { display: flex; gap: 8px; align-items: baseline; }
+  .ocard .name { font: 600 13px/1.3 var(--sans); letter-spacing: .04em; }
+  .ocard .state {
+    font: 600 10.5px/1.4 var(--mono); letter-spacing: .08em; text-transform: lowercase;
+    color: var(--quiet);
+  }
+  .ocard .state[data-s="ok"] { color: var(--mine); }
+  .ocard .state[data-s="failed"], .ocard .state[data-s="incident"] { color: var(--warn); }
+  .ocard .detail { font-size: 15px; line-height: 1.45; }
+  .ocard .meta { font: 11px/1.5 var(--mono); color: var(--quiet); letter-spacing: .02em; }
+  .ocard .act { font: 12px/1.4 var(--sans); color: var(--ink); }
+  .outs .stamp { font: 11px/1.4 var(--mono); color: var(--quiet); margin: 0 0 2px; }
   .review { display: grid; gap: 26px; max-width: var(--measure); }
   .rcard { border-left: 2px solid var(--rule); padding: 0 0 2px 12px; display: grid; gap: 7px; }
   .rcard .why {
@@ -351,6 +365,7 @@
   <nav class="tabs" role="tablist" aria-label="rooms">
     <button class="tab" id="tab-human" type="button" role="tab" aria-selected="true">human</button>
     <button class="tab" id="tab-work" type="button" role="tab" aria-selected="false">work</button>
+    <button class="tab" id="tab-today" type="button" role="tab" aria-selected="false" hidden>today</button>
     <button class="tab" id="tab-review" type="button" role="tab" aria-selected="false" hidden>review</button>
     <button class="tab" id="tab-reports" type="button" role="tab" aria-selected="false" hidden>reports</button>
   </nav>
@@ -397,7 +412,7 @@
 const state = { me: "?", peer: "?", messages: [], sending: false, reply: null,
                 submission: null, work: [], focusWork: null, roomView: "lines",
                 whoFilter: "all", host: false, review: [], answers: {}, reviewNote: "",
-                reports: [], openReport: null,
+                reports: [], openReport: null, outcomes: null,
                 view: "lines" };
 const VIEW_KEY = "hc.view";
 try {
@@ -601,12 +616,83 @@ function render() {
   syncChrome();
   const tab = currentTab();
   document.body.classList.toggle("view-work", tab === "work");
-  document.body.classList.toggle("view-readonly", tab === "review" || tab === "reports");
+  document.body.classList.toggle("view-readonly",
+    tab === "review" || tab === "reports" || tab === "today");
   if (state.view === "work") { renderWork(); return; }
+  if (state.view === "today") { renderToday(); return; }
   if (state.view === "review") { renderReview(); return; }
   if (state.view === "reports") { renderReports(); return; }
   if (state.view === "canvas") { renderCanvas(); return; }
   renderLines();
+}
+
+// ---------- today: what ran, what exists, what is actually known ----------
+async function loadOutcomes(fresh) {
+  try {
+    const res = await fetch("/api/outcomes" + (fresh ? "?fresh=1" : ""));
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    state.outcomes = await res.json();
+  } catch (e) {
+    state.outcomes = {routines: [], error: e.message};
+  }
+}
+
+function renderToday() {
+  const thread = $("thread");
+  thread.textContent = "";
+  const wrap = document.createElement("section");
+  wrap.className = "outcomes";
+  const lede = document.createElement("p");
+  lede.className = "lede";
+  lede.textContent = "what ran, what exists, and what is actually known about it.";
+  wrap.append(lede);
+  const data = state.outcomes || {};
+  if (data.generated_at) {
+    const stampEl = document.createElement("p");
+    stampEl.className = "stamp";
+    stampEl.textContent = "read " + data.generated_at.slice(11, 16);
+    wrap.append(stampEl);
+  }
+  if (data.error) {
+    const p = document.createElement("p"); p.id = "empty";
+    p.textContent = "no outcome snapshot: " + data.error;
+    wrap.append(p);
+  }
+  for (const r of data.routines || []) {
+    const card = document.createElement("article");
+    card.className = "ocard";
+    const head = document.createElement("div"); head.className = "head";
+    const name = document.createElement("span"); name.className = "name";
+    name.textContent = r.routine;
+    const stateEl = document.createElement("span"); stateEl.className = "state";
+    stateEl.dataset.s = r.state;
+    stateEl.textContent = r.state;
+    head.append(name, stateEl);
+    const detail = document.createElement("div"); detail.className = "detail";
+    detail.textContent = r.detail || "";
+    const meta = document.createElement("div"); meta.className = "meta";
+    const run = r.run || {};
+    meta.textContent = [r.cadence, "run " + (run.status || "unknown"),
+                        r.delivery ? "delivery " + r.delivery.state : ""]
+      .filter(Boolean).join(" · ");
+    card.append(head, detail, meta);
+    if (r.delivery && r.delivery.detail) {
+      const d = document.createElement("div"); d.className = "meta";
+      d.textContent = r.delivery.detail;
+      card.append(d);
+    }
+    if (r.next_action) {
+      const act = document.createElement("div"); act.className = "act";
+      act.textContent = "next: " + r.next_action;
+      card.append(act);
+    }
+    wrap.append(card);
+  }
+  const again = document.createElement("button");
+  again.type = "button"; again.className = "send"; again.textContent = "read again";
+  again.addEventListener("click", async () => { await loadOutcomes(true); render(); });
+  wrap.append(again);
+  thread.append(wrap);
 }
 
 // ---------- review: the fact store's questions, answerable here ----------
@@ -999,6 +1085,7 @@ async function send(text) {
 // is no separate "return", because two visible tabs already are one.
 function currentTab() {
   if (state.view === "work") return "work";
+  if (state.view === "today") return "today";
   if (state.view === "review") return "review";
   if (state.view === "reports") return "reports";
   return "human";
@@ -1006,9 +1093,9 @@ function currentTab() {
 
 function syncChrome() {
   const tab = currentTab();
-  for (const name of ["human", "work", "review", "reports"]) {
+  for (const name of ["human", "work", "today", "review", "reports"]) {
     $("tab-" + name).setAttribute("aria-selected", tab === name ? "true" : "false");
-    if (name === "review" || name === "reports") $("tab-" + name).hidden = !state.host;
+    if (name !== "human" && name !== "work") $("tab-" + name).hidden = !state.host;
   }
   $("seg-layout").hidden = tab !== "human";
   $("seg-who").hidden = tab !== "work";
@@ -1083,6 +1170,7 @@ async function showTab(name) {
   else state.view = name;
   retainRecord(null);
   if (state.view === "work") await loadWork();
+  if (state.view === "today") await loadOutcomes(false);
   if (state.view === "review") await loadReview();
   if (state.view === "reports") { state.openReport = null; await loadReports(); }
   history.pushState({}, "");
@@ -1092,6 +1180,7 @@ async function showTab(name) {
 }
 $("tab-human").onclick = () => showTab("human");
 $("tab-work").onclick = () => showTab("work");
+$("tab-today").onclick = () => showTab("today");
 $("tab-review").onclick = () => showTab("review");
 $("tab-reports").onclick = () => showTab("reports");
 $("seg-lines").onclick = () => setLayout("lines");
@@ -1237,6 +1326,7 @@ $("search-open").replaceChildren(ICON_SEARCH());
 syncChrome();
 load(true);
 if (state.view === "work") loadWork().then(render);
+if (state.view === "today") loadOutcomes(false).then(render);
 if (state.view === "review") loadReview().then(render);
 if (state.view === "reports") loadReports().then(render);
 </script>

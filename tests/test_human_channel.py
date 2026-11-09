@@ -682,6 +682,19 @@ class ReviewAndReports(ServerCase):
         finally:
             serve.FACT_REVIEW = old
 
+    def test_outcomes_are_the_hosts_and_carry_three_routines(self):
+        self.assertEqual(self.get("/api/outcomes", auth=False)[0], 401)
+        self.assertEqual(self.get("/api/outcomes", token=WILL_TOKEN)[0], 403)
+        code, body = self.get("/api/outcomes")
+        self.assertEqual(code, 200)
+        data = json.loads(body)
+        names = [r["routine"] for r in data["routines"]]
+        self.assertEqual(names, ["payday plan", "grocery proposal", "offsite backup"])
+        for r in data["routines"]:
+            self.assertIn(r["state"], ("ok", "failed", "incident", "stale", "missing",
+                                       "unverified", "not expected"))
+            self.assertIn("delivery", r)
+
     def test_reports_read_only_from_the_allowlist(self):
         from tempfile import TemporaryDirectory as T
         with T() as tmp:
