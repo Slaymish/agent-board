@@ -266,6 +266,28 @@ class HumanChannel(unittest.TestCase):
                               capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stdout)
 
+    def test_search_needs_the_link_and_covers_both_rooms(self):
+        self.assertEqual(self.get("/api/search?q=hello", auth=False)[0], 401)
+        code, body = self.get("/api/search?q=hello")
+        self.assertEqual(code, 200)
+        ids = [r["id"] for r in json.loads(body)["records"]]
+        self.assertIn("will/0001", ids, "the humans room is searchable")
+        code, body = self.get("/api/search?q=agent%20line")
+        ids = [r["id"] for r in json.loads(body)["records"]]
+        self.assertIn("will-hermes/0001", ids, "the work is searchable")
+        code, body = self.get("/api/search?q=will-hermes/0001")
+        self.assertEqual([r["id"] for r in json.loads(body)["records"]],
+                         ["will-hermes/0001"], "an id finds exactly that record")
+
+    def test_search_skips_receipts(self):
+        with (self.board / "will-hermes.jsonl").open("a") as fh:
+            fh.write(json.dumps({
+                "id": "will-hermes/0002", "ts": "2026-11-08T11:00:00Z",
+                "author": "will-hermes", "topic": "receipt",
+                "text": "delivered will/0001"}) + "\n")
+        code, body = self.get("/api/search?q=delivered")
+        self.assertEqual(json.loads(body)["records"], [])
+
     def test_the_work_view_skips_delivery_receipts(self):
         with (self.board / "will-hermes.jsonl").open("a") as fh:
             fh.write(json.dumps({
@@ -546,27 +568,35 @@ class PageNavigation(unittest.TestCase):
     def test_exact_links_history_focus_scroll_and_refresh(self):
         page = (HERE.parent / "human/page.html").read_text()
         linkify = page[page.index("function linkify("):page.index("function snippet(")]
-        navigation = page[page.index("let navDepth ="):page.index('$("composer").addEventListener')]
+        navigation = page[page.index("// Following a reference from a note"):page.index('$("composer").addEventListener')]
         load_work = page[page.index("async function loadWork()"):page.index("// Following a reference")]
+        set_layout = page[page.index("function setLayout("):page.index("async function loadWork()")]
         harness = r"""
 const assert = require('node:assert/strict');
 let scrollY = 310;
 const scrollTo = (x, y) => { scrollY = y; };
 const requestAnimationFrame = fn => fn();
 const elements = new Map();
-const $ = id => { if (!elements.has(id)) elements.set(id, {}); return elements.get(id); };
+const stub = () => ({hidden:false, textContent:"", value:"", dataset:{}, children:[],
+  onclick:null, addEventListener(){}, setAttribute(){}, replaceChildren(){},
+  querySelectorAll:()=>[], focus(){}, closest(){return null;}});
+const $ = id => { if (!elements.has(id)) elements.set(id, stub()); return elements.get(id); };
 let pop;
-const window = {addEventListener: (name, fn) => { pop = fn; }};
+const window = {addEventListener: (name, fn) => { pop = fn; },
+                scrollTo: (arg) => { scrollY = typeof arg === 'number' ? arg : (arg.top || 0); }};
+globalThis.localStorage = {getItem: () => null, setItem() {}, removeItem() {}};
 const document = {
   createTextNode: text => ({textContent: text}),
   createElement: tag => ({tag, style: {}, addEventListener() {}}),
+  body: {scrollHeight: 900},
   querySelectorAll: () => rendered.map(r => ({dataset: {id:r.id}, scrollIntoView() {scrollY = 777;}}))
 };
-const state = {view:'lines', roomView:'lines', messages:[], work:[], focusWork:null};
-let rendered = [];
-function render() { rendered = state.view === 'work' ? state.work : state.messages; }
-function paintViewIcon() {}
-function status(message) { throw new Error(message); }
+ const state = {view:'lines', roomView:'lines', messages:[], work:[], focusWork:null,
+                whoFilter:'all', me:'hamish', peer:'will'};
+ let rendered = [];
+ function render() { rendered = state.view === 'work' ? state.work : state.messages; }
+ function syncChrome() {}
+ function status(message) { throw new Error(message); }
 const rows = {
  'will-hermes/0001': {id:'will-hermes/0001', room:'agents', text:'A full record'},
  'will-hermes/0002': {id:'will-hermes/0002', room:'agents', text:'B full record'}
@@ -589,7 +619,6 @@ const history = {
  for (const bad of ['xwill-hermes/1000', 'will-hermes/1000x', 'will-hermes/1000/extra', 'will-hermes/10000'])
    assert.equal(linkify(bad).filter(x=>x.tag==='button').length, 0, bad);
  assert.equal(linkify('(will-hermes/1000)').filter(x=>x.tag==='button').length, 1);
- assert.equal($('return').hidden, true);
  await openWork('will-hermes/0001');
  assert.equal(entries[cursor].y, 777);
  scrollY = 888;
@@ -603,16 +632,13 @@ const history = {
  assert.equal(state.work.find(r=>r.id===state.focusWork).text, 'A full record');
  await history.back();
  assert.equal(state.view, 'lines'); assert.equal(scrollY, 310);
- assert.equal($('return').hidden, true);
- $('return').onclick(); assert.equal(cursor, 0);
- await history.forward(); assert.equal(state.focusWork, 'will-hermes/0001');
- await history.back();
- await $('rooms').onclick(); scrollY = 456;
- await $('rooms').onclick(); assert.equal(scrollY, 310);
- await $('rooms').onclick(); assert.equal(scrollY, 456);
+ await $('tab-work').onclick(); assert.equal(state.view, 'work');
+ await $('tab-human').onclick(); assert.equal(state.view, 'lines');
+ $('seg-canvas').onclick(); assert.equal(state.roomView, 'canvas'); assert.equal(state.view, 'canvas');
+ $('seg-lines').onclick(); assert.equal(state.view, 'lines');
 })().catch(e => { console.error(e); process.exitCode=1; });
 """
-        done = subprocess.run(["node"], input=harness + linkify + load_work + navigation + checks,
+        done = subprocess.run(["node"], input=harness + linkify + set_layout + load_work + navigation + checks,
                               capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn('[hidden] { display: none !important; }', page)

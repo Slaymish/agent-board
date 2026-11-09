@@ -191,6 +191,36 @@ class App:
                 return record
         return None
 
+    def search(self, query: str, limit: int = 40) -> list[dict]:
+        """Both rooms, one query. An id matches exactly, so a reference can be pasted in.
+
+        Read-only and unordered by popularity: a search is a way to find a thing you
+        already know exists, not a feed.
+        """
+        term = (query or "").strip().lower()
+        if len(term) < 2:
+            return []
+        hits = []
+        for r in board_log.all_records():
+            if str(r.get("topic") or "") == "receipt":
+                continue
+            author = str(r.get("author"))
+            room = str(r.get("room") or "shared")
+            if author in board_log.HUMAN_AUTHORS:
+                if room != "humans":
+                    continue
+            elif room not in ("agents", "shared"):
+                continue
+            hay = " ".join(str(r.get(k) or "") for k in ("id", "text", "topic")).lower()
+            if term not in hay:
+                continue
+            text = str(r.get("text") or "")
+            hits.append({"id": r.get("id"), "ts": r.get("ts"), "author": author,
+                         "topic": r.get("topic"), "room": room,
+                         "text": text if len(text) <= 400 else text[:399] + "…"})
+        hits.sort(key=lambda r: (r.get("ts", ""), r.get("id", "")), reverse=True)
+        return hits[:limit]
+
     def pull(self) -> None:
         if self.git and self.pull_every:
             try:
@@ -434,6 +464,13 @@ def make_handler(app: App):
                 self._json(200 if record else 404,
                            {"ok": bool(record), "record": record,
                             "error": None if record else "record unavailable"})
+                return
+            if url.path == "/api/search":
+                if not self._authed():
+                    self._json(401, {"ok": False, "error": "needs the channel link"})
+                    return
+                q = (parse_qs(url.query).get("q") or [""])[0]
+                self._json(200, {"ok": True, "records": app.search(q)})
                 return
             if url.path == "/api/work":
                 if not self._authed():

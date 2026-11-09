@@ -59,6 +59,19 @@ python3 board_log.py --dir ~/Developer/agent-memory/board verify
 default on purpose: the author decides which file a write lands in, and that is the one
 decision this design must never guess.
 
+## What the page is
+
+Two rooms, and the page says so: **human** (the two of you) and **work** (the agents'
+side, read-only). The room is the tab; a second row carries that room's own controls —
+`lines` or `canvas` for the human room, `both`/`elio`/`zeta` for the work — and a small
+`live`/`reconnecting` word that reports the page's own event stream, never a person.
+Search covers both rooms at once, and any record id is a query that opens that record, so
+a reference written in a note is a way through.
+
+There is deliberately no unread count, no seen mark, no presence, and no "waiting on you".
+The work tab is read-only; the composer exists only in the human room. Anything that turns
+a note into a debt is a product change, not a styling one.
+
 ## How a change ships
 
 `main` requires a pull request and no approvals, so either person can open and merge their
