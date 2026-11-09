@@ -106,7 +106,7 @@ PAGE = """<!doctype html>
      what this is for: a run of notes from one person is normal and does not stack up
      against anything. The author's name appears once per run per day; the time sits
      in the margin where it can be read or ignored. */
-  .note { display: grid; grid-template-columns: 44px 1fr; gap: 14px; padding-top: 9px; }
+  .note { display: grid; grid-template-columns: 44px 1fr 20px; gap: 14px; padding-top: 9px; }
   .note.first { margin-top: 16px; }
   .note .when {
     font-family: var(--mono); font-size: 10px; color: var(--quiet);
@@ -117,6 +117,30 @@ PAGE = """<!doctype html>
     text-transform: lowercase; margin: 0 0 2px;
   }
   .note.mine .name { color: var(--mine); }
+  /* A reply is one line pointing back, never a tree: the note keeps its place in the
+     day and the quotation says which earlier thought it belongs to. */
+  .quote {
+    font-size: 13px; line-height: 1.35; color: var(--quiet);
+    border-left: 1px solid var(--rule); padding-left: 8px; margin: 1px 0 4px;
+    max-width: 34em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .reply-btn {
+    border: 0; background: none; padding: 2px 0 0; margin: 0; height: auto;
+    color: var(--quiet); opacity: .35; cursor: pointer; align-self: start;
+    line-height: 0;
+  }
+  .reply-btn svg { width: 14px; height: 14px; display: block; }
+  .reply-btn:hover, .reply-btn:active { opacity: 1; color: var(--ink); }
+  .replying {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    font-family: var(--mono); font-size: 11px; color: var(--quiet);
+    overflow: hidden;
+  }
+  .replying span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .replying button {
+    border: 0; background: none; color: var(--quiet); height: auto; padding: 0 2px;
+    font-size: 15px; letter-spacing: 0; line-height: 1;
+  }
   .note.theirs .name { color: var(--theirs); }
   .day {
     font-family: var(--mono); font-size: 11px; letter-spacing: .08em;
@@ -133,8 +157,9 @@ PAGE = """<!doctype html>
     position: sticky; bottom: 0; background: var(--paper);
     border-top: 1px solid var(--rule);
     padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
-    display: flex; gap: 10px; align-items: flex-end;
+    display: flex; flex-direction: column; gap: 6px;
   }
+  .compose { display: flex; gap: 10px; align-items: flex-end; width: 100%; }
   textarea {
     flex: 1; resize: none; min-height: 48px; max-height: 55dvh;
     font: inherit; color: inherit; background: transparent;
@@ -170,12 +195,18 @@ PAGE = """<!doctype html>
 <main id="thread"><p id="empty">Nothing here yet.</p></main>
 <div id="status"></div>
 <form id="composer">
-  <textarea id="text" rows="1" maxlength="4000" placeholder="write to will"
-            autocomplete="off" enterkeyhint="enter" aria-label="message"></textarea>
-  <button id="send" type="submit">add</button>
+  <div class="replying" id="replying" hidden>
+    <span id="replying-text"></span>
+    <button type="button" id="cancel-reply" aria-label="cancel reply">×</button>
+  </div>
+  <div class="compose">
+    <textarea id="text" rows="1" maxlength="4000" placeholder="write to will"
+              autocomplete="off" enterkeyhint="enter" aria-label="note"></textarea>
+    <button id="send" type="submit">add</button>
+  </div>
 </form>
 <script>
-const state = { me: "?", peer: "?", messages: [], sending: false };
+const state = { me: "?", peer: "?", messages: [], sending: false, reply: null };
 const $ = (id) => document.getElementById(id);
 
 // A half-finished thought should survive closing the page, because the whole point is
@@ -233,6 +264,29 @@ function linkify(text) {
   });
 }
 
+function target(id) {
+  return state.messages.find((m) => m.id === id) || null;
+}
+
+function snippet(r, limit) {
+  const text = (r.text || "").replace(/\s+/g, " ").trim();
+  return text.length > limit ? text.slice(0, limit - 1) + "…" : text;
+}
+
+function startReply(r) {
+  state.reply = r.id;
+  const chip = $("replying");
+  $("replying-text").textContent = "replying to " + r.author + " · " + snippet(r, 48);
+  chip.hidden = false;
+  $("text").focus();
+}
+
+function cancelReply() {
+  state.reply = null;
+  $("replying").hidden = true;
+  $("replying-text").textContent = "";
+}
+
 function line(r, first) {
   const mine = r.author === state.me;
   const el = document.createElement("article");
@@ -246,10 +300,25 @@ function line(r, first) {
     name.textContent = r.author;
     body.append(name);
   }
+  if (r.reply_to) {
+    const parent = target(r.reply_to);
+    const quote = document.createElement("div"); quote.className = "quote";
+    quote.textContent = parent
+      ? parent.author + " · " + snippet(parent, 90)
+      : "replying to " + r.reply_to;
+    body.append(quote);
+  }
   const text = document.createElement("div"); text.className = "text";
   text.append(...linkify(r.text || ""));
   body.append(text);
-  el.append(when, body);
+  const reply = document.createElement("button");
+  reply.type = "button"; reply.className = "reply-btn"; reply.title = "reply to this";
+  reply.setAttribute("aria-label", "reply to this note");
+  reply.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4 1.6 7.3 5 10.6"/>' +
+    '<path d="M1.9 7.3h7.4a3.4 3.4 0 0 1 0 6.8H6"/></svg>';
+  reply.addEventListener("click", () => startReply(r));
+  el.append(when, body, reply);
   return el;
 }
 
@@ -308,7 +377,7 @@ async function send(text) {
   try {
     const res = await fetch("/api/post", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text })
+      body: JSON.stringify(state.reply ? { text, reply_to: state.reply } : { text })
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
@@ -343,6 +412,7 @@ $("text").addEventListener("input", (ev) => {
   box.style.height = Math.min(box.scrollHeight, window.innerHeight * 0.55) + "px";
   saveDraft();
 });
+$("cancel-reply").addEventListener("click", cancelReply);
 $("refresh").addEventListener("click", async () => {
   const b = $("refresh");
   b.classList.add("turning");
@@ -418,7 +488,8 @@ class App:
         finally:
             self.pulling.release()
 
-    def post(self, human: str, text: str, topic: str = "note") -> dict:
+    def post(self, human: str, text: str, topic: str = "note",
+             reply_to: str | None = None) -> dict:
         text = text.strip()
         if not text:
             raise ValueError("empty message")
@@ -427,11 +498,22 @@ class App:
         problem = board_log.room_voice_problem(human, ROOM, "human")
         if problem:                      # configuration error, not the writer's fault
             raise RuntimeError(problem)
+        if reply_to:
+            # A reply stays in its parent's room, so the target has to be one of these
+            # notes. Checked here rather than trusted from the page: the page can only
+            # send an id, but an id is still a claim about the log.
+            parent = next((r for r in board_log.all_records()
+                           if str(r.get("id")) == str(reply_to)), None)
+            if parent is None:
+                raise ValueError(f"no note {reply_to} to reply to")
+            if (parent.get("room") or "shared") != ROOM:
+                raise ValueError(f"{reply_to} is not in this room")
         with self.write_lock:
-            rec = board_log._append_record(human, {
-                "ts": _now(), "author": human, "topic": topic, "text": text,
-                "room": ROOM, "via": "human",
-            })
+            body = {"ts": _now(), "author": human, "topic": topic, "text": text,
+                    "room": ROOM, "via": "human"}
+            if reply_to:
+                body["reply_to"] = str(reply_to)
+            rec = board_log._append_record(human, body)
             pushed = None
             if self.git:
                 path = board_log.own_file(human)
@@ -576,6 +658,7 @@ def make_handler(app: App):
                 body = json.loads(self.rfile.read(length) or b"{}")
                 text = str(body.get("text") or "")
                 topic = str(body.get("topic") or "note")[:40] or "note"
+                reply_to = body.get("reply_to") or None
             except (json.JSONDecodeError, UnicodeDecodeError):
                 self._json(400, {"ok": False, "error": "body is not JSON"})
                 return
@@ -584,7 +667,8 @@ def make_handler(app: App):
                 self._json(401, {"ok": False, "error": "needs the channel link"})
                 return
             try:
-                out = app.post(human, text, topic)
+                out = app.post(human, text, topic,
+                               str(reply_to) if reply_to else None)
             except ValueError as e:
                 self._json(400, {"ok": False, "error": str(e)})
                 return

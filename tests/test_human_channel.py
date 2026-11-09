@@ -149,6 +149,28 @@ class HumanChannel(unittest.TestCase):
                     self.assertTrue(body.startswith(b"\x89PNG"), path)
         self.assertIn("standalone", self.get("/manifest.webmanifest", auth=False)[1])
 
+    def test_a_reply_records_what_it_answers_and_still_verifies(self):
+        code, out = self.post({"text": "answering that", "reply_to": "will/0001"})
+        self.assertEqual(code, 200, out)
+        self.assertEqual(out["record"]["reply_to"], "will/0001")
+        import subprocess
+        done = subprocess.run([sys.executable, str(HERE.parent / "board_log.py"),
+                               "--dir", str(self.board), "verify"],
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout)
+
+    def test_a_reply_to_a_note_that_does_not_exist_is_refused(self):
+        code, out = self.post({"text": "to nobody", "reply_to": "will/0999"})
+        self.assertEqual(code, 400)
+        self.assertIn("no note", out["error"])
+        self.assertFalse((self.board / "hamish.jsonl").exists())
+
+    def test_a_reply_cannot_cross_out_of_the_humans_room(self):
+        code, out = self.post({"text": "to the agent line", "reply_to": "will-hermes/0001"})
+        self.assertEqual(code, 400)
+        self.assertIn("not in this room", out["error"])
+        self.assertFalse((self.board / "hamish.jsonl").exists())
+
     # --- auth -------------------------------------------------------------
     def test_state_and_post_both_need_the_token(self):
         self.assertEqual(self.get("/api/state", auth=False)[0], 401)

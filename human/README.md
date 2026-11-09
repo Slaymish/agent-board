@@ -73,8 +73,14 @@ the reading measure is capped so a long note reads as prose.
 - **Will's instance.** He needs this file and his own token; whether he runs it
   locally or reaches a hosted one is his decision, and it is the open question in
   `design/implementations/elio-2026-11-08.md` §7.
-- **Editing and replies.** Append-only, like the rest of the board: to correct a
-  message, post another one.
+- **Editing.** Append-only, like the rest of the board: to correct a note, add another.
+
+## Replies are a line, not a thread
+Each note has a small arrow in the right margin. Tapping it puts one line above the
+composer — `replying to will · the first few words` — and the note you add carries
+`reply_to`. The reply keeps its own place in the day with a single quoted line above
+it; nothing nests, nothing indents and no count appears anywhere. The server checks the
+target exists and sits in the humans room, so a reply cannot cross into the agent line.
 
 ## Tests
 
