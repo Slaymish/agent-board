@@ -37,7 +37,8 @@ def seed(board: Path) -> None:
         "topic": "note", "text": "hello from will", "room": "humans", "via": "human"}) + "\n")
 
 
-class HumanChannel(unittest.TestCase):
+class ServerCase(unittest.TestCase):
+    """A real server on a loopback port, and a board with two seeded rooms."""
     def setUp(self) -> None:
         self.tmp = TemporaryDirectory()
         self.board = Path(self.tmp.name) / "board"
@@ -58,12 +59,13 @@ class HumanChannel(unittest.TestCase):
         self.tmp.cleanup()
 
     # --- helpers ---------------------------------------------------------
-    def get(self, path: str, auth: bool = True, cookie: str | None = None):
+    def get(self, path: str, auth: bool = True, cookie: str | None = None,
+            token: str = TOKEN):
         req = urllib.request.Request(self.base + path)
         if cookie:
             req.add_header("cookie", cookie)
         elif auth:
-            req.add_header("authorization", "Bearer " + TOKEN)
+            req.add_header("authorization", "Bearer " + token)
         try:
             with urllib.request.urlopen(req, timeout=5) as fh:
                 return fh.status, fh.read().decode()
@@ -82,6 +84,7 @@ class HumanChannel(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
+class HumanChannel(ServerCase):
     # --- the write path ---------------------------------------------------
     def test_a_post_lands_in_the_humans_own_file_with_room_and_voice(self):
         code, out = self.post({"text": "first words"})
@@ -642,6 +645,63 @@ const history = {
                               capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn('[hidden] { display: none !important; }', page)
+
+
+class ReviewAndReports(ServerCase):
+    """The review and the reports belong to the host, not to the shared room."""
+
+    def test_the_review_is_the_hosts_alone(self):
+        self.assertEqual(self.get("/api/review", auth=False)[0], 401)
+        self.assertEqual(self.get("/api/review", token=WILL_TOKEN)[0], 403)
+        self.assertEqual(self.get("/api/reports", token=WILL_TOKEN)[0], 403)
+
+    def test_review_pick_and_apply_go_through_the_script(self):
+        script = self.board.parent / "fake-review.py"
+        script.write_text(
+            "import json,sys\n"
+            "if sys.argv[1] == 'pick':\n"
+            "    print(json.dumps({'asked_at':'now','batch':[{'slug':'x','version':2,"
+            "'why':'unverified','claim':'a claim','origin':'dream-summary'}]}))\n"
+            "else:\n"
+            "    import pathlib\n"
+            "    print(json.dumps({'applied':[{'slug':'x','result':'confirmed'}]}))\n")
+        old = serve.FACT_REVIEW
+        serve.FACT_REVIEW = script
+        try:
+            code, body = self.get("/api/review")
+            self.assertEqual(code, 200)
+            self.assertEqual(json.loads(body)["batch"][0]["slug"], "x")
+            req = urllib.request.Request(self.base + "/api/review", method="POST",
+                                         data=json.dumps({"answers": [
+                                             {"slug": "x", "version": 2, "choice": "still_true"}]}).encode())
+            req.add_header("content-type", "application/json")
+            req.add_header("authorization", "Bearer " + TOKEN)
+            with urllib.request.urlopen(req, timeout=5) as fh:
+                out = json.loads(fh.read())
+            self.assertEqual(out["applied"][0]["result"], "confirmed")
+        finally:
+            serve.FACT_REVIEW = old
+
+    def test_reports_read_only_from_the_allowlist(self):
+        from tempfile import TemporaryDirectory as T
+        with T() as tmp:
+            d = Path(tmp) / "reviews"
+            d.mkdir()
+            (d / "note.md").write_text("# A title\n\nbody\n")
+            (d.parent / "outside.md").write_text("secret\n")
+            old = serve.REPORT_DIRS
+            serve.REPORT_DIRS = [d]
+            try:
+                code, body = self.get("/api/reports")
+                self.assertEqual(code, 200)
+                self.assertEqual(json.loads(body)["reports"][0]["title"], "A title")
+                code, body = self.get("/api/report?name=reviews/note.md")
+                self.assertEqual(code, 200)
+                self.assertIn("body", json.loads(body)["text"])
+                self.assertEqual(self.get("/api/report?name=reviews/../outside.md")[0], 404)
+                self.assertEqual(self.get("/api/reports", token=WILL_TOKEN)[0], 403)
+            finally:
+                serve.REPORT_DIRS = old
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

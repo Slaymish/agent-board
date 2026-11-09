@@ -38,6 +38,7 @@ import os
 import secrets
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.cookies import SimpleCookie
@@ -53,6 +54,16 @@ import board_log  # noqa: E402  (the one write path; do not duplicate id/locking
 ROOM = "humans"
 COOKIE = "hc"
 MAX_TEXT = board_log.MAX_TEXT
+
+# The review and the reports are this person's own material, not the shared room's.
+FACT_REVIEW = Path.home() / ".hermes" / "scripts" / "facts-review.py"
+REPORT_DIRS = [
+    Path.home() / "agent-system" / "plans" / "reviews",
+    Path.home() / ".hermes" / "data" / "lottery-scanner",
+    Path.home() / ".hermes" / "data" / "journal-clearance",
+    Path.home() / ".hermes" / "data" / "recs",
+]
+REPORT_MAX = 200_000
 
 # The page is deliberately one file with no assets and no framework: it has to open on
 # a phone over the tailnet, and a board that needs a build has a second way to be down.
@@ -82,6 +93,10 @@ DENIED = """<!doctype html><meta name="viewport" content="width=device-width, in
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _stamp(epoch: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch))
 
 
 class App:
@@ -220,6 +235,74 @@ class App:
                          "text": text if len(text) <= 400 else text[:399] + "…"})
         hits.sort(key=lambda r: (r.get("ts", ""), r.get("id", "")), reverse=True)
         return hits[:limit]
+
+    def review_pick(self, limit: int = 5) -> dict:
+        """The review queue, from the script that already owns the selection rules.
+
+        This is a form over an existing decision procedure, not a second one: which
+        claims are worth a person's attention is `facts-review.py`'s job.
+        """
+        done = subprocess.run([sys.executable, str(FACT_REVIEW), "pick", "--limit", str(limit)],
+                              capture_output=True, text=True, timeout=60)
+        if done.returncode != 0:
+            raise RuntimeError((done.stderr or done.stdout).strip()[:400] or "review unavailable")
+        return json.loads(done.stdout)
+
+    def review_apply(self, answers: list[dict]) -> dict:
+        """Apply one batch, bound to the revision each question was asked against."""
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump({"answers": answers}, fh)
+            path = fh.name
+        try:
+            done = subprocess.run([sys.executable, str(FACT_REVIEW), "apply", "--answers", path],
+                                  capture_output=True, text=True, timeout=120)
+            if done.returncode != 0:
+                raise RuntimeError((done.stderr or done.stdout).strip()[:400] or "apply failed")
+            return json.loads(done.stdout)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def reports(self) -> list[dict]:
+        out = []
+        for directory in REPORT_DIRS:
+            if not directory.is_dir():
+                continue
+            for path in directory.glob("*.md"):
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                title = path.stem.replace("-", " ").replace("_", " ")
+                try:
+                    for line in path.read_text(errors="replace").splitlines()[:12]:
+                        if line.startswith("# "):
+                            title = line[2:].strip()
+                            break
+                except OSError:
+                    pass
+                out.append({"name": f"{directory.name}/{path.name}", "title": title,
+                            "mtime": _stamp(st.st_mtime), "bytes": st.st_size})
+        out.sort(key=lambda r: r["mtime"], reverse=True)
+        return out[:60]
+
+    def report_text(self, name: str) -> str | None:
+        wanted = str(name or "")
+        for directory in REPORT_DIRS:
+            if not wanted.startswith(directory.name + "/"):
+                continue
+            path = (directory / wanted.split("/", 1)[1]).resolve()
+            if path.parent != directory.resolve() or path.suffix != ".md":
+                return None
+            try:
+                if path.stat().st_size > REPORT_MAX:
+                    return None
+                return path.read_text(errors="replace")
+            except OSError:
+                return None
+        return None
 
     def pull(self) -> None:
         if self.git and self.pull_every:
@@ -453,7 +536,50 @@ def make_handler(app: App):
                     rows = rows[ids.index(since) + 1:] if since in ids else rows
                 me = app.who(self._token())
                 self._json(200, {"ok": True, "me": me, "peer": app.peer(me),
+                                 "host": me == app.local_human,
                                  "messages": rows, "server_time": _now()})
+                return
+            if url.path == "/api/review":
+                who = app.who(self._token())
+                if who is None:
+                    self._json(401, {"ok": False, "error": "needs the channel link"})
+                    return
+                if who != app.local_human:
+                    # A review is about whose memory it is. The other person's link
+                    # must not read, answer or even see this person's facts.
+                    self._json(403, {"ok": False, "error": "this review belongs to the host"})
+                    return
+                if self.command == "POST":
+                    self._json(405, {"ok": False, "error": "post answers to the same path"})
+                    return
+                limit = int((parse_qs(url.query).get("limit") or ["5"])[0] or 5)
+                try:
+                    self._json(200, {"ok": True, **app.review_pick(max(1, min(limit, 20)))})
+                except (RuntimeError, ValueError) as e:
+                    self._json(503, {"ok": False, "error": str(e)})
+                return
+            if url.path == "/api/reports":
+                who = app.who(self._token())
+                if who is None:
+                    self._json(401, {"ok": False, "error": "needs the channel link"})
+                    return
+                if who != app.local_human:
+                    self._json(403, {"ok": False, "error": "reports belong to the host"})
+                    return
+                self._json(200, {"ok": True, "reports": app.reports()})
+                return
+            if url.path == "/api/report":
+                who = app.who(self._token())
+                if who is None:
+                    self._json(401, {"ok": False, "error": "needs the channel link"})
+                    return
+                if who != app.local_human:
+                    self._json(403, {"ok": False, "error": "reports belong to the host"})
+                    return
+                name = (parse_qs(url.query).get("name") or [""])[0]
+                text = app.report_text(name)
+                self._json(200 if text is not None else 404,
+                           {"ok": text is not None, "name": name, "text": text})
                 return
             if url.path == "/api/record":
                 if not self._authed():
@@ -505,6 +631,34 @@ def make_handler(app: App):
 
         def do_POST(self) -> None:
             url = urlparse(self.path)
+            if url.path == "/api/review":
+                who = app.who(self._token())
+                if who is None:
+                    self._json(401, {"ok": False, "error": "needs the channel link"})
+                    return
+                if who != app.local_human:
+                    self._json(403, {"ok": False, "error": "this review belongs to the host"})
+                    return
+                if "application/json" not in (self.headers.get("content-type") or ""):
+                    self._json(415, {"ok": False, "error": "send JSON"})
+                    return
+                length = int(self.headers.get("content-length") or 0)
+                if length <= 0 or length > 64_000:
+                    self._json(413, {"ok": False, "error": "answers missing or too large"})
+                    return
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    answers = body.get("answers") or []
+                    if not isinstance(answers, list):
+                        raise ValueError("answers must be a list")
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+                    self._json(400, {"ok": False, "error": str(e) or "body is not JSON"})
+                    return
+                try:
+                    self._json(200, {"ok": True, **app.review_apply(answers)})
+                except RuntimeError as e:
+                    self._json(503, {"ok": False, "error": str(e)})
+                return
             if url.path != "/api/post":
                 self._json(404, {"ok": False, "error": "no such path"})
                 return

@@ -132,6 +132,44 @@
   .result .snip { display: block; margin-top: 2px; color: var(--quiet); font-size: 14px; }
   .result b { font-weight: 600; background: rgba(127, 118, 100, .16); border-radius: 2px; }
 
+  /* ---------- review: a form over the fact store's own questions ---------- */
+  .review { display: grid; gap: 16px; max-width: var(--measure); }
+  .rcard { border-left: 2px solid var(--rule); padding: 0 0 2px 12px; display: grid; gap: 7px; }
+  .rcard .why {
+    font: 11px/1.4 var(--mono); color: var(--quiet); letter-spacing: .02em;
+  }
+  .rcard .claim { font-size: 16px; line-height: 1.45; }
+  .rcard .choices { display: flex; gap: 6px; flex-wrap: wrap; }
+  .rcard .choices button {
+    border: 1px solid var(--rule); background: none; color: var(--ink);
+    border-radius: 999px; padding: 6px 12px; font: 600 11.5px/1.2 var(--sans);
+    letter-spacing: .06em; text-transform: lowercase; cursor: pointer;
+  }
+  .rcard .choices button[aria-pressed="true"] {
+    background: var(--ink); color: var(--paper); border-color: var(--ink);
+  }
+  .rcard textarea {
+    width: 100%; border: 1px solid var(--rule); border-radius: 8px;
+    background: none; color: var(--ink); font: 15px/1.45 var(--serif);
+    padding: 8px 10px; resize: vertical; min-height: 34px;
+  }
+  .review .send { justify-self: start; }
+
+  /* ---------- reports: what was written, readable ---------- */
+  .rlist { display: grid; gap: 0; max-width: var(--measure); }
+  .rlist button {
+    text-align: left; border: 0; border-bottom: 1px solid var(--rule);
+    background: none; color: var(--ink); padding: 12px 0; cursor: pointer;
+    font: 15.5px/1.4 var(--serif); display: grid; gap: 2px;
+  }
+  .rlist .meta { font: 11px/1.4 var(--mono); color: var(--quiet); letter-spacing: .02em; }
+  .reader { max-width: var(--measure); }
+  .reader pre {
+    white-space: pre-wrap; overflow-wrap: anywhere; font: 14.5px/1.55 var(--mono);
+    margin: 0; color: var(--ink);
+  }
+  .reader .back { margin-bottom: 10px; }
+
   /* ---------- the page ---------- */
   main {
     flex: 1; width: 100%; max-width: calc(var(--sheet) + 2 * var(--gutter));
@@ -193,7 +231,8 @@
   }
   .ref:hover { opacity: 1; }
   /* reading the agents' side is not a place to type: the composer belongs to the room */
-  .view-work #composer, .view-work #replying { display: none; }
+  .view-work #composer, .view-work #replying,
+  .view-readonly #composer, .view-readonly #replying { display: none; }
 
   /* ---------- work: the agents' side, read-only, adjacent ---------- */
   .work { display: grid; gap: 18px; max-width: var(--measure); }
@@ -312,6 +351,8 @@
   <nav class="tabs" role="tablist" aria-label="rooms">
     <button class="tab" id="tab-human" type="button" role="tab" aria-selected="true">human</button>
     <button class="tab" id="tab-work" type="button" role="tab" aria-selected="false">work</button>
+    <button class="tab" id="tab-review" type="button" role="tab" aria-selected="false" hidden>review</button>
+    <button class="tab" id="tab-reports" type="button" role="tab" aria-selected="false" hidden>reports</button>
   </nav>
   <div class="tools">
     <button class="icon" id="search-open" type="button" aria-label="search" title="search"></button>
@@ -355,7 +396,8 @@
 <script>
 const state = { me: "?", peer: "?", messages: [], sending: false, reply: null,
                 submission: null, work: [], focusWork: null, roomView: "lines",
-                whoFilter: "all",
+                whoFilter: "all", host: false, review: [], answers: {}, reviewNote: "",
+                reports: [], openReport: null,
                 view: "lines" };
 const VIEW_KEY = "hc.view";
 try {
@@ -557,10 +599,181 @@ function note(r, first) {
 // agents' side, read-only, so a note can be followed to what it caused.
 function render() {
   syncChrome();
-  document.body.classList.toggle("view-work", state.view === "work");
+  const tab = currentTab();
+  document.body.classList.toggle("view-work", tab === "work");
+  document.body.classList.toggle("view-readonly", tab === "review" || tab === "reports");
   if (state.view === "work") { renderWork(); return; }
+  if (state.view === "review") { renderReview(); return; }
+  if (state.view === "reports") { renderReports(); return; }
   if (state.view === "canvas") { renderCanvas(); return; }
   renderLines();
+}
+
+// ---------- review: the fact store's questions, answerable here ----------
+function renderReview() {
+  const thread = $("thread");
+  thread.textContent = "";
+  const wrap = document.createElement("section");
+  wrap.className = "review";
+  const lede = document.createElement("p");
+  lede.className = "lede";
+  lede.textContent = "what i think i know about you, and how sure i am. one tap, or say it properly.";
+  wrap.append(lede);
+  if (!state.review.length) {
+    const p = document.createElement("p");
+    p.id = "empty";
+    p.textContent = state.reviewNote || "nothing due just now.";
+    wrap.append(p);
+    const again = document.createElement("button");
+    again.type = "button"; again.className = "send"; again.textContent = "check again";
+    again.addEventListener("click", async () => { await loadReview(); render(); });
+    wrap.append(again);
+    thread.append(wrap);
+    return;
+  }
+  for (const q of state.review) {
+    const card = document.createElement("article");
+    card.className = "rcard";
+    const why = document.createElement("div");
+    why.className = "why";
+    why.textContent = [q.why, q.origin, q.last_confirmed ? "last confirmed " + q.last_confirmed : ""]
+      .filter(Boolean).join(" · ");
+    const claim = document.createElement("div");
+    claim.className = "claim";
+    claim.textContent = q.claim;
+    const choices = document.createElement("div");
+    choices.className = "choices";
+    for (const [value, label] of [["still_true", "still true"], ["no_longer", "no longer"],
+                                  ["skip", "skip"]]) {
+      const b = document.createElement("button");
+      b.type = "button"; b.textContent = label;
+      b.setAttribute("aria-pressed", (state.answers[q.slug] || {}).choice === value ? "true" : "false");
+      b.addEventListener("click", () => {
+        state.answers[q.slug] = {...(state.answers[q.slug] || {}), choice: value, text: ""};
+        render();
+      });
+      choices.append(b);
+    }
+    const box = document.createElement("textarea");
+    box.rows = 1;
+    box.placeholder = "or say it properly";
+    box.value = (state.answers[q.slug] || {}).text || "";
+    box.addEventListener("input", () => {
+      const entry = state.answers[q.slug] || {};
+      entry.text = box.value;
+      entry.choice = box.value.trim() ? "" : entry.choice;
+      state.answers[q.slug] = entry;
+    });
+    card.append(why, claim, choices, box);
+    wrap.append(card);
+  }
+  const send = document.createElement("button");
+  send.type = "button"; send.className = "send"; send.textContent = "send answers";
+  send.addEventListener("click", async () => {
+    const answers = state.review
+      .map((q) => ({slug: q.slug, version: q.version,
+                    choice: (state.answers[q.slug] || {}).choice || "",
+                    text: ((state.answers[q.slug] || {}).text || "").trim()}))
+      .filter((a) => a.choice || a.text);
+    if (!answers.length) { flash("nothing chosen"); return; }
+    send.disabled = true;
+    try {
+      const res = await fetch("/api/review", {
+        method: "POST", headers: {"content-type": "application/json"},
+        body: JSON.stringify({answers})
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
+      const applied = data.applied || [];
+      state.answers = {};
+      state.reviewNote = applied.map((a) => a.slug + ": " + (a.result || a.why || "?")).join(" · ");
+      await loadReview();
+      render();
+      flash(applied.length + (applied.length === 1 ? " answer applied" : " answers applied"));
+    } catch (e) {
+      status("not saved: " + e.message, true);
+    } finally {
+      send.disabled = false;
+    }
+  });
+  wrap.append(send);
+  thread.append(wrap);
+}
+
+async function loadReview() {
+  try {
+    const res = await fetch("/api/review?limit=5");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    state.review = data.batch || [];
+    if (!state.review.length && !state.reviewNote) state.reviewNote = "nothing due just now.";
+  } catch (e) {
+    state.review = [];
+    state.reviewNote = "the review is unreachable: " + e.message;
+  }
+}
+
+// ---------- reports: the written things, openable ----------
+async function loadReports() {
+  try {
+    const res = await fetch("/api/reports");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    state.reports = (await res.json()).reports || [];
+  } catch (e) {
+    state.reports = [];
+    status("reports unreachable: " + e.message, true);
+  }
+}
+
+async function openReport(name) {
+  try {
+    const res = await fetch("/api/report?name=" + encodeURIComponent(name));
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
+    state.openReport = {name, text: data.text || ""};
+    render();
+  } catch (e) {
+    status("could not open that report: " + e.message, true);
+  }
+}
+
+function renderReports() {
+  const thread = $("thread");
+  thread.textContent = "";
+  if (state.openReport) {
+    const wrap = document.createElement("section");
+    wrap.className = "reader";
+    const back = document.createElement("button");
+    back.type = "button"; back.className = "ref back"; back.textContent = "all reports";
+    back.addEventListener("click", () => { state.openReport = null; render(); });
+    const pre = document.createElement("pre");
+    pre.textContent = state.openReport.text;
+    wrap.append(back, pre);
+    thread.append(wrap);
+    return;
+  }
+  const wrap = document.createElement("section");
+  wrap.className = "rlist";
+  const lede = document.createElement("p");
+  lede.className = "lede";
+  lede.textContent = "the things that were written down.";
+  wrap.append(lede);
+  if (!state.reports.length) {
+    const p = document.createElement("p"); p.id = "empty";
+    p.textContent = "nothing written yet.";
+    wrap.append(p);
+  }
+  for (const r of state.reports) {
+    const b = document.createElement("button");
+    b.type = "button";
+    const title = document.createElement("span"); title.textContent = r.title;
+    const meta = document.createElement("span"); meta.className = "meta";
+    meta.textContent = r.name + " · " + r.mtime;
+    b.append(title, meta);
+    b.addEventListener("click", () => openReport(r.name));
+    wrap.append(b);
+  }
+  thread.append(wrap);
 }
 
 function renderWork() {
@@ -729,7 +942,7 @@ async function load(first) {
     const res = await fetch("/api/state", { headers: { "accept": "application/json" } });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
-    state.me = data.me; state.peer = data.peer;
+    state.me = data.me; state.peer = data.peer; state.host = !!data.host;
     $("title").textContent = [data.me, data.peer].sort().join(" + ");
     $("text").placeholder = "write to " + data.peer;
     if (first) restoreDraft();
@@ -784,12 +997,21 @@ async function send(text) {
 // The page is two rooms, so it says so: a tab strip for room, one control row for how
 // the room is drawn (human) or whose work is shown (work). A tab is the way back; there
 // is no separate "return", because two visible tabs already are one.
+function currentTab() {
+  if (state.view === "work") return "work";
+  if (state.view === "review") return "review";
+  if (state.view === "reports") return "reports";
+  return "human";
+}
+
 function syncChrome() {
-  const work = state.view === "work";
-  $("tab-human").setAttribute("aria-selected", work ? "false" : "true");
-  $("tab-work").setAttribute("aria-selected", work ? "true" : "false");
-  $("seg-layout").hidden = work;
-  $("seg-who").hidden = !work;
+  const tab = currentTab();
+  for (const name of ["human", "work", "review", "reports"]) {
+    $("tab-" + name).setAttribute("aria-selected", tab === name ? "true" : "false");
+    if (name === "review" || name === "reports") $("tab-" + name).hidden = !state.host;
+  }
+  $("seg-layout").hidden = tab !== "human";
+  $("seg-who").hidden = tab !== "work";
   $("seg-lines").setAttribute("aria-pressed", state.view === "lines" ? "true" : "false");
   $("seg-canvas").setAttribute("aria-pressed", state.view === "canvas" ? "true" : "false");
   for (const b of $("seg-who").querySelectorAll("button")) {
@@ -856,10 +1078,13 @@ window.addEventListener("popstate", async ev => {
 });
 async function showTab(name) {
   rememberView();
-  if (state.view !== "work") state.roomView = state.view;
-  state.view = name === "work" ? "work" : (state.roomView || "lines");
+  if (state.view !== "work") state.roomView = state.view === "canvas" ? "canvas" : "lines";
+  if (name === "human") state.view = state.roomView || "lines";
+  else state.view = name;
   retainRecord(null);
   if (state.view === "work") await loadWork();
+  if (state.view === "review") await loadReview();
+  if (state.view === "reports") { state.openReport = null; await loadReports(); }
   history.pushState({}, "");
   render();
   scrollTo(0, roomScroll[state.view] || 0);
@@ -867,6 +1092,8 @@ async function showTab(name) {
 }
 $("tab-human").onclick = () => showTab("human");
 $("tab-work").onclick = () => showTab("work");
+$("tab-review").onclick = () => showTab("review");
+$("tab-reports").onclick = () => showTab("reports");
 $("seg-lines").onclick = () => setLayout("lines");
 $("seg-canvas").onclick = () => setLayout("canvas");
 $("seg-who").onclick = (ev) => {
@@ -1010,6 +1237,8 @@ $("search-open").replaceChildren(ICON_SEARCH());
 syncChrome();
 load(true);
 if (state.view === "work") loadWork().then(render);
+if (state.view === "review") loadReview().then(render);
+if (state.view === "reports") loadReports().then(render);
 </script>
 </body>
 </html>
