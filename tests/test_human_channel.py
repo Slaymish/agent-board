@@ -266,6 +266,27 @@ class HumanChannel(unittest.TestCase):
                               capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stdout)
 
+    def test_the_work_view_skips_delivery_receipts(self):
+        with (self.board / "will-hermes.jsonl").open("a") as fh:
+            fh.write(json.dumps({
+                "id": "will-hermes/0002", "ts": "2026-11-08T11:00:00Z",
+                "author": "will-hermes", "topic": "receipt",
+                "text": "delivered will/0001"}) + "\n")
+        code, body = self.get("/api/work")
+        ids = [r["id"] for r in json.loads(body)["records"]]
+        self.assertNotIn("will-hermes/0002", ids, "a receipt is bookkeeping, not work")
+
+    def test_the_work_view_needs_the_link(self):
+        code, _ = self.get("/api/work", auth=False)
+        self.assertEqual(code, 401)
+
+    def test_the_work_view_shows_agent_records_and_not_the_room(self):
+        code, body = self.get("/api/work")
+        self.assertEqual(code, 200)
+        ids = [r["id"] for r in json.loads(body)["records"]]
+        self.assertIn("will-hermes/0001", ids, "the agents' side should be visible")
+        self.assertNotIn("will/0001", ids, "the humans room is not 'work'")
+
 
 class Guard(unittest.TestCase):
     """The guard has to allow the human and still refuse the other person's file."""
