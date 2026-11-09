@@ -336,20 +336,14 @@ class SaveAndPublish(unittest.TestCase):
         board_log.BOARD, board_log.REPO = self.orig
         self.tmp.cleanup()
 
-    def test_a_commit_failure_leaves_the_note_saved_and_unsent(self):
-        def fake(*args, check=True, **kw):
-            if args and args[0] in ("add", "commit"):
-                raise subprocess.CalledProcessError(1, list(args))
-            return subprocess.CompletedProcess(args, 0, "", "")
-
-        board_log.git = fake
-        app = serve.App(self.board, {"hamish": TOKEN, "will": WILL_TOKEN},
-                        git=True, pull_every=0, publish_every=0)
-        out = app.post("hamish", "still mine")
-        self.assertTrue(out["saved"])
-        self.assertFalse(out["published"])
-        written = (self.board / "hamish.jsonl").read_text()
-        self.assertIn("still mine", written)
+    def test_fsync_failure_does_not_claim_saved_or_publish(self):
+        from unittest.mock import patch
+        app = serve.App(self.board, {"hamish": TOKEN}, git=False)
+        with patch.object(serve.os, "fsync", side_effect=OSError("disk failure")), \
+                patch.object(app, "publish") as publish:
+            with self.assertRaises(OSError):
+                app.post("hamish", "uncertain append")
+            publish.assert_not_called()
 
     def test_a_lost_response_does_not_become_two_notes(self):
         app = serve.App(self.board, {"hamish": TOKEN, "will": WILL_TOKEN},
@@ -360,6 +354,268 @@ class SaveAndPublish(unittest.TestCase):
         self.assertTrue(again.get("repeated"))
         lines = (self.board / "hamish.jsonl").read_text().splitlines()
         self.assertEqual(len(lines), 1, "the retry appended a second record")
+
+
+class RealGitRecovery(HumanChannel):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.board.parent
+        self.remote = self.repo / "remote.git"
+        self.run_git("init", "-q")
+        self.run_git("config", "user.email", "test@example.invalid")
+        self.run_git("config", "user.name", "Test")
+        self.run_git("add", "board")
+        self.run_git("commit", "-qm", "seed")
+        subprocess.run(["git", "init", "--bare", "-q", str(self.remote)], check=True)
+        self.run_git("remote", "add", "origin", str(self.remote))
+        self.run_git("push", "-qu", "origin", "HEAD")
+        self.app.git = True
+
+    def run_git(self, *args):
+        return subprocess.run(["git", "-C", str(self.repo), *args], check=True,
+                              capture_output=True, text=True).stdout
+
+    def test_commit_hook_failure_http_then_background_recovery(self):
+        hook = self.repo / ".git/hooks/pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        unrelated = self.repo / "unrelated"
+        unrelated.write_text("leave staged")
+        self.run_git("add", "unrelated")
+        code, out = self.post({"text": "durable", "client_id": "lost"})
+        self.assertEqual(code, 200)
+        self.assertTrue(out["saved"])
+        self.assertFalse(out["published"])
+        hook.unlink()
+        self.app.publish_every = .05
+        stop = threading.Event()
+        worker = threading.Thread(target=self.app.publish_forever, args=(stop,))
+        worker.start()
+        import time
+        try:
+            deadline = time.monotonic() + 4
+            remote_text = ""
+            while time.monotonic() < deadline:
+                result = subprocess.run(["git", "--git-dir", str(self.remote), "show",
+                                         "HEAD:board/hamish.jsonl"], capture_output=True, text=True)
+                remote_text = result.stdout
+                if "durable" in remote_text:
+                    break
+                time.sleep(.05)
+            self.assertIn("durable", remote_text)
+            self.assertIn("unrelated", self.run_git("diff", "--cached", "--name-only"))
+        finally:
+            stop.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+
+    def test_commit_failure_reaches_actual_git_path(self):
+        from unittest.mock import patch
+        actual = self.app.git_run
+        reached = []
+        def failing(*args, **kwargs):
+            if args[0] == "commit":
+                reached.append(args)
+                raise subprocess.CalledProcessError(1, args)
+            return actual(*args, **kwargs)
+        with patch.object(self.app, "git_run", side_effect=failing):
+            out = self.app.post("hamish", "saved despite commit failure")
+        self.assertTrue(reached)
+        self.assertTrue(out["saved"])
+        self.assertFalse(out["published"])
+
+    def advance_remote(self, filename):
+        clone = self.repo / "second"
+        with (self.repo / ".git/info/exclude").open("a") as stream:
+            stream.write("second/\nremote.git/\n")
+        subprocess.run(["git", "clone", "-q", str(self.remote), str(clone)], check=True)
+        def git(*args):
+            return subprocess.run(["git", "-C", str(clone), *args], check=True,
+                                  capture_output=True, text=True)
+        git("config", "user.email", "second@example.invalid")
+        git("config", "user.name", "Second")
+        with (clone / "board" / filename).open("a") as stream:
+            author = Path(filename).stem
+            stream.write(json.dumps({"id": author + "/0002", "author": author,
+                                     "text": "remote advancement", "ts": "2026-11-08T12:00:00Z",
+                                     "room": "agents" if author.endswith("hermes") else "humans",
+                                     "via": "agent" if author.endswith("hermes") else "human"}) + "\n")
+        git("add", "board/" + filename)
+        git("commit", "-qm", "remote advancement")
+        git("push", "-q")
+
+    def pending_post(self):
+        hook = self.remote / "hooks/pre-receive"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        self.assertFalse(self.app.post("hamish", "pending human")["published"])
+        hook.unlink()
+
+    def test_disjoint_remote_advance_rebases_pending_human_commit(self):
+        self.pending_post()
+        self.advance_remote("will-hermes.jsonl")
+        self.assertTrue(self.app.publish())
+        body = subprocess.run(["git", "--git-dir", str(self.remote), "show",
+                               "HEAD:board/hamish.jsonl"], check=True,
+                              capture_output=True, text=True).stdout
+        self.assertIn("pending human", body)
+
+    def test_same_file_remote_advance_stays_pending_unchanged(self):
+        self.pending_post()
+        before = self.run_git("rev-parse", "HEAD")
+        body = (self.board / "hamish.jsonl").read_bytes()
+        self.advance_remote("hamish.jsonl")
+        self.assertFalse(self.app.publish())
+        self.assertEqual(before, self.run_git("rev-parse", "HEAD"))
+        self.assertEqual(body, (self.board / "hamish.jsonl").read_bytes())
+        self.assertEqual("", self.run_git("status", "--porcelain", "--untracked-files=no"))
+        self.assertFalse((self.repo / ".git/rebase-merge").exists())
+
+    def test_pull_replacement_and_append_share_repository_lock(self):
+        from unittest.mock import patch
+        import time
+        self.advance_remote("will.jsonl")
+        self.app.pull_every = 1
+        entered = threading.Event()
+        release = threading.Event()
+        actual = self.app.git_run
+        def held(*args, **kwargs):
+            if args[0] == "pull":
+                entered.set()
+                self.assertTrue(release.wait(3))
+            return actual(*args, **kwargs)
+        results = []
+        with patch.object(self.app, "git_run", side_effect=held):
+            puller = threading.Thread(target=self.app.pull)
+            poster = threading.Thread(target=lambda: results.append(self.app.post("will", "after replacement")))
+            puller.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                poster.start()
+                time.sleep(.15)
+                self.assertTrue(poster.is_alive())
+                self.assertNotIn("after replacement", (self.board / "will.jsonl").read_text())
+            finally:
+                release.set()
+                puller.join(4)
+                if poster.ident: poster.join(4)
+        self.assertEqual(len(results), 1)
+        self.assertIn("after replacement", (self.board / "will.jsonl").read_text())
+
+    def test_remote_rejection_and_unavailability_recover(self):
+        hook = self.remote / "hooks/pre-receive"
+        hook.write_text("#!/bin/sh\nexit 1\n"); hook.chmod(0o755)
+        self.assertFalse(self.app.post("hamish", "rejected")["published"])
+        hook.unlink()
+        self.run_git("remote", "set-url", "origin", str(self.repo / "missing"))
+        self.assertFalse(self.app.publish())
+        self.run_git("remote", "set-url", "origin", str(self.remote))
+        self.assertTrue(self.app.publish())
+
+    def test_restart_author_scope_and_concurrent_duplicates(self):
+        first = self.app.post("hamish", "once", client_id="same")
+        app = serve.App(self.board, {"hamish": TOKEN, "will": WILL_TOKEN}, git=False)
+        self.assertEqual(first["record"], app.post("hamish", "once", client_id="same")["record"])
+        other = app.post("will", "other", client_id="same")
+        self.assertEqual(other["record"]["author"], "will")
+        with self.assertRaises(ValueError):
+            app.post("hamish", "edited", client_id="same")
+        second_app = serve.App(self.board, {"hamish": TOKEN}, git=False)
+        threads = [threading.Thread(target=(app if n % 2 else second_app).post, args=("hamish", "parallel"),
+                                    kwargs={"client_id": "parallel"}) for n in range(8)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        rows = board_log.records(self.board / "hamish.jsonl")
+        self.assertEqual(sum(r.get("client_id") == "parallel" for r in rows), 1)
+
+    def test_exact_old_full_reference_and_auth(self):
+        with (self.board / "will-hermes.jsonl").open("a") as stream:
+            for n in range(2, 32):
+                stream.write(json.dumps({"id": f"will-hermes/{n:04d}", "author": "will-hermes",
+                    "room": "agents", "text": "x" * 1800, "ts": "2026-11-08T11:00:00Z"}) + "\n")
+        self.assertEqual(self.get("/api/record?id=will-hermes/0002", auth=False)[0], 401)
+        code, body = self.get("/api/record?id=will-hermes/0002")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(json.loads(body)["record"]["text"]), 1800)
+        self.assertNotIn("will-hermes/0002", [r["id"] for r in self.app.work()])
+        self.assertEqual(self.get("/api/record?id=missing/0001")[0], 404)
+        self.assertEqual(json.loads(self.get("/api/record?id=will/0001")[1])["record"]["room"], "humans")
+
+
+class PageNavigation(unittest.TestCase):
+    def test_exact_links_history_focus_scroll_and_refresh(self):
+        page = (HERE.parent / "human/page.html").read_text()
+        linkify = page[page.index("function linkify("):page.index("function snippet(")]
+        navigation = page[page.index("let navDepth ="):page.index('$("composer").addEventListener')]
+        load_work = page[page.index("async function loadWork()"):page.index("// Following a reference")]
+        harness = r"""
+const assert = require('node:assert/strict');
+let scrollY = 310;
+const scrollTo = (x, y) => { scrollY = y; };
+const requestAnimationFrame = fn => fn();
+const elements = new Map();
+const $ = id => { if (!elements.has(id)) elements.set(id, {}); return elements.get(id); };
+let pop;
+const window = {addEventListener: (name, fn) => { pop = fn; }};
+const document = {
+  createTextNode: text => ({textContent: text}),
+  createElement: tag => ({tag, style: {}, addEventListener() {}}),
+  querySelectorAll: () => rendered.map(r => ({dataset: {id:r.id}, scrollIntoView() {scrollY = 777;}}))
+};
+const state = {view:'lines', roomView:'lines', messages:[], work:[], focusWork:null};
+let rendered = [];
+function render() { rendered = state.view === 'work' ? state.work : state.messages; }
+function paintViewIcon() {}
+function status(message) { throw new Error(message); }
+const rows = {
+ 'will-hermes/0001': {id:'will-hermes/0001', room:'agents', text:'A full record'},
+ 'will-hermes/0002': {id:'will-hermes/0002', room:'agents', text:'B full record'}
+};
+async function fetch(url) {
+ return {ok:true, json:async () => url.startsWith('/api/record') ?
+   {record:rows[decodeURIComponent(url.split('=')[1])]} : {records:[]}};
+}
+const entries = [{}]; let cursor = 0;
+const history = {
+ replaceState(value) { entries[cursor] = structuredClone(value); },
+ pushState(value) { entries.splice(++cursor); entries[cursor] = structuredClone(value); },
+ async back() { if (cursor) await pop({state:entries[--cursor]}); },
+ async forward() { await pop({state:entries[++cursor]}); }
+};
+"""
+        checks = r"""
+(async () => {
+ assert.equal(linkify('will-hermes/10000').filter(x=>x.tag==='button').length, 0);
+ for (const bad of ['xwill-hermes/1000', 'will-hermes/1000x', 'will-hermes/1000/extra', 'will-hermes/10000'])
+   assert.equal(linkify(bad).filter(x=>x.tag==='button').length, 0, bad);
+ assert.equal(linkify('(will-hermes/1000)').filter(x=>x.tag==='button').length, 1);
+ assert.equal($('return').hidden, true);
+ await openWork('will-hermes/0001');
+ assert.equal(entries[cursor].y, 777);
+ scrollY = 888;
+ await openWork('will-hermes/0002');
+ assert.equal(state.focusWork, 'will-hermes/0002');
+ await history.back();
+ assert.equal(state.focusWork, 'will-hermes/0001');
+ assert.equal(state.work.find(r=>r.id===state.focusWork).text, 'A full record');
+ assert.equal(scrollY, 888);
+ await loadWork(); render();
+ assert.equal(state.work.find(r=>r.id===state.focusWork).text, 'A full record');
+ await history.back();
+ assert.equal(state.view, 'lines'); assert.equal(scrollY, 310);
+ assert.equal($('return').hidden, true);
+ $('return').onclick(); assert.equal(cursor, 0);
+ await history.forward(); assert.equal(state.focusWork, 'will-hermes/0001');
+ await history.back();
+ await $('rooms').onclick(); scrollY = 456;
+ await $('rooms').onclick(); assert.equal(scrollY, 310);
+ await $('rooms').onclick(); assert.equal(scrollY, 456);
+})().catch(e => { console.error(e); process.exitCode=1; });
+"""
+        done = subprocess.run(["node"], input=harness + linkify + load_work + navigation + checks,
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('[hidden] { display: none !important; }', page)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
