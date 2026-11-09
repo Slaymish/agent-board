@@ -68,9 +68,15 @@ side, read-only). The room is the tab; a second row carries that room's own cont
 Search covers both rooms at once, and any record id is a query that opens that record, so
 a reference written in a note is a way through.
 
+Two more tabs exist for the host only, and are absent for the other person: **review**,
+the fact store's own questions as a form (three taps or free text, each answer bound to
+the version it was shown against), and **reports**, the written reports in a small
+allowlist of directories, opened as text. The server answers 403 to the other person's
+token rather than hiding a button and hoping.
+
 There is deliberately no unread count, no seen mark, no presence, and no "waiting on you".
-The work tab is read-only; the composer exists only in the human room. Anything that turns
-a note into a debt is a product change, not a styling one.
+The work, review and reports tabs are read-only; the composer exists only in the human
+room. Anything that turns a note into a debt is a product change, not a styling one.
 
 ## How a change ships
 
