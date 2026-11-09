@@ -88,28 +88,31 @@ PAGE = """<!doctype html>
   }
   .who { font-family: var(--mono); font-size: 11px; color: var(--quiet); margin-left: auto;
          letter-spacing: .02em; }
-  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--quiet);
-         align-self: center; flex: none; }
-  .dot.live { background: var(--mine); }
-  .dot.down { background: var(--warn); }
-  main { flex: 1; padding: 8px 18px 20px; }
-  .msg { padding: 14px 0 0; display: grid; grid-template-columns: 3px 1fr; gap: 12px; }
-  .msg + .msg { border-top: 1px solid var(--rule); margin-top: 14px; }
-  .msg.same { border-top: 0; margin-top: 0; padding-top: 8px; }
+  /* No presence indicator: a green dot beside a name reads as "they are here, why
+     haven't they answered". Connection trouble shows in the status line instead. */
+  main { flex: 1; padding: 4px 18px 24px; }
+  /* One column, not two sides. There is no left and right, because a reply is not
+     what this is for: a run of notes from one person is normal and does not stack up
+     against anything. The author's name appears once per run per day; the time sits
+     in the margin where it can be read or ignored. */
+  .note { display: grid; grid-template-columns: 44px 1fr; gap: 14px; padding-top: 9px; }
+  .note.first { margin-top: 16px; }
+  .note .when {
+    font-family: var(--mono); font-size: 10px; color: var(--quiet);
+    text-align: right; padding-top: 6px; font-variant-numeric: tabular-nums;
+  }
+  .note .name {
+    font-family: var(--sans); font-size: 11px; letter-spacing: .13em;
+    text-transform: lowercase; margin: 0 0 2px;
+  }
+  .note.mine .name { color: var(--mine); }
+  .note.theirs .name { color: var(--theirs); }
   .day {
     font-family: var(--mono); font-size: 11px; letter-spacing: .08em;
     text-transform: uppercase; color: var(--quiet);
-    margin: 22px 0 4px; padding-bottom: 6px; border-bottom: 1px solid var(--rule);
+    margin: 26px 0 4px; padding-bottom: 6px; border-bottom: 1px solid var(--rule);
   }
   .day:first-child { margin-top: 8px; }
-  .msg .bar { background: var(--theirs); border-radius: 2px; }
-  .msg.me .bar { background: var(--mine); }
-  .meta {
-    font-family: var(--sans); font-size: 11px; letter-spacing: .1em;
-    text-transform: lowercase; color: var(--quiet);
-    display: flex; gap: 8px; align-items: baseline;
-  }
-  .meta time { font-family: var(--mono); letter-spacing: 0; }
   .text { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 3px; }
   .text a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 2px; }
   #empty { color: var(--quiet); font-size: 15px; padding: 28px 0; }
@@ -140,7 +143,6 @@ PAGE = """<!doctype html>
 </head>
 <body>
 <header>
-  <span class="dot" id="dot"></span>
   <h1 id="title">hamish + will</h1>
   <span class="who" id="who">humans</span>
 </header>
@@ -187,23 +189,23 @@ function linkify(text) {
   });
 }
 
-function line(r, showMeta) {
+function line(r, first) {
+  const mine = r.author === state.me;
   const el = document.createElement("article");
-  el.className = "msg" + (r.author === state.me ? " me" : "") + (showMeta ? "" : " same");
+  el.className = "note" + (mine ? " mine" : " theirs") + (first ? " first" : "");
   el.dataset.id = r.id;
-  const bar = document.createElement("div"); bar.className = "bar";
+  const when = document.createElement("time"); when.className = "when";
+  when.textContent = stamp(r.ts); when.title = new Date(r.ts).toString();
   const body = document.createElement("div");
-  if (showMeta) {
-    const meta = document.createElement("div"); meta.className = "meta";
-    const who = document.createElement("span"); who.textContent = r.author === state.me ? "you" : r.author;
-    const time = document.createElement("time"); time.textContent = stamp(r.ts);
-    meta.append(who, time);
-    body.append(meta);
+  if (first) {
+    const name = document.createElement("div"); name.className = "name";
+    name.textContent = r.author;
+    body.append(name);
   }
   const text = document.createElement("div"); text.className = "text";
   text.append(...linkify(r.text || ""));
   body.append(text);
-  el.append(bar, body);
+  el.append(when, body);
   return el;
 }
 
@@ -224,12 +226,13 @@ function render() {
       thread.append(sep);
       lastDay = day; prev = null;
     }
-    const close = prev && prev.author === r.author &&
-      (new Date(r.ts) - new Date(prev.ts)) < 10 * 60000;
-    thread.append(line(r, !close));
+    // A run is one person on one day. Twenty notes and one reply is the normal shape,
+    // so nothing here groups, counts or orders them into an exchange.
+    const first = !prev || prev.author !== r.author;
+    thread.append(line(r, first));
     prev = r;
   }
-  window.scrollTo({ top: document.body.scrollHeight, behavior: "instant" });
+  if (atBottom) window.scrollTo({ top: document.body.scrollHeight, behavior: "instant" });
 }
 
 function status(msg, bad) {
@@ -247,10 +250,8 @@ async function load(first) {
     $("text").placeholder = "write to " + data.peer;
     state.messages = data.messages;
     render();
-    $("dot").className = "dot live";
     status("");
   } catch (e) {
-    $("dot").className = "dot down";
     status("not reaching the board: " + e.message, true);
   }
 }
