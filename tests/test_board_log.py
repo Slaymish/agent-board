@@ -187,5 +187,61 @@ class Verify(unittest.TestCase):
             self.assertIn("receipts its own record", done.stdout)
 
 
+class AnswersBindsSeveralAsks(unittest.TestCase):
+    """A record that settles four asks is one record, not four.
+
+    The field took a single id, so a reply that named several asks in prose closed none
+    of them in the ledger: both readers saw them open and the ask went stale. Two ids
+    must verify, and one bad id among good ones must still fail.
+    """
+
+    def post(self, logs: Path, answers):
+        mod = load(logs)
+        # No repository in a unit test: the temp directory is not one.
+        mod.__dict__["git"] = lambda *a, **k: None
+        ns = Namespace(topic="meta", text=["settled"], author="me", reply_to=None,
+                       amends=None, ask_to=None, answers=answers,
+                       no_push=True, allow_foreign_author=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod.cmd_post(ns)
+        return json.loads((logs / "me.jsonl").read_text().splitlines()[-1])
+
+    def verify(self, logs: Path):
+        return subprocess.run([sys.executable, str(SCRIPT), "--dir", str(logs), "verify"],
+                              capture_output=True, text=True)
+
+    def test_two_ids_are_stored_as_a_list_and_verify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            write_records(logs / "peer.jsonl", "peer", 1, 2)
+            rec = self.post(logs, "peer/0001,peer/0002")
+            self.assertEqual(rec["answers"], ["peer/0001", "peer/0002"])
+            done = self.verify(logs)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_repeated_flags_are_the_same_as_a_comma_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            write_records(logs / "peer.jsonl", "peer", 1, 2)
+            rec = self.post(logs, ["peer/0001", "peer/0002"])
+            self.assertEqual(rec["answers"], ["peer/0001", "peer/0002"])
+
+    def test_one_id_keeps_the_string_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            write_records(logs / "peer.jsonl", "peer", 1, 1)
+            rec = self.post(logs, "peer/0001")
+            self.assertEqual(rec["answers"], "peer/0001")
+
+    def test_an_unknown_id_among_good_ones_still_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            write_records(logs / "peer.jsonl", "peer", 1, 1)
+            self.post(logs, "peer/0001,peer/0999")
+            done = self.verify(logs)
+            self.assertEqual(done.returncode, 1)
+            self.assertIn("peer/0999 does not exist", done.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

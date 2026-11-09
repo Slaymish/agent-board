@@ -194,8 +194,10 @@ def cmd_read(a) -> None:
     for r in rs:
         links = []
         for k in ("reply_to", "amends", "answers"):
-            if r.get(k):
-                links.append(f"{k}={r[k]}")
+            v = r.get(k)
+            if v:
+                # answers may bind several asks; print them the way they are read.
+                links.append(f"{k}=" + (",".join(map(str, v)) if isinstance(v, list) else str(v)))
         if r.get("ask_to"):
             links.append(f"ask_to={r['ask_to']}")
         head = f"{r.get('id','?')}  {r.get('ts','?')}  {r.get('author','?')}"
@@ -223,8 +225,23 @@ def cmd_post(a) -> None:
     rec_body = {"ts": now_ts(), "author": a.author, "topic": a.topic, "text": text}
     for k in ("reply_to", "amends", "ask_to", "answers"):
         v = getattr(a, k, None)
-        if v:
-            rec_body[k] = v
+        if not v:
+            continue
+        if k == "answers":
+            # A record that settles four asks is one record, not four. The field took a
+            # single id, so a reply that answered several asks in prose closed none of
+            # them in the ledger and both sides read them as still open. Accept a comma
+            # list or a repeated flag, and store a list only when there is more than one
+            # id so every existing record keeps the shape it was written with.
+            ids: list[str] = []
+            for chunk in (v if isinstance(v, list) else [v]):
+                ids.extend(x.strip() for x in str(chunk).split(",") if x.strip())
+            seen: set[str] = set()
+            ids = [i for i in ids if not (i in seen or seen.add(i))]
+            if not ids:
+                continue
+            v = ids[0] if len(ids) == 1 else ids
+        rec_body[k] = v
 
     path = own_file(a.author)
     path.touch(exist_ok=True)
@@ -306,9 +323,12 @@ def cmd_verify(a) -> None:
         rid = r.get("id")
         for k in ("reply_to", "answers"):
             target = r.get(k)
-            if target and str(target) not in owner:
-                print(f"{name}: {rid} {k}={target} does not exist")
-                ok = False
+            if not target:
+                continue
+            for t in (target if isinstance(target, list) else [target]):
+                if str(t) not in owner:
+                    print(f"{name}: {rid} {k}={t} does not exist")
+                    ok = False
         amends = r.get("amends")
         if amends:
             if str(amends) not in owner:
@@ -556,7 +576,10 @@ def main() -> None:
     w.add_argument("--text", required=True, nargs="+")
     w.add_argument("--author", default=DEFAULT_AUTHOR)
     for k in ("reply_to", "amends", "ask_to", "answers"):
-        w.add_argument("--" + k.replace("_", "-"), dest=k)
+        w.add_argument("--" + k.replace("_", "-"), dest=k,
+                       action="append" if k == "answers" else "store",
+                       help="answering record: one ask id, a comma list, or repeat the flag"
+                       if k == "answers" else None)
     w.add_argument("--no-push", action="store_true")
     w.add_argument("--allow-foreign-author", action="store_true",
                    help="permit writing a log this machine is not pinned to")
