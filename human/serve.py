@@ -141,6 +141,29 @@ class App:
         out.sort(key=lambda r: (r.get("ts", ""), r.get("id", "")))
         return out
 
+    def work(self, limit: int = 24) -> list[dict]:
+        """The agents' side of the same log, read-only.
+
+        This is what lets a note in the room be followed to the work it caused. It is a
+        reader, not a second client: nothing here writes, and nothing here counts,
+        acknowledges or flags for attention. The room stays the room.
+        """
+        rows = [r for r in board_log.all_records()
+                if (r.get("room") or "shared") in ("agents", "shared")
+                and str(r.get("author")) not in board_log.HUMAN_AUTHORS
+                # Delivery receipts are bookkeeping, not work: a list of "delivered NN"
+                # lines tells a person nothing and buries the notes that do.
+                and str(r.get("topic") or "") != "receipt"
+                and not str(r.get("text") or "").startswith("delivered ")]
+        rows.sort(key=lambda r: (r.get("ts", ""), r.get("id", "")))
+        out = []
+        for r in rows[-limit:]:
+            text = str(r.get("text") or "")
+            out.append({"id": r.get("id"), "ts": r.get("ts"), "author": r.get("author"),
+                        "topic": r.get("topic"), "reply_to": r.get("reply_to"),
+                        "text": text if len(text) <= 700 else text[:699] + "…"})
+        return out
+
     def pull(self) -> None:
         if not self.git or not self.pull_every:
             return
@@ -350,6 +373,12 @@ def make_handler(app: App):
                 me = app.who(self._token())
                 self._json(200, {"ok": True, "me": me, "peer": app.peer(me),
                                  "messages": rows, "server_time": _now()})
+                return
+            if url.path == "/api/work":
+                if not self._authed():
+                    self._json(401, {"ok": False, "error": "needs the channel link"})
+                    return
+                self._json(200, {"ok": True, "records": app.work()})
                 return
             if url.path in ("/", "/index.html"):
                 q = parse_qs(url.query)

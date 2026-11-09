@@ -129,6 +129,45 @@
                       to { box-shadow: inset 3px 0 0 transparent; } }
   .note.fresh, .card.fresh { animation: arrive 1.8s ease-out; }
 
+  /* ---------- a record id in a note is a way through, not decoration ---------- */
+  .ref {
+    font: inherit; color: inherit; background: none; border: 0; padding: 0 1px;
+    border-bottom: 1px dotted currentColor; cursor: pointer; opacity: .8;
+  }
+  .ref:hover { opacity: 1; }
+  /* reading the agents' side is not a place to type: the composer belongs to the room */
+  .view-work #composer, .view-work #replying { display: none; }
+
+  /* ---------- work: the agents' side, read-only, adjacent ---------- */
+  .work { display: grid; gap: 18px; max-width: var(--measure); }
+  .work .lede {
+    font: 13px/1.5 var(--sans); color: var(--quiet); margin: 0 0 2px;
+  }
+  .wcard {
+    border-left: 2px solid var(--rule); padding: 0 0 0 12px;
+    display: grid; gap: 4px;
+  }
+  .wcard.focus { border-left-color: var(--ink); }
+  .wcard .top {
+    display: flex; gap: 8px; align-items: baseline;
+    font: 11.5px/1.4 var(--mono); color: var(--quiet); letter-spacing: .02em;
+  }
+  /* The page already pushes a name to the right of a line (.note .who). Here the meta
+     line is a left-packed row, so undo that inheritance rather than fight it. */
+  .wcard .top > * { margin-left: 0; }
+  .wcard .who { color: var(--theirs); }
+  .wcard .who.mine { color: var(--mine); }
+  .wcard .text {
+    font-size: 15px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere;
+    display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .wcard.open .text { display: block; }
+  .wcard .more {
+    justify-self: start; font: 12px/1 var(--sans); color: var(--quiet);
+    background: none; border: 0; padding: 4px 0; cursor: pointer;
+  }
+
   /* ---------- canvas: notes as objects, replies inside them ---------- */
   .cards { columns: 2; column-gap: 10px; }
   @media (max-width: 339px) { .cards { columns: 1; } }
@@ -233,10 +272,13 @@
 </form>
 <script>
 const state = { me: "?", peer: "?", messages: [], sending: false, reply: null,
-                submission: null,
+                submission: null, work: [], focusWork: null,
                 view: "lines" };
 const VIEW_KEY = "hc.view";
-try { if (localStorage.getItem(VIEW_KEY) === "canvas") state.view = "canvas"; } catch (e) {}
+try {
+  const saved = localStorage.getItem(VIEW_KEY);
+  if (saved === "canvas" || saved === "work") state.view = saved;
+} catch (e) {}
 const $ = (id) => document.getElementById(id);
 
 // Icons are built as elements, not markup: nothing here takes a string from the log.
@@ -271,6 +313,13 @@ const ICON_CANVAS = () => icon([], [
   { x: 9, y: 8.5, width: 5, height: 5, rx: 1 }
 ]);
 const ICON_REFRESH = () => icon(["M13.4 6.6A5.6 5.6 0 1 0 13 10.4", "M13.6 2.7v4h-4"]);
+const ICON_WORK = () => icon([], [
+  { x: 2, y: 3, width: 3, height: 3, rx: 1 },
+  { x: 3.5, y: 7.5, width: 8, height: 2, rx: 1 },
+  { x: 3.5, y: 11, width: 5.5, height: 2, rx: 1 }
+]);
+const ID_RE = /\b(?:hamish-hermes|will-hermes|hamish|will)\/\d{4}\b/g;
+const AGENT_NAMES = { "hamish-hermes": "elio", "will-hermes": "zeta" };
 
 // A half-finished thought should survive closing the page, because nothing here is
 // urgent. Kept per person, on the device, cleared once it lands.
@@ -330,15 +379,24 @@ function dayOf(ts) {
 }
 
 function linkify(text) {
-  const parts = String(text).split(/(https?:\/\/[^\s<]+)/g);
+  const parts = String(text).split(
+    /(https?:\/\/[^\s<]+|(?:hamish-hermes|will-hermes|hamish|will)\/\d{4})/g);
   return parts.map((p, i) => {
     if (i % 2 === 0) return document.createTextNode(p);
-    const a = document.createElement("a");
-    a.href = p; a.rel = "noreferrer noopener"; a.textContent = p;
-    a.style.color = "inherit";
-    a.style.textDecorationThickness = "1px";
-    a.style.textUnderlineOffset = "2px";
-    return a;
+    if (/^https?:/.test(p)) {
+      const a = document.createElement("a");
+      a.href = p; a.rel = "noreferrer noopener"; a.textContent = p;
+      a.style.color = "inherit";
+      a.style.textDecorationThickness = "1px";
+      a.style.textUnderlineOffset = "2px";
+      return a;
+    }
+    // A record id is a way through to the work it names, so a note can point at the
+    // thing it is about without either room being copied into the other.
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "ref"; b.textContent = p;
+    b.addEventListener("click", () => openWork(p));
+    return b;
   });
 }
 
@@ -407,11 +465,61 @@ function note(r, first) {
   return el;
 }
 
-// Two ways through the same log. Lines is the day as it happened; canvas groups notes
-// into conversations so a reply lands beside the thought it belongs to.
+// Three ways through the same log. Lines is the day as it happened; canvas groups notes
+// into conversations so a reply lands beside the thought it belongs to; work is the
+// agents' side, read-only, so a note can be followed to what it caused.
 function render() {
+  document.body.classList.toggle("view-work", state.view === "work");
+  if (state.view === "work") { renderWork(); return; }
   if (state.view === "canvas") { renderCanvas(); return; }
   renderLines();
+}
+
+function renderWork() {
+  const thread = $("thread");
+  thread.textContent = "";
+  const wrap = document.createElement("section");
+  wrap.className = "work";
+  const lede = document.createElement("p");
+  lede.className = "lede";
+  lede.textContent = "the work underneath — read only, and nothing here is waiting on you";
+  wrap.append(lede);
+  if (!state.work.length) {
+    const p = document.createElement("p"); p.id = "empty";
+    p.textContent = "nothing here yet.";
+    wrap.append(p);
+    thread.append(wrap);
+    return;
+  }
+  for (const r of state.work) {
+    const card = document.createElement("article");
+    card.className = "wcard" + (state.focusWork === r.id ? " focus open" : "");
+    card.dataset.id = r.id;
+    const top = document.createElement("div"); top.className = "top";
+    const who = document.createElement("span");
+    who.className = "who" + (r.author === "hamish-hermes" ? " mine" : "");
+    who.textContent = AGENT_NAMES[r.author] || r.author;
+    const when = document.createElement("span"); when.textContent = shortDay(r.ts);
+    top.append(who, when);
+    if (r.topic && r.topic !== "note") {
+      const topic = document.createElement("span"); topic.textContent = r.topic;
+      top.append(topic);
+    }
+    const body = document.createElement("div"); body.className = "text";
+    body.append(...linkify(r.text || ""));
+    card.append(top, body);
+    if ((r.text || "").length > 420) {
+      const more = document.createElement("button");
+      more.type = "button"; more.className = "more"; more.textContent = "more";
+      more.addEventListener("click", () => {
+        const open = card.classList.toggle("open");
+        more.textContent = open ? "less" : "more";
+      });
+      card.append(more);
+    }
+    wrap.append(card);
+  }
+  thread.append(wrap);
 }
 
 function renderLines() {
@@ -573,8 +681,39 @@ async function send(text) {
   }
 }
 
+const VIEW_NEXT = { lines: "canvas", canvas: "work", work: "lines" };
+
 function paintViewIcon() {
-  $("views").replaceChildren(state.view === "canvas" ? ICON_LINES() : ICON_CANVAS());
+  const next = VIEW_NEXT[state.view] || "canvas";
+  $("views").replaceChildren(
+    next === "canvas" ? ICON_CANVAS() : next === "work" ? ICON_WORK() : ICON_LINES());
+  $("views").setAttribute("aria-label", "switch to " + next);
+  $("views").title = "switch to " + next;
+}
+
+async function loadWork() {
+  try {
+    const res = await fetch("/api/work", { headers: { "accept": "application/json" } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    state.work = data.records || [];
+  } catch (e) {
+    status("not reaching the work: " + e.message, true);
+  }
+}
+
+// Following a reference from a note: open the work view on that record. If it is older
+// than the window the page holds, say so rather than pretending nothing happened.
+async function openWork(id) {
+  state.focusWork = id;
+  state.view = "work";
+  try { localStorage.setItem(VIEW_KEY, "work"); } catch (e) {}
+  paintViewIcon();
+  await loadWork();
+  render();
+  const el = document.querySelector('.wcard[data-id="' + id + '"]');
+  if (el) el.scrollIntoView({ block: "center" });
+  else flash("older than the last 24 records");
 }
 
 $("composer").addEventListener("submit", async (ev) => {
@@ -608,10 +747,12 @@ $("refresh").addEventListener("click", async () => {
     flash("nothing new");
   }
 });
-$("views").addEventListener("click", () => {
-  state.view = state.view === "canvas" ? "lines" : "canvas";
+$("views").addEventListener("click", async () => {
+  state.view = VIEW_NEXT[state.view] || "lines";
+  state.focusWork = null;
   try { localStorage.setItem(VIEW_KEY, state.view); } catch (e) {}
   paintViewIcon();
+  if (state.view === "work") await loadWork();
   render();
   window.scrollTo({ top: state.view === "lines" ? document.body.scrollHeight : 0,
                     behavior: "instant" });
@@ -636,6 +777,7 @@ setInterval(() => { if (!document.hidden) load(false); }, 30000);
 $("refresh").replaceChildren(ICON_REFRESH());
 paintViewIcon();
 load(true);
+if (state.view === "work") loadWork().then(render);
 </script>
 </body>
 </html>
