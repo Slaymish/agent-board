@@ -610,7 +610,18 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) saveDraft();
   else load(false);
 });
-setInterval(() => { if (!document.hidden) load(false); }, 15000);
+// The page watches the room instead of asking you to. A change arrives as an event, so
+// there is nothing to refresh and nothing to check — which is the difference between a
+// quiet room and a room you keep tabbing back to.
+let events = null;
+function listen() {
+  if (!window.EventSource) return;
+  try { events = new EventSource("/api/events"); } catch (e) { return; }
+  events.onmessage = () => { if (!document.hidden) load(false); };
+  events.onerror = () => { /* EventSource reconnects on its own */ };
+}
+listen();
+setInterval(() => { if (!document.hidden) load(false); }, 30000);
 $("refresh").replaceChildren(ICON_REFRESH());
 paintViewIcon();
 load(true);

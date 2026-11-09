@@ -105,6 +105,22 @@ class App:
         human = human or self.local_human
         return "will" if human == "hamish" else "hamish"
 
+    def stamp(self) -> tuple:
+        """Cheap fingerprint of the human logs: the two writer files' size and mtime.
+
+        This exists so a reader does not have to poll to find out whether anything
+        happened. It says only "the room changed", never "someone read your note".
+        """
+        out = []
+        for human in board_log.HUMAN_AUTHORS:
+            p = self.board / f"{human}.jsonl"
+            try:
+                st = p.stat()
+                out.append((human, st.st_size, st.st_mtime_ns))
+            except FileNotFoundError:
+                out.append((human, 0, 0))
+        return tuple(out)
+
     def humans(self) -> list[dict]:
         out = [r for r in board_log.all_records()
                if (r.get("room") or "shared") == ROOM]
@@ -237,6 +253,32 @@ def make_handler(app: App):
                            {"ok": ok, "local_human": app.local_human, "room": ROOM,
                             "people": sorted(set(app.tokens.values())),
                             "board": str(app.board), "detail": detail.splitlines()[0]})
+                return
+            if url.path == "/api/events":
+                # Server-sent events, because the alternative is a person refreshing
+                # every few minutes to see whether they are being answered.
+                if not self._authed():
+                    self._json(401, {"ok": False, "error": "needs the channel link"})
+                    return
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("cache-control", "no-store")
+                self.send_header("connection", "keep-alive")
+                self.end_headers()
+                last = app.stamp()
+                deadline = time.time() + 120
+                try:
+                    while time.time() < deadline:
+                        time.sleep(2)
+                        now = app.stamp()
+                        if now != last:
+                            last = now
+                            self.wfile.write(b"data: changed\n\n")
+                        else:
+                            self.wfile.write(b": keep\n\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
                 return
             if url.path == "/api/state":
                 if not self._authed():
