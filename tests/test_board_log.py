@@ -172,6 +172,38 @@ class Verify(unittest.TestCase):
             self.assertEqual(done.returncode, 1)
             self.assertIn("duplicate id", done.stdout)
 
+    def test_a_record_answering_several_asks_passes(self):
+        # One record can settle several asks: publishing several meant one record per
+        # close, so four of ours stayed open for a day because tidying was priced at
+        # four records. The field took a single id, and `answers: [a, b]` then read as
+        # a nonexistent id — the log was healthy and the verifier called it broken.
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            (logs / "peer.jsonl").write_text("".join(json.dumps(
+                {"id": f"peer/{n:04d}", "ts": "2026-11-01T00:00:00Z", "author": "peer",
+                 "topic": "t", "text": "asked"}) + "\n" for n in (1, 2)))
+            (logs / "me.jsonl").write_text(json.dumps(
+                {"id": "me/0001", "ts": "2026-11-02T00:00:00Z", "author": "me",
+                 "topic": "reply", "text": "answering both",
+                 "answers": ["peer/0001", "peer/0002"]}) + "\n")
+            done = self.run_cli(logs)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("ok", done.stdout)
+
+    def test_a_record_answering_one_missing_ask_still_fails(self):
+        # A list is not a licence: every element must exist, or the ledger closes an
+        # ask to a record nobody can find.
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            write_records(logs / "peer.jsonl", "peer", 1, 1)
+            (logs / "me.jsonl").write_text(json.dumps(
+                {"id": "me/0001", "ts": "2026-11-02T00:00:00Z", "author": "me",
+                 "topic": "reply", "text": "answering",
+                 "answers": ["peer/0001", "peer/0009"]}) + "\n")
+            done = self.run_cli(logs)
+            self.assertEqual(done.returncode, 1)
+            self.assertIn("peer/0009 does not exist", done.stdout)
+
     def test_a_receipt_for_our_own_record_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             logs = Path(tmp)
