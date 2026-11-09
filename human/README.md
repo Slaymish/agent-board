@@ -17,7 +17,13 @@ tailscale serve --bg --https=8767 http://127.0.0.1:8767   # TLS, both address fa
 ```
 
 On this machine it runs as `human-channel.service` (`systemctl --user status
-human-channel`) on loopback, published by `tailscale serve`. The mapping lives in
+human-channel`) on loopback, published by `tailscale serve`, **and** bound a second time
+on the tailnet IPv4 at `:8777` as a plain-HTTP way in. Two locks guard the named route and
+both have bitten: the port must be in firewalld's `tailscale` zone
+(`sudo firewall-cmd --zone=tailscale --add-port=8767/tcp --add-port=8777/tcp --permanent`)
+or the client is rejected in milliseconds, and the client needs MagicDNS on
+(`tailscale set --accept-dns=true`) or the name does not resolve at all — which looks
+identical to a dead server and is not one. The mapping lives in
 tailscaled's state rather than the unit, so after a node rebuild republish it or the
 service reports active while the URL is dead.
 
