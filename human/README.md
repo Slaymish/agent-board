@@ -57,6 +57,14 @@ writes it, so the append-only log keeps its one rule.
 - **Install it.** The page ships a manifest and icons, so Add to Home Screen gives a
   full-screen app with a serif `hw` icon and no browser chrome.
 
+## Writing, not messaging
+Two things make it comfortable to ramble rather than compose a message. An unfinished
+draft is kept on the device (localStorage, per person) and comes back when the page is
+reopened, so closing it mid-thought costs nothing. The refresh control in the header
+checks for new notes on demand; the page also re-checks when it comes back to the
+foreground and every 15 seconds while it is open. The submit button says **add**, and
+the reading measure is capped so a long note reads as prose.
+
 ## Not built yet
 
 - **Delivery of the other person's human records to a phone.** `will.jsonl` will sit

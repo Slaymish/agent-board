@@ -91,6 +91,14 @@ PAGE = """<!doctype html>
   }
   .who { font-family: var(--mono); font-size: 11px; color: var(--quiet); margin-left: auto;
          letter-spacing: .02em; }
+  .refresh {
+    border: 0; background: none; padding: 6px; margin: 0 0 0 8px; line-height: 0;
+    color: var(--quiet); cursor: pointer; align-self: center;
+  }
+  .refresh svg { width: 15px; height: 15px; display: block; }
+  .refresh:active { color: var(--ink); }
+  .refresh.turning svg { animation: turn .6s ease; }
+  @keyframes turn { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
   /* No presence indicator: a green dot beside a name reads as "they are here, why
      haven't they answered". Connection trouble shows in the status line instead. */
   main { flex: 1; padding: 4px 18px 24px; }
@@ -116,7 +124,9 @@ PAGE = """<!doctype html>
     margin: 26px 0 4px; padding-bottom: 6px; border-bottom: 1px solid var(--rule);
   }
   .day:first-child { margin-top: 8px; }
-  .text { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 3px; }
+  /* A ramble is the point, so the reading measure is capped: a long note reads as
+     prose in one column, not as a paragraph stretched across a screen. */
+  .text { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 3px; max-width: 34em; }
   .text a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 2px; }
   #empty { color: var(--quiet); font-size: 15px; padding: 28px 0; }
   form {
@@ -126,11 +136,12 @@ PAGE = """<!doctype html>
     display: flex; gap: 10px; align-items: flex-end;
   }
   textarea {
-    flex: 1; resize: none; min-height: 44px; max-height: 40dvh;
+    flex: 1; resize: none; min-height: 48px; max-height: 55dvh;
     font: inherit; color: inherit; background: transparent;
-    border: 1px solid var(--rule); border-radius: 8px;
-    padding: 10px 12px; line-height: 1.4;
+    border: 1px solid var(--rule); border-radius: 5px;
+    padding: 11px 12px; line-height: 1.45;
   }
+  textarea::placeholder { color: var(--quiet); font-style: italic; }
   textarea:focus { outline: 2px solid var(--mine); outline-offset: -1px; }
   button {
     font-family: var(--sans); font-size: 12px; letter-spacing: .12em;
@@ -148,17 +159,47 @@ PAGE = """<!doctype html>
 <header>
   <h1 id="title">hamish + will</h1>
   <span class="who" id="who">humans</span>
+  <button class="refresh" id="refresh" type="button" aria-label="refresh" title="check for new notes">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M13.4 6.6A5.6 5.6 0 1 0 13 10.4"/>
+      <path d="M13.6 2.7v4h-4"/>
+    </svg>
+  </button>
 </header>
 <main id="thread"><p id="empty">Nothing here yet.</p></main>
 <div id="status"></div>
 <form id="composer">
   <textarea id="text" rows="1" maxlength="4000" placeholder="write to will"
             autocomplete="off" enterkeyhint="enter" aria-label="message"></textarea>
-  <button id="send" type="submit">send</button>
+  <button id="send" type="submit">add</button>
 </form>
 <script>
 const state = { me: "?", peer: "?", messages: [], sending: false };
 const $ = (id) => document.getElementById(id);
+
+// A half-finished thought should survive closing the page, because the whole point is
+// that nothing here is urgent. Kept per person, on the device, cleared once it lands.
+const draftKey = () => "hc.draft." + (state.me || "?");
+let draftTimer = null;
+function saveDraft() {
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(() => {
+    try { localStorage.setItem(draftKey(), $("text").value); } catch (e) {}
+  }, 250);
+}
+function restoreDraft() {
+  try {
+    const saved = localStorage.getItem(draftKey());
+    if (saved && !$("text").value) {
+      $("text").value = saved;
+      $("text").dispatchEvent(new Event("input"));
+    }
+  } catch (e) {}
+}
+function clearDraft() {
+  try { localStorage.removeItem(draftKey()); } catch (e) {}
+}
 
 function stamp(ts) {
   const d = new Date(ts);
@@ -251,6 +292,7 @@ async function load(first) {
     $("title").textContent = [data.me, data.peer].sort().join(" + ");
     $("who").textContent = "humans";
     $("text").placeholder = "write to " + data.peer;
+    if (first) restoreDraft();
     state.messages = data.messages;
     render();
     status("");
@@ -271,6 +313,7 @@ async function send(text) {
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
     state.messages.push(data.record);
+    clearDraft();
     render();
     status(data.pushed === false ? "saved here; will not see it until the push succeeds" : "",
            data.pushed === false);
@@ -297,9 +340,20 @@ $("text").addEventListener("keydown", (ev) => {
 });
 $("text").addEventListener("input", (ev) => {
   const box = ev.target; box.style.height = "auto";
-  box.style.height = Math.min(box.scrollHeight, window.innerHeight * 0.4) + "px";
+  box.style.height = Math.min(box.scrollHeight, window.innerHeight * 0.55) + "px";
+  saveDraft();
 });
-document.addEventListener("visibilitychange", () => { if (!document.hidden) load(false); });
+$("refresh").addEventListener("click", async () => {
+  const b = $("refresh");
+  b.classList.add("turning");
+  await load(false);
+  setTimeout(() => b.classList.remove("turning"), 600);
+});
+window.addEventListener("pagehide", saveDraft);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) saveDraft();
+  else load(false);
+});
 setInterval(() => { if (!document.hidden) load(false); }, 15000);
 load(true);
 </script>
