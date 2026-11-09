@@ -19,6 +19,13 @@ its human asks, and never posts into it.
 Reading is the local checkout, refreshed by a pull every ``--pull`` seconds (0 turns
 it off). Posting appends under a file lock, then commits and pushes only this
 person's file. No dependencies: the standard library and ``board_log.py`` next to it.
+
+Saving and publishing are separate facts. The append is the note; the push is how the
+other person gets it. A failed commit or push therefore returns ``saved: true,
+published: false`` rather than an error, and a publisher loop retries pending commits
+every ``--publish-every`` seconds until one succeeds, so a note cannot sit silently in
+a local commit waiting for unrelated traffic. A retry from the page carries the same
+``client_id``, so a lost response cannot turn one note into two.
 """
 from __future__ import annotations
 
@@ -79,14 +86,21 @@ class App:
     """Everything the handler needs, resolved once at start-up."""
 
     def __init__(self, board: Path, tokens: dict[str, str], *, local_human: str = "hamish",
-                 git: bool = True, pull_every: int = 45) -> None:
+                 git: bool = True, pull_every: int = 45, publish_every: int = 30) -> None:
         self.board = board
         self.tokens = {t: h for h, t in tokens.items() if t}
         self.local_human = local_human
         self.git = git
         self.pull_every = pull_every
+        self.publish_every = publish_every
         self.write_lock = threading.Lock()
         self.pulling = threading.Lock()
+        self.publishing = threading.Lock()
+        # client_id -> the record it produced, so a retry after a lost response returns
+        # the note instead of appending a second one. Bounded: it is a response cache,
+        # not a second log.
+        self.recent: dict[str, dict] = {}
+        self.recent_lock = threading.Lock()
         board_log.set_dir(board)
 
     def who(self, token: str) -> str | None:
@@ -138,7 +152,7 @@ class App:
             self.pulling.release()
 
     def post(self, human: str, text: str, topic: str = "note",
-             reply_to: str | None = None) -> dict:
+             reply_to: str | None = None, client_id: str | None = None) -> dict:
         text = text.strip()
         if not text:
             raise ValueError("empty message")
@@ -157,19 +171,63 @@ class App:
                 raise ValueError(f"no note {reply_to} to reply to")
             if (parent.get("room") or "shared") != ROOM:
                 raise ValueError(f"{reply_to} is not in this room")
+        if client_id:
+            with self.recent_lock:
+                seen = self.recent.get(str(client_id))
+            if seen is not None:
+                return {"record": seen, "saved": True, "published": True, "repeated": True}
         with self.write_lock:
             body = {"ts": _now(), "author": human, "topic": topic, "text": text,
                     "room": ROOM, "via": "human"}
             if reply_to:
                 body["reply_to"] = str(reply_to)
             rec = board_log._append_record(human, body)
-            pushed = None
+            if client_id:
+                with self.recent_lock:
+                    if len(self.recent) > 200:
+                        self.recent.pop(next(iter(self.recent)))
+                    self.recent[str(client_id)] = rec
+            published = True
+            error = None
             if self.git:
                 path = board_log.own_file(human)
-                board_log.git("add", str(path.relative_to(board_log.REPO)))
-                board_log.git("commit", "-q", "-m", f"board: {rec['id']} {topic}".strip())
-                pushed = board_log.git("push", check=False).returncode == 0
-        return {"record": rec, "pushed": pushed}
+                try:
+                    board_log.git("add", str(path.relative_to(board_log.REPO)))
+                    board_log.git("commit", "-q", "-m", f"board: {rec['id']} {topic}".strip())
+                except (subprocess.CalledProcessError, OSError) as e:
+                    # The note is on disk and fsynced. A commit failure is a publication
+                    # problem, not a reason to tell the writer their words were lost.
+                    published, error = False, str(e)
+                else:
+                    published = self.publish()
+        return {"record": rec, "saved": True, "published": published,
+                **({"error": error} if error else {})}
+
+    def publish(self) -> bool:
+        """Push pending commits. Safe to call from the request, the loop, or both.
+
+        A rejected push is usually a peer that got there first, so one rebase-and-retry
+        is the whole policy. Anything past that is left to the loop rather than holding
+        the writer's request open.
+        """
+        if not self.git:
+            return True
+        if not self.publishing.acquire(blocking=False):
+            return False
+        try:
+            for _ in range(2):
+                if board_log.git("push", check=False).returncode == 0:
+                    return True
+                board_log.git("pull", "--rebase", "--autostash", check=False)
+            return False
+        finally:
+            self.publishing.release()
+
+    def publish_forever(self, stop: threading.Event) -> None:
+        while not stop.wait(self.publish_every):
+            ahead = board_log.git("rev-list", "--count", "@{u}..HEAD", check=False)
+            if ahead.returncode == 0 and ahead.stdout.strip() not in ("", "0"):
+                self.publish()
 
     def pull_forever(self, stop: threading.Event) -> None:
         while not stop.wait(self.pull_every):
@@ -340,6 +398,7 @@ def make_handler(app: App):
                 text = str(body.get("text") or "")
                 topic = str(body.get("topic") or "note")[:40] or "note"
                 reply_to = body.get("reply_to") or None
+                client_id = str(body.get("client_id") or "")[:64] or None
             except (json.JSONDecodeError, UnicodeDecodeError):
                 self._json(400, {"ok": False, "error": "body is not JSON"})
                 return
@@ -349,12 +408,18 @@ def make_handler(app: App):
                 return
             try:
                 out = app.post(human, text, topic,
-                               str(reply_to) if reply_to else None)
+                               str(reply_to) if reply_to else None, client_id)
             except ValueError as e:
                 self._json(400, {"ok": False, "error": str(e)})
                 return
             except RuntimeError as e:
                 self._json(500, {"ok": False, "error": str(e)})
+                return
+            except subprocess.CalledProcessError as e:
+                # Only reachable if a git call outside the guarded block fails. The note
+                # is already on disk, so say that rather than a bare 500.
+                self._json(200, {"ok": True, "saved": True, "published": False,
+                                 "error": str(e)})
                 return
             self._json(200, {"ok": True, **out})
 
@@ -409,6 +474,8 @@ def main() -> None:
     p.add_argument("--no-git", action="store_true", help="write the file only; no commit or push")
     p.add_argument("--pull", type=int, default=45, metavar="SECONDS",
                    help="how often to pull the other side's records (0 = never)")
+    p.add_argument("--publish", type=int, default=30, metavar="SECONDS",
+                   help="how often to retry commits that did not reach the remote (0 = never)")
     a = p.parse_args()
     if not a.also_port:
         a.also_port = a.port + 10
@@ -419,10 +486,13 @@ def main() -> None:
     if board_log.is_human_author(a.author) is False:
         sys.exit(f"--author must be one of {', '.join(board_log.HUMAN_AUTHORS)}")
     people = people_from(Path(a.token_file).expanduser(), a.author)
-    app = App(board, people, local_human=a.author, git=not a.no_git, pull_every=a.pull)
+    app = App(board, people, local_human=a.author, git=not a.no_git, pull_every=a.pull,
+              publish_every=a.publish)
     stop = threading.Event()
     if not a.no_git and a.pull:
         threading.Thread(target=app.pull_forever, args=(stop,), daemon=True).start()
+    if not a.no_git and a.publish:
+        threading.Thread(target=app.publish_forever, args=(stop,), daemon=True).start()
 
     httpd = ThreadingHTTPServer((a.host, a.port), make_handler(app))
     if a.also_host:

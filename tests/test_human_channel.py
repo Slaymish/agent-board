@@ -8,6 +8,7 @@ real HTTP server on a loopback ephemeral port rather than a mocked handler.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import threading
 import unittest
@@ -291,6 +292,53 @@ class Guard(unittest.TestCase):
                 board_log._guard_author(A())
         finally:
             os.environ.pop("BOARD_HUMAN", None)
+
+
+class SaveAndPublish(unittest.TestCase):
+    """The note and its publication are two facts, and the writer is told both.
+
+    Appending is fsynced and local; the commit and push are how the other person gets it.
+    Until 9 Nov 2026 a commit failure raised out of the handler, so a note that was safely
+    on disk answered as a 500 with no record of what happened.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = TemporaryDirectory()
+        self.board = Path(self.tmp.name) / "board"
+        self.board.mkdir()
+        seed(self.board)
+        self.orig_git = board_log.git
+        self.orig = board_log.BOARD, board_log.REPO
+
+    def tearDown(self) -> None:
+        board_log.git = self.orig_git
+        board_log.BOARD, board_log.REPO = self.orig
+        self.tmp.cleanup()
+
+    def test_a_commit_failure_leaves_the_note_saved_and_unsent(self):
+        def fake(*args, check=True, **kw):
+            if args and args[0] in ("add", "commit"):
+                raise subprocess.CalledProcessError(1, list(args))
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        board_log.git = fake
+        app = serve.App(self.board, {"hamish": TOKEN, "will": WILL_TOKEN},
+                        git=True, pull_every=0, publish_every=0)
+        out = app.post("hamish", "still mine")
+        self.assertTrue(out["saved"])
+        self.assertFalse(out["published"])
+        written = (self.board / "hamish.jsonl").read_text()
+        self.assertIn("still mine", written)
+
+    def test_a_lost_response_does_not_become_two_notes(self):
+        app = serve.App(self.board, {"hamish": TOKEN, "will": WILL_TOKEN},
+                        git=False, pull_every=0)
+        first = app.post("hamish", "once", client_id="sub-1")
+        again = app.post("hamish", "once", client_id="sub-1")
+        self.assertEqual(first["record"]["id"], again["record"]["id"])
+        self.assertTrue(again.get("repeated"))
+        lines = (self.board / "hamish.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 1, "the retry appended a second record")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

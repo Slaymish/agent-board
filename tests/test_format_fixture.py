@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Two implementations, one format: a shared fixture both CLIs must agree on.
 
-`board_log.py` here and `board/board.py` in the private log repo are independent
-readings of the same JSONL protocol. The risk of two implementations is not that they
-disagree loudly, it is that they disagree quietly — a record committed by one and
-rejected by the other. This fixture is one small log and two assertions: both accept a
-clean log and count the same records, both reject a duplicate id.
+`board_log.py` here and `board/board.py` in the private log repo are independent readings of the
+same JSONL protocol. The risk of two implementations is not that they disagree loudly, it is that
+they disagree quietly — a record committed by one and rejected by the other.
 
-  python3 tests/test_format_fixture.py
-  PEER_BOARD=/path/to/board.py python3 tests/test_format_fixture.py
+The fixture covers the rules that make a room mean something, not just ids and links, because
+until 9 Nov 2026 it did not and the two validators had already diverged: the public one enforced
+room/voice policy and the private one did not, while both passed this file.
 
-The peer CLI is optional; without it the fixture still runs against this one.
+  python3 -m unittest tests.test_format_fixture     # what the documented command runs
+  python3 tests/test_format_fixture.py              # same, standalone
+  PEER_BOARD=/path/to/board.py                      # point at another checkout's CLI
+
+The peer is found automatically at `~/Developer/agent-memory/board/board.py` when that clone
+exists, and skipped with a reason when it does not — a missing peer is a smaller problem than a
+green tick that compared nothing.
 """
 import json
 import os
@@ -18,10 +23,12 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
 CLI = HERE.parent / "board_log.py"
-PEER = os.environ.get("PEER_BOARD", "")
+PEER = os.environ.get("PEER_BOARD") or str(
+    pathlib.Path.home() / "Developer" / "agent-memory" / "board" / "board.py")
 
 RECORDS = {
     "hamish-hermes": [
@@ -67,6 +74,66 @@ SELF_RECEIPT = {
     ],
 }
 
+OUT_OF_ORDER = {
+    "hamish-hermes": [
+        {"id": "hamish-hermes/0002", "ts": "2026-11-01T00:02:00Z", "author": "hamish-hermes",
+         "topic": "meta", "text": "two"},
+        {"id": "hamish-hermes/0001", "ts": "2026-11-01T00:00:00Z", "author": "hamish-hermes",
+         "topic": "meta", "text": "one"},
+    ],
+}
+
+MISFILED_AUTHOR = {
+    # A record claiming to be the peer's, sitting in our file. Both CLIs refuse it; the
+    # fixture did not say so, which is how a format rule becomes folklore.
+    "hamish-hermes": [
+        {"id": "will-hermes/0009", "ts": "2026-11-01T00:00:00Z", "author": "will-hermes",
+         "topic": "meta", "text": "not mine to write"},
+    ],
+}
+
+# The room contract, case by case. Each is otherwise a legal record, so the only thing a
+# verifier can be refusing is the rule named in the expectation.
+POLICY = {
+    "an agent writing the humans room": ({
+        "hamish-hermes": [
+            {"id": "hamish-hermes/0001", "ts": "2026-11-01T00:00:00Z",
+             "author": "hamish-hermes", "topic": "note", "text": "not my room",
+             "room": "humans", "via": "agent"},
+        ],
+    }, "takes hamish, will as the author"),
+    "an invented voice": ({
+        "hamish-hermes": [
+            {"id": "hamish-hermes/0001", "ts": "2026-11-01T00:00:00Z",
+             "author": "hamish-hermes", "topic": "note", "text": "who",
+             "via": "robot"},
+        ],
+    }, "is not one of agent, human, relay"),
+    "a reply across rooms": ({
+        "hamish-hermes": [
+            {"id": "hamish-hermes/0001", "ts": "2026-11-01T00:00:00Z",
+             "author": "hamish-hermes", "topic": "note", "text": "agent side"},
+            {"id": "hamish-hermes/0002", "ts": "2026-11-01T00:01:00Z",
+             "author": "hamish-hermes", "topic": "note", "text": "reaching in",
+             "reply_to": "will/0001"},
+        ],
+        "will": [
+            {"id": "will/0001", "ts": "2026-11-01T00:00:30Z", "author": "will",
+             "topic": "note", "text": "my room", "room": "humans", "via": "human"},
+        ],
+    }, "a reply stays in its parent's room"),
+    "an amendment across rooms": ({
+        "hamish-hermes": [
+            {"id": "hamish-hermes/0001", "ts": "2026-11-01T00:00:00Z",
+             "author": "hamish-hermes", "topic": "note", "text": "agent side",
+             "room": "agents", "via": "agent"},
+            {"id": "hamish-hermes/0002", "ts": "2026-11-01T00:01:00Z",
+             "author": "hamish-hermes", "topic": "note", "text": "moving it",
+             "room": "shared", "via": "agent", "amends": "hamish-hermes/0001"},
+        ],
+    }, "an amendment stays in its target's room"),
+}
+
 
 def check(cli, name):
     with tempfile.TemporaryDirectory() as tmp:
@@ -88,26 +155,7 @@ def check(cli, name):
         assert "its own record" in (own.stdout + own.stderr), \
             "%s refused the self-receipt for the wrong reason: %s" % (name, own.stdout or own.stderr)
     extra_cases(cli, name)
-    print("ok", name)
-
-
-OUT_OF_ORDER = {
-    "hamish-hermes": [
-        {"id": "hamish-hermes/0002", "ts": "2026-11-01T00:02:00Z", "author": "hamish-hermes",
-         "topic": "meta", "text": "two"},
-        {"id": "hamish-hermes/0001", "ts": "2026-11-01T00:00:00Z", "author": "hamish-hermes",
-         "topic": "meta", "text": "one"},
-    ],
-}
-
-MISFILED_AUTHOR = {
-    # A record claiming to be the peer's, sitting in our file. Both CLIs refuse it; the
-    # fixture did not say so, which is how a format rule becomes folklore.
-    "hamish-hermes": [
-        {"id": "will-hermes/0009", "ts": "2026-11-01T00:00:00Z", "author": "will-hermes",
-         "topic": "meta", "text": "not mine to write"},
-    ],
-}
+    policy_cases(cli, name)
 
 
 def extra_cases(cli, name):
@@ -125,14 +173,19 @@ def extra_cases(cli, name):
             "%s refused a misfiled author for the wrong reason: %s" % (name, out.stdout or out.stderr)
 
 
-def peer_supports_dir(peer):
-    """A conformance comparison needs both CLIs to be told the same thing.
+def policy_cases(cli, name):
+    for label, (records, reason) in POLICY.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            d = pathlib.Path(tmp)
+            write_log(d, records)
+            out = run(cli, d, "verify")
+            text = (out.stdout + out.stderr)
+            assert out.returncode != 0, "%s accepted %s" % (name, label)
+            assert reason in text, "%s refused %s for the wrong reason: %s" % (name, label, text)
 
-    The first run of this fixture failed on exactly that: the peer's `board.py`
-    took the directory positionally-ish and read `--dir <path>` as the subcommand,
-    because the flag was still on an unmerged branch. Skipping with the reason is
-    better than a red test that is describing a version difference.
-    """
+
+def peer_supports_dir(peer):
+    """A conformance comparison needs both CLIs to be told the same thing."""
     try:
         out = subprocess.run([sys.executable, str(peer), "--help"],
                              capture_output=True, text=True, timeout=20)
@@ -141,11 +194,17 @@ def peer_supports_dir(peer):
     return "--dir" in (out.stdout + out.stderr)
 
 
+class FormatFixture(unittest.TestCase):
+    def test_this_cli(self):
+        check(CLI, "board_log.py")
+
+    def test_peer_cli_agrees(self):
+        if not PEER or not pathlib.Path(PEER).exists():
+            self.skipTest("no peer checkout at %s; set PEER_BOARD to compare" % PEER)
+        if not peer_supports_dir(PEER):
+            self.skipTest("%s does not take --dir yet" % PEER)
+        check(pathlib.Path(PEER), pathlib.Path(PEER).name + " (peer)")
+
+
 if __name__ == "__main__":
-    check(CLI, "board_log.py")
-    if not PEER or not pathlib.Path(PEER).exists():
-        print("skip peer: set PEER_BOARD to the other repo's board.py to compare")
-    elif not peer_supports_dir(PEER):
-        print("skip peer: %s does not take --dir yet (the flag is on a branch)" % PEER)
-    else:
-        check(PEER, pathlib.Path(PEER).name + " (peer)")
+    unittest.main(verbosity=2)

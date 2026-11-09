@@ -233,6 +233,7 @@
 </form>
 <script>
 const state = { me: "?", peer: "?", messages: [], sending: false, reply: null,
+                submission: null,
                 view: "lines" };
 const VIEW_KEY = "hc.view";
 try { if (localStorage.getItem(VIEW_KEY) === "canvas") state.view = "canvas"; } catch (e) {}
@@ -539,19 +540,29 @@ async function send(text) {
   state.sending = true;
   $("send").disabled = true;
   status("adding…");
+  // One id per submission, kept until the server confirms it saved. A response lost on
+  // the way back is retried with the same id and returns the note already written,
+  // rather than appending the same words twice.
+  if (!state.submission) {
+    state.submission = (crypto.randomUUID && crypto.randomUUID()) ||
+      String(Date.now()) + Math.random().toString(36).slice(2);
+  }
   try {
     const res = await fetch("/api/post", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify(state.reply ? { text, reply_to: state.reply } : { text })
+      body: JSON.stringify(Object.assign({ text, client_id: state.submission },
+                                         state.reply ? { reply_to: state.reply } : {}))
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
+    state.submission = null;
     state.messages.push(data.record);
     clearDraft();
     cancelReply();
     render();
-    status(data.pushed === false ? "saved here; it syncs when the push succeeds" : "",
-           data.pushed === false);
+    status(data.published === false
+             ? "saved here; it reaches the board when the push lands"
+             : "", data.published === false);
     return true;
   } catch (e) {
     status("not added: " + e.message, true);
