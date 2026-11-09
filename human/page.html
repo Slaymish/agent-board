@@ -75,6 +75,62 @@
   .icon:active { background: rgba(127, 118, 100, .12); color: var(--ink); }
   .icon.turning svg { animation: turn .6s ease; }
   @keyframes turn { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  .tools { margin-left: auto; display: flex; gap: 2px; }
+
+  /* ---------- tabs: two rooms, visibly two rooms ---------- */
+  .tabs { display: flex; gap: 2px; margin-left: 12px; }
+  .tab {
+    position: relative; border: 0; background: none; padding: 0 9px;
+    height: 32px; font: 600 12px/1 var(--sans); letter-spacing: .10em;
+    text-transform: lowercase; color: var(--quiet); cursor: pointer;
+  }
+  .tab[aria-selected="true"] { color: var(--ink); }
+  .tab[aria-selected="true"]::after {
+    content: ""; position: absolute; left: 6px; right: 6px; bottom: -9px;
+    height: 2px; background: var(--ink);
+  }
+
+  /* ---------- one control row under the tabs: layout, or who ---------- */
+  .subbar {
+    position: sticky; top: calc(48px + env(safe-area-inset-top)); z-index: 2;
+    background: var(--paper); border-bottom: 1px solid var(--rule);
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px var(--gutter); min-height: 39px;
+  }
+  .seg { display: flex; border: 1px solid var(--rule); border-radius: 999px; padding: 1px; }
+  .seg button {
+    border: 0; background: none; border-radius: 999px; padding: 4px 11px;
+    font: 600 11px/1.2 var(--sans); letter-spacing: .10em; text-transform: lowercase;
+    color: var(--quiet); cursor: pointer;
+  }
+  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+  .subbar .who { margin-left: auto; }
+  .subbar .who[data-state="down"] { color: var(--warn); }
+
+  /* ---------- search: the same two rooms, found rather than scrolled ---------- */
+  #search { position: fixed; inset: 0; z-index: 6; background: var(--paper);
+            display: flex; flex-direction: column; }
+  #search .bar {
+    display: flex; gap: 8px; align-items: center;
+    padding: calc(env(safe-area-inset-top) + 10px) var(--gutter) 10px;
+    border-bottom: 1px solid var(--rule);
+  }
+  #search input {
+    flex: 1; border: 0; background: none; color: var(--ink);
+    font: 17px/1.4 var(--serif); padding: 6px 0; outline: none; min-width: 0;
+  }
+  #search .results { flex: 1; overflow: auto; padding: 4px var(--gutter) 24px;
+                     max-width: calc(var(--sheet) + 2 * var(--gutter)); width: 100%; }
+  .result {
+    display: block; width: 100%; text-align: left; border: 0; background: none;
+    border-bottom: 1px solid var(--rule); padding: 11px 0; cursor: pointer;
+    color: var(--ink); font: 15px/1.45 var(--serif);
+  }
+  .result .meta {
+    display: block; font: 11px/1.5 var(--mono); color: var(--quiet); letter-spacing: .02em;
+  }
+  .result .snip { display: block; margin-top: 2px; color: var(--quiet); font-size: 14px; }
+  .result b { font-weight: 600; background: rgba(127, 118, 100, .16); border-radius: 2px; }
 
   /* ---------- the page ---------- */
   main {
@@ -253,12 +309,35 @@
 <body>
 <header>
   <h1 id="title">hamish + will</h1>
-  <span class="who" id="who">human room</span>
-  <button class="ref" id="rooms" type="button">work</button>
-  <button class="ref" id="return" type="button" hidden>return</button>
-  <button class="icon" id="views" type="button" aria-label="switch between lines and canvas" title="lines or canvas"></button>
-  <button class="icon" id="refresh" type="button" aria-label="check for new notes" title="check for new notes"></button>
+  <nav class="tabs" role="tablist" aria-label="rooms">
+    <button class="tab" id="tab-human" type="button" role="tab" aria-selected="true">human</button>
+    <button class="tab" id="tab-work" type="button" role="tab" aria-selected="false">work</button>
+  </nav>
+  <div class="tools">
+    <button class="icon" id="search-open" type="button" aria-label="search" title="search"></button>
+    <button class="icon" id="refresh" type="button" aria-label="check for new notes" title="check for new notes"></button>
+  </div>
 </header>
+<div class="subbar">
+  <div class="seg" id="seg-layout" role="group" aria-label="layout">
+    <button type="button" id="seg-lines" aria-pressed="true">lines</button>
+    <button type="button" id="seg-canvas" aria-pressed="false">canvas</button>
+  </div>
+  <div class="seg" id="seg-who" role="group" aria-label="whose work" hidden>
+    <button type="button" data-who="all" aria-pressed="true">both</button>
+    <button type="button" data-who="hamish-hermes" aria-pressed="false">elio</button>
+    <button type="button" data-who="will-hermes" aria-pressed="false">zeta</button>
+  </div>
+  <span class="who" id="link" data-state="live">live</span>
+</div>
+<div id="search" hidden>
+  <div class="bar">
+    <input id="q" type="search" placeholder="notes, work, an id" autocomplete="off"
+           autocapitalize="none" spellcheck="false" aria-label="search">
+    <button class="ref" id="search-close" type="button">close</button>
+  </div>
+  <div class="results" id="results"></div>
+</div>
 <main id="thread"><p id="empty">Nothing here yet.</p></main>
 <div id="status" role="status" aria-live="polite"></div>
 <form id="composer">
@@ -276,6 +355,7 @@
 <script>
 const state = { me: "?", peer: "?", messages: [], sending: false, reply: null,
                 submission: null, work: [], focusWork: null, roomView: "lines",
+                whoFilter: "all",
                 view: "lines" };
 const VIEW_KEY = "hc.view";
 try {
@@ -317,6 +397,7 @@ const ICON_CANVAS = () => icon([], [
   { x: 9, y: 8.5, width: 5, height: 5, rx: 1 }
 ]);
 const ICON_REFRESH = () => icon(["M13.4 6.6A5.6 5.6 0 1 0 13 10.4", "M13.6 2.7v4h-4"]);
+const ICON_SEARCH = () => icon(["M6.7 2.2a4.5 4.5 0 1 0 0 9 4.5 4.5 0 0 0 0-9", "M10.1 10.1 14 14"]);
 const ICON_WORK = () => icon([], [
   { x: 2, y: 3, width: 3, height: 3, rx: 1 },
   { x: 3.5, y: 7.5, width: 8, height: 2, rx: 1 },
@@ -475,9 +556,7 @@ function note(r, first) {
 // into conversations so a reply lands beside the thought it belongs to; work is the
 // agents' side, read-only, so a note can be followed to what it caused.
 function render() {
-  $("who").textContent = state.view === "work" ? "work · read only" : "human room";
-  $("rooms").textContent = state.view === "work" ? "human room" : "work";
-  $("views").hidden = state.view === "work";
+  syncChrome();
   document.body.classList.toggle("view-work", state.view === "work");
   if (state.view === "work") { renderWork(); return; }
   if (state.view === "canvas") { renderCanvas(); return; }
@@ -500,7 +579,16 @@ function renderWork() {
     thread.append(wrap);
     return;
   }
-  for (const r of state.work) {
+  const shown = state.whoFilter === "all"
+    ? state.work : state.work.filter((r) => r.author === state.whoFilter);
+  if (!shown.length) {
+    const p = document.createElement("p"); p.id = "empty";
+    p.textContent = "nothing from them in this window.";
+    wrap.append(p);
+    thread.append(wrap);
+    return;
+  }
+  for (const r of shown) {
     const card = document.createElement("article");
     card.className = "wcard" + (state.focusWork === r.id ? " focus open" : "");
     card.dataset.id = r.id;
@@ -693,14 +781,29 @@ async function send(text) {
   }
 }
 
-const VIEW_NEXT = { lines: "canvas", canvas: "lines", work: "lines" };
+// The page is two rooms, so it says so: a tab strip for room, one control row for how
+// the room is drawn (human) or whose work is shown (work). A tab is the way back; there
+// is no separate "return", because two visible tabs already are one.
+function syncChrome() {
+  const work = state.view === "work";
+  $("tab-human").setAttribute("aria-selected", work ? "false" : "true");
+  $("tab-work").setAttribute("aria-selected", work ? "true" : "false");
+  $("seg-layout").hidden = work;
+  $("seg-who").hidden = !work;
+  $("seg-lines").setAttribute("aria-pressed", state.view === "lines" ? "true" : "false");
+  $("seg-canvas").setAttribute("aria-pressed", state.view === "canvas" ? "true" : "false");
+  for (const b of $("seg-who").querySelectorAll("button")) {
+    b.setAttribute("aria-pressed", b.dataset.who === state.whoFilter ? "true" : "false");
+  }
+}
 
-function paintViewIcon() {
-  const next = VIEW_NEXT[state.view] || "canvas";
-  $("views").replaceChildren(
-    next === "canvas" ? ICON_CANVAS() : next === "work" ? ICON_WORK() : ICON_LINES());
-  $("views").setAttribute("aria-label", "switch to " + next);
-  $("views").title = "switch to " + next;
+function setLayout(v) {
+  state.roomView = v;
+  if (state.view !== "work") state.view = v;
+  try { localStorage.setItem(VIEW_KEY, v); } catch (e) {}
+  render();
+  window.scrollTo({ top: v === "lines" ? document.body.scrollHeight : 0,
+                    behavior: "instant" });
 }
 
 async function loadWork() {
@@ -718,15 +821,13 @@ async function loadWork() {
 
 // Following a reference from a note: open the work view on that record. If it is older
 // than the window the page holds, say so rather than pretending nothing happened.
-let navDepth = 0;
 let focusRecord = null;
 const roomScroll = {lines: 0, canvas: 0, work: 0};
 history.scrollRestoration = "manual";
 function rememberView() {
   roomScroll[state.view] = scrollY;
   history.replaceState({view: state.view, y: scrollY, focus: focusRecord,
-                        depth: navDepth, roomView: state.roomView, roomScroll: {...roomScroll}}, "");
-  $("return").hidden = navDepth === 0;
+                        roomView: state.roomView, roomScroll: {...roomScroll}}, "");
 }
 async function resolveRecord(id) {
   const res = await fetch("/api/record?id=" + encodeURIComponent(id));
@@ -743,7 +844,6 @@ function retainRecord(record) {
 }
 window.addEventListener("popstate", async ev => {
   const saved = ev.state || {};
-  navDepth = saved.depth || 0;
   state.view = saved.view || "lines";
   state.roomView = saved.roomView || "lines";
   Object.assign(roomScroll, saved.roomScroll || {});
@@ -751,22 +851,88 @@ window.addEventListener("popstate", async ev => {
     if (state.view === "work") await loadWork();
     retainRecord(saved.focus ? await resolveRecord(saved.focus) : null);
   } catch (e) { status(e.message, true); }
-  paintViewIcon(); render();
-  $("return").hidden = navDepth === 0;
+  render();
   requestAnimationFrame(() => scrollTo(0, saved.y || 0));
 });
-$("return").onclick = () => { if (navDepth > 0) history.back(); };
-$("rooms").onclick = async () => {
+async function showTab(name) {
   rememberView();
   if (state.view !== "work") state.roomView = state.view;
-  state.view = state.view === "work" ? state.roomView : "work";
+  state.view = name === "work" ? "work" : (state.roomView || "lines");
   retainRecord(null);
   if (state.view === "work") await loadWork();
-  navDepth++;
   history.pushState({}, "");
-  paintViewIcon(); render(); scrollTo(0, roomScroll[state.view] || 0);
+  render();
+  scrollTo(0, roomScroll[state.view] || 0);
   rememberView();
+}
+$("tab-human").onclick = () => showTab("human");
+$("tab-work").onclick = () => showTab("work");
+$("seg-lines").onclick = () => setLayout("lines");
+$("seg-canvas").onclick = () => setLayout("canvas");
+$("seg-who").onclick = (ev) => {
+  const b = ev.target.closest("button[data-who]");
+  if (!b) return;
+  state.whoFilter = b.dataset.who;
+  render();
 };
+
+// ---------- search: both rooms, and an id is a query ----------
+function searchClose() { $("search").hidden = true; }
+function searchOpen() {
+  $("search").hidden = false;
+  $("q").value = "";
+  renderResults("");
+  $("q").focus();
+}
+$("search-open").onclick = searchOpen;
+$("search-close").onclick = searchClose;
+$("q").addEventListener("keydown", (ev) => { if (ev.key === "Escape") searchClose(); });
+let searchTimer = null;
+$("q").addEventListener("input", (ev) => {
+  clearTimeout(searchTimer);
+  const term = ev.target.value;
+  searchTimer = setTimeout(() => renderResults(term), 140);
+});
+async function renderResults(term) {
+  const box = $("results");
+  box.textContent = "";
+  term = (term || "").trim();
+  if (!term) {
+    const p = document.createElement("p"); p.id = "empty";
+    p.textContent = "both rooms at once. an id opens that record.";
+    box.append(p);
+    return;
+  }
+  let hits = [];
+  try {
+    const res = await fetch("/api/search?q=" + encodeURIComponent(term));
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    hits = (await res.json()).records || [];
+  } catch (e) {
+    status("search failed: " + e.message, true);
+    return;
+  }
+  if (term !== $("q").value.trim()) return;   // a later keystroke already started
+  if (!hits.length) {
+    const p = document.createElement("p"); p.id = "empty";
+    p.textContent = "nothing matches.";
+    box.append(p);
+    return;
+  }
+  for (const r of hits) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "result";
+    const meta = document.createElement("span"); meta.className = "meta";
+    meta.textContent = [AGENT_NAMES[r.author] || r.author,
+                        r.room === "humans" ? "human" : "work",
+                        r.id, shortDay(r.ts)].join(" · ");
+    const snip = document.createElement("span"); snip.className = "snip";
+    snip.textContent = snippet(r, 140);
+    b.append(meta, snip);
+    b.addEventListener("click", () => { searchClose(); openWork(r.id); });
+    box.append(b);
+  }
+}
 async function openWork(id) {
   try {
     const record = await resolveRecord(id);
@@ -775,9 +941,8 @@ async function openWork(id) {
     state.view = record.room === "humans" ? state.roomView : "work";
     if (state.view === "work") await loadWork();
     retainRecord(record);
-    navDepth++;
     history.pushState({}, "");
-    paintViewIcon(); render();
+    render();
     const el = [...document.querySelectorAll("[data-id]")].find(el => el.dataset.id === id);
     if (el) el.scrollIntoView({block: "center"});
     rememberView();
@@ -820,20 +985,6 @@ $("refresh").addEventListener("click", async () => {
     flash("nothing new");
   }
 });
-$("views").addEventListener("click", async () => {
-  rememberView();
-  retainRecord(null);
-  state.view = VIEW_NEXT[state.view] || "lines";
-  state.focusWork = null;
-  try { localStorage.setItem(VIEW_KEY, state.view); } catch (e) {}
-  paintViewIcon();
-  if (state.view === "work") await loadWork();
-  render();
-  window.scrollTo({ top: state.view === "lines" ? document.body.scrollHeight : 0,
-                    behavior: "instant" });
-  state.roomView = state.view;
-  rememberView();
-});
 window.addEventListener("pagehide", saveDraft);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) saveDraft();
@@ -844,15 +995,19 @@ document.addEventListener("visibilitychange", () => {
 // quiet room and a room you keep tabbing back to.
 let events = null;
 function listen() {
-  if (!window.EventSource) return;
+  if (!window.EventSource) { $("link").dataset.state = "down"; $("link").textContent = "no live"; return; }
   try { events = new EventSource("/api/events"); } catch (e) { return; }
+  events.onopen = () => { $("link").dataset.state = "live"; $("link").textContent = "live"; };
   events.onmessage = () => { if (!document.hidden) load(false); };
-  events.onerror = () => { /* EventSource reconnects on its own */ };
+  // Reconnecting is the normal state after a laptop sleeps; say it plainly rather than
+  // showing "live" over a dead stream, and let EventSource retry on its own.
+  events.onerror = () => { $("link").dataset.state = "down"; $("link").textContent = "reconnecting"; };
 }
 listen();
 setInterval(() => { if (!document.hidden) load(false); }, 30000);
 $("refresh").replaceChildren(ICON_REFRESH());
-paintViewIcon();
+$("search-open").replaceChildren(ICON_SEARCH());
+syncChrome();
 load(true);
 if (state.view === "work") loadWork().then(render);
 </script>
