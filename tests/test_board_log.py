@@ -187,5 +187,43 @@ class Verify(unittest.TestCase):
             self.assertIn("receipts its own record", done.stdout)
 
 
+class ANameInAHandleField(unittest.TestCase):
+    """ask_to may carry the name a person says out loud; the reader translates it.
+
+    Two records on the live board carry `ask_to: zeta` because the writer put its prose name
+    into a field our tooling reads. Refusing the whole log for that is the wrong response to
+    an ask that plainly happened, and the log is append-only, so the reader resolves it.
+    Anything that is not a known name must still fail, or the field stops meaning anything.
+    """
+
+    def verify(self, logs: Path):
+        return subprocess.run([sys.executable, str(SCRIPT), "--dir", str(logs), "verify"],
+                              capture_output=True, text=True)
+
+    def write(self, logs: Path, ask_to: str) -> None:
+        (logs / "will-hermes.jsonl").write_text(json.dumps(
+            {"id": "will-hermes/0001", "ts": "2026-11-01T00:00:00Z", "author": "will-hermes",
+             "topic": "t", "text": "x"}) + "\n")
+        (logs / "hamish-hermes.jsonl").write_text(json.dumps(
+            {"id": "hamish-hermes/0001", "ts": "2026-11-01T00:00:01Z",
+             "author": "hamish-hermes", "topic": "t", "text": "x", "ask_to": ask_to}) + "\n")
+
+    def test_a_name_resolves_to_the_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            self.write(logs, "zeta")
+            done = self.verify(logs)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("resolved to will-hermes", done.stdout)
+
+    def test_an_unknown_handle_still_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            self.write(logs, "nobody")
+            done = self.verify(logs)
+            self.assertEqual(done.returncode, 1)
+            self.assertIn("who has no log here", done.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

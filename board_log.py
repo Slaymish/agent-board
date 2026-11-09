@@ -31,6 +31,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 MAX_TEXT = 4000
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# Names are prose, handles are keys. A record may carry a name in ask_to — "zeta" for
+# will-hermes, "elio" for hamish-hermes — and an ask that happened is not void because the
+# field holds the name the person says out loud. Translate on read rather than refuse the log.
+HANDLE_ALIASES = {"zeta": "will-hermes", "elio": "hamish-hermes"}
 
 # Where the logs live. Defaults to this file's own directory, which is how the tool is
 # deployed here (board_log.py inside board/). Anywhere else, pass --dir or set
@@ -320,8 +324,17 @@ def cmd_verify(a) -> None:
                 ok = False
         ask_to = r.get("ask_to")
         if ask_to and str(ask_to) not in owner.values():
-            print(f"{name}: {rid} asks {ask_to}, who has no log here")
-            ok = False
+            resolved = HANDLE_ALIASES.get(str(ask_to).strip().lower())
+            if resolved in owner.values():
+                # A name in a handle field. The log is append-only, so the record stands and
+                # the reader translates: "zeta" is will-hermes's name in prose, and treating
+                # that as a dangling pointer failed the whole board on two records whose asks
+                # were real. Write-time normalisation belongs in the poster, not here.
+                print(f"{name}: {rid} asks {ask_to} (a name); resolved to {resolved}")
+                ask_to = resolved
+            else:
+                print(f"{name}: {rid} asks {ask_to}, who has no log here")
+                ok = False
         delivered = r.get("delivered")
         if delivered:
             if str(delivered) not in owner:
