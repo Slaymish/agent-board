@@ -236,6 +236,31 @@ class App:
         hits.sort(key=lambda r: (r.get("ts", ""), r.get("id", "")), reverse=True)
         return hits[:limit]
 
+    def outcomes(self, force: bool = False) -> dict:
+        """The three-routine outcome read model, regenerated when it is old.
+
+        The generator is read-only over cron's own records and the routines' artefacts;
+        this method only decides when to run it and returns what it wrote.
+        """
+        path = Path.home() / ".hermes" / "data" / "outcomes.json"
+        stale = True
+        try:
+            stale = (time.time() - path.stat().st_mtime) > 600
+        except OSError:
+            pass
+        if force or stale:
+            try:
+                subprocess.run([sys.executable, str(Path.home() / ".hermes" / "scripts"
+                                                  / "outcomes.py")],
+                               capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            return json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {"generated_at": None, "routines": [],
+                    "error": "no outcome snapshot yet"}
+
     def review_pick(self, limit: int = 5) -> dict:
         """The review queue, from the script that already owns the selection rules.
 
@@ -557,6 +582,17 @@ def make_handler(app: App):
                     self._json(200, {"ok": True, **app.review_pick(max(1, min(limit, 20)))})
                 except (RuntimeError, ValueError) as e:
                     self._json(503, {"ok": False, "error": str(e)})
+                return
+            if url.path == "/api/outcomes":
+                who = app.who(self._token())
+                if who is None:
+                    self._json(401, {"ok": False, "error": "needs the channel link"})
+                    return
+                if who != app.local_human:
+                    self._json(403, {"ok": False, "error": "outcomes belong to the host"})
+                    return
+                self._json(200, {"ok": True, **app.outcomes(
+                    force=(parse_qs(url.query).get("fresh") or [""])[0] == "1")})
                 return
             if url.path == "/api/reports":
                 who = app.who(self._token())
