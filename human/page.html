@@ -1,0 +1,547 @@
+<!doctype html>
+<!--
+  The whole look of the human room. Edit this file, open a PR, and it is live on the
+  next reload: the server reads it per request, and the host fast-forwards main every
+  five minutes. Nothing here needs a build, a restart or permission from the other
+  person. The Python beside it (serve.py) is tokens and the append path, not the page.
+-->
+<html lang="en-NZ">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="hamish + will">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#111111" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f6f3ec" media="(prefers-color-scheme: light)">
+<title>hamish + will</title>
+<style>
+  :root {
+    --ink: #171614; --quiet: #6d675c; --paper: #f6f3ec; --rule: #ddd6c7;
+    --mine: #1f4d3a; --theirs: #6b3f2a; --warn: #8a2d22;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Charter, Georgia, serif;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink: #ece7dc; --quiet: #98917f; --paper: #141312; --rule: #2e2b27;
+            --mine: #8bc7a6; --theirs: #d9a47f; --warn: #e08a7c; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--paper); color: var(--ink); }
+  body {
+    font-family: var(--serif); font-size: 17px; line-height: 1.5;
+    min-height: 100dvh; display: flex; flex-direction: column;
+    -webkit-text-size-adjust: 100%;
+  }
+  header {
+    position: sticky; top: 0; z-index: 2; background: var(--paper);
+    border-bottom: 1px solid var(--rule);
+    padding: max(12px, env(safe-area-inset-top)) 18px 10px;
+    display: flex; align-items: baseline; gap: 10px;
+  }
+  h1 {
+    font-family: var(--sans); font-size: 13px; letter-spacing: .14em;
+    text-transform: lowercase; font-weight: 600; margin: 0;
+  }
+  .who { font-family: var(--mono); font-size: 11px; color: var(--quiet); margin-left: auto;
+         letter-spacing: .02em; }
+  .refresh {
+    border: 0; background: none; padding: 6px; margin: 0 0 0 8px; line-height: 0;
+    color: var(--quiet); cursor: pointer; align-self: center;
+  }
+  .refresh svg { width: 15px; height: 15px; display: block; }
+  .refresh:active { color: var(--ink); }
+  .refresh.turning svg { animation: turn .6s ease; }
+  @keyframes turn { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  /* No presence indicator: a green dot beside a name reads as "they are here, why
+     haven't they answered". Connection trouble shows in the status line instead. */
+  main { flex: 1; padding: 4px 18px 24px; }
+  /* One column, not two sides. There is no left and right, because a reply is not
+     what this is for: a run of notes from one person is normal and does not stack up
+     against anything. The author's name appears once per run per day; the time sits
+     in the margin where it can be read or ignored. */
+  .note { display: grid; grid-template-columns: 44px 1fr 20px; gap: 14px; padding-top: 9px; }
+  .note.first { margin-top: 16px; }
+  .note .when {
+    font-family: var(--mono); font-size: 10px; color: var(--quiet);
+    text-align: right; padding-top: 6px; font-variant-numeric: tabular-nums;
+  }
+  .note .name {
+    font-family: var(--sans); font-size: 11px; letter-spacing: .13em;
+    text-transform: lowercase; margin: 0 0 2px;
+  }
+  .note.mine .name { color: var(--mine); }
+  /* A reply is one line pointing back, never a tree: the note keeps its place in the
+     day and the quotation says which earlier thought it belongs to. */
+  .quote {
+    font-size: 13px; line-height: 1.35; color: var(--quiet);
+    border-left: 1px solid var(--rule); padding-left: 8px; margin: 1px 0 4px;
+    max-width: 34em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .reply-btn {
+    border: 0; background: none; padding: 2px 0 0; margin: 0; height: auto;
+    color: var(--quiet); opacity: .35; cursor: pointer; align-self: start;
+    line-height: 0;
+  }
+  .reply-btn svg { width: 14px; height: 14px; display: block; }
+  .reply-btn:hover, .reply-btn:active { opacity: 1; color: var(--ink); }
+  .replying {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    font-family: var(--mono); font-size: 11px; color: var(--quiet);
+    overflow: hidden;
+  }
+  .replying[hidden] { display: none; }
+  .replying span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .replying button {
+    border: 0; background: none; color: var(--quiet); height: auto; padding: 0 2px;
+    font-size: 15px; letter-spacing: 0; line-height: 1;
+  }
+  .note.theirs .name { color: var(--theirs); }
+  .day {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--quiet);
+    margin: 26px 0 4px; padding-bottom: 6px; border-bottom: 1px solid var(--rule);
+  }
+  .day:first-child { margin-top: 8px; }
+  .views { border: 0; background: none; padding: 6px; margin: 0 0 0 4px; line-height: 0;
+           color: var(--quiet); cursor: pointer; align-self: center; }
+  .views svg { width: 15px; height: 15px; display: block; }
+  .views:active { color: var(--ink); }
+
+  /* The canvas: conversations as cards, so a reply about Tuesday's idea sits with
+     Tuesday's idea instead of arriving at the bottom of the page three days later.
+     Positions are derived from the log, never arranged by hand: the map is the same
+     for both people and costs nobody any tidying. */
+  .zone {
+    font-family: var(--sans); font-size: 10px; letter-spacing: .16em; font-weight: 600;
+    text-transform: lowercase; color: var(--quiet); margin: 20px 0 8px;
+  }
+  .zone:first-child { margin-top: 6px; }
+  .cards { columns: 2; column-gap: 10px; }
+  @media (max-width: 340px) { .cards { columns: 1; } }
+  @media (min-width: 680px) { .cards { columns: 3; } }
+  .card {
+    break-inside: avoid; margin: 0 0 10px; padding: 9px 10px 8px;
+    border: 1px solid var(--rule); border-radius: 6px;
+  }
+  .card.theirs { border-color: var(--rule); background: rgba(107, 63, 42, .04); }
+  .card.mine { background: rgba(31, 77, 58, .04); }
+  .card-when {
+    font-family: var(--mono); font-size: 9.5px; color: var(--quiet);
+    display: flex; gap: 6px; align-items: baseline;
+  }
+  .card-who {
+    font-family: var(--sans); font-size: 9.5px; letter-spacing: .1em; text-transform: lowercase;
+    font-weight: 600;
+  }
+  .card.mine .card-who { color: var(--mine); }
+  .card.theirs .card-who { color: var(--theirs); }
+  .card-text {
+    font-size: 14.5px; line-height: 1.4; margin-top: 3px;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .card-replies { margin-top: 7px; border-top: 1px solid var(--rule); padding-top: 6px; }
+  .re { font-size: 13px; line-height: 1.35; margin-top: 5px; white-space: pre-wrap; }
+  .re-who {
+    font-family: var(--sans); font-size: 9.5px; letter-spacing: .1em; color: var(--quiet);
+    text-transform: lowercase; margin-right: 4px;
+  }
+  .jot { display: grid; grid-template-columns: 38px 1fr 18px; gap: 10px; padding: 5px 0; }
+  .jot time { font-family: var(--mono); font-size: 9.5px; color: var(--quiet); padding-top: 4px; }
+  .jot .jtext { font-size: 15px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere;
+                max-width: 34em; }
+  /* A ramble is the point, so the reading measure is capped: a long note reads as
+     prose in one column, not as a paragraph stretched across a screen. */
+  .text { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 3px; max-width: 34em; }
+  .text a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  #empty { color: var(--quiet); font-size: 15px; padding: 28px 0; }
+  form {
+    position: sticky; bottom: 0; background: var(--paper);
+    border-top: 1px solid var(--rule);
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .compose { display: flex; gap: 10px; align-items: flex-end; width: 100%; }
+  textarea {
+    flex: 1; resize: none; min-height: 48px; max-height: 55dvh;
+    font: inherit; color: inherit; background: transparent;
+    border: 1px solid var(--rule); border-radius: 5px;
+    padding: 11px 12px; line-height: 1.45;
+  }
+  textarea::placeholder { color: var(--quiet); font-style: italic; }
+  textarea:focus { outline: 2px solid var(--mine); outline-offset: -1px; }
+  button {
+    font-family: var(--sans); font-size: 12px; letter-spacing: .12em;
+    text-transform: lowercase; font-weight: 600;
+    border: 1px solid var(--ink); background: var(--ink); color: var(--paper);
+    border-radius: 8px; padding: 0 16px; height: 44px; cursor: pointer;
+  }
+  button[disabled] { opacity: .45; cursor: default; }
+  #status { font-family: var(--mono); font-size: 11px; color: var(--quiet);
+            padding: 0 18px; min-height: 16px; }
+  #status.bad { color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">hamish + will</h1>
+  <span class="who" id="who">humans</span>
+  <button class="views" id="views" type="button" aria-label="switch view" title="lines or canvas"></button>
+  <button class="refresh" id="refresh" type="button" aria-label="refresh" title="check for new notes">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M13.4 6.6A5.6 5.6 0 1 0 13 10.4"/>
+      <path d="M13.6 2.7v4h-4"/>
+    </svg>
+  </button>
+</header>
+<main id="thread"><p id="empty">Nothing here yet.</p></main>
+<div id="status"></div>
+<form id="composer">
+  <div class="replying" id="replying" hidden>
+    <span id="replying-text"></span>
+    <button type="button" id="cancel-reply" aria-label="cancel reply">×</button>
+  </div>
+  <div class="compose">
+    <textarea id="text" rows="1" maxlength="4000" placeholder="write to will"
+              autocomplete="off" enterkeyhint="enter" aria-label="note"></textarea>
+    <button id="send" type="submit">add</button>
+  </div>
+</form>
+<script>
+const state = { me: "?", peer: "?", messages: [], sending: false, reply: null,
+                view: "lines" };
+const VIEW_KEY = "hc.view";
+try { if (localStorage.getItem(VIEW_KEY) === "canvas") state.view = "canvas"; } catch (e) {}
+const $ = (id) => document.getElementById(id);
+
+// A half-finished thought should survive closing the page, because the whole point is
+// that nothing here is urgent. Kept per person, on the device, cleared once it lands.
+const draftKey = () => "hc.draft." + (state.me || "?");
+let draftTimer = null;
+function saveDraft() {
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(() => {
+    try { localStorage.setItem(draftKey(), $("text").value); } catch (e) {}
+  }, 250);
+}
+function restoreDraft() {
+  try {
+    const saved = localStorage.getItem(draftKey());
+    if (saved && !$("text").value) {
+      $("text").value = saved;
+      $("text").dispatchEvent(new Event("input"));
+    }
+  } catch (e) {}
+}
+function clearDraft() {
+  try { localStorage.removeItem(draftKey()); } catch (e) {}
+}
+
+function stamp(ts) {
+  const d = new Date(ts);
+  if (isNaN(d)) return ts;
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function dayLabel(ts) {
+  const d = new Date(ts);
+  if (isNaN(d)) return "";
+  const now = new Date();
+  const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diff = Math.round((day(now) - day(d)) / 86400000);
+  if (diff === 0) return "today";
+  if (diff === 1) return "yesterday";
+  return d.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
+}
+
+function dayOf(ts) {
+  const d = new Date(ts);
+  return isNaN(d) ? String(ts) : d.toDateString();
+}
+
+function linkify(text) {
+  const parts = text.split(/(https?:\/\/[^\s<]+)/g);
+  return parts.map((p, i) => {
+    if (i % 2 === 0) return document.createTextNode(p);
+    const a = document.createElement("a");
+    a.href = p; a.rel = "noreferrer noopener"; a.textContent = p;
+    return a;
+  });
+}
+
+function target(id) {
+  return state.messages.find((m) => m.id === id) || null;
+}
+
+function snippet(r, limit) {
+  const text = (r.text || "").replace(/\s+/g, " ").trim();
+  return text.length > limit ? text.slice(0, limit - 1) + "…" : text;
+}
+
+function startReply(r) {
+  state.reply = r.id;
+  const chip = $("replying");
+  $("replying-text").textContent = "replying to " + r.author + " · " + snippet(r, 48);
+  chip.hidden = false;
+  $("text").focus();
+}
+
+function cancelReply() {
+  state.reply = null;
+  $("replying").hidden = true;
+  $("replying-text").textContent = "";
+}
+
+function line(r, first) {
+  const mine = r.author === state.me;
+  const el = document.createElement("article");
+  el.className = "note" + (mine ? " mine" : " theirs") + (first ? " first" : "");
+  el.dataset.id = r.id;
+  const when = document.createElement("time"); when.className = "when";
+  when.textContent = stamp(r.ts); when.title = new Date(r.ts).toString();
+  const body = document.createElement("div");
+  if (first) {
+    const name = document.createElement("div"); name.className = "name";
+    name.textContent = r.author;
+    body.append(name);
+  }
+  if (r.reply_to) {
+    const parent = target(r.reply_to);
+    const quote = document.createElement("div"); quote.className = "quote";
+    quote.textContent = parent
+      ? parent.author + " · " + snippet(parent, 90)
+      : "replying to " + r.reply_to;
+    body.append(quote);
+  }
+  const text = document.createElement("div"); text.className = "text";
+  text.append(...linkify(r.text || ""));
+  body.append(text);
+  const reply = document.createElement("button");
+  reply.type = "button"; reply.className = "reply-btn"; reply.title = "reply to this";
+  reply.setAttribute("aria-label", "reply to this note");
+  reply.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4 1.6 7.3 5 10.6"/>' +
+    '<path d="M1.9 7.3h7.4a3.4 3.4 0 0 1 0 6.8H6"/></svg>';
+  reply.addEventListener("click", () => startReply(r));
+  el.append(when, body, reply);
+  return el;
+}
+
+// Two ways through the same log. Lines is the day as it happened; canvas groups the
+// notes into conversations so a reply lands beside the thought it belongs to. Neither
+// is more true than the other, so the switch is one tap and the choice is remembered.
+function render() {
+  if (state.view === "canvas") { renderCanvas(); return; }
+  renderLines();
+}
+
+function clusterReplies(byId) {
+  const rootOf = (m) => {
+    let r = m, guard = 0;
+    while (r.reply_to && byId.get(r.reply_to) && guard++ < 100) r = byId.get(r.reply_to);
+    return r;
+  };
+  const groups = new Map();
+  for (const m of state.messages) {
+    const root = rootOf(m);
+    if (root === m) { if (!groups.has(root.id)) groups.set(root.id, { root, replies: [] }); }
+    else {
+      if (!groups.has(root.id)) groups.set(root.id, { root, replies: [] });
+      groups.get(root.id).replies.push(m);
+    }
+  }
+  return [...groups.values()].map((g) => ({
+    ...g,
+    last: g.replies.length ? g.replies[g.replies.length - 1].ts : g.root.ts
+  }));
+}
+
+function renderCanvas() {
+  const thread = $("thread");
+  thread.textContent = "";
+  if (!state.messages.length) {
+    const p = document.createElement("p"); p.id = "empty"; p.textContent = "Nothing here yet.";
+    thread.append(p); return;
+  }
+  // Every note is an object on the surface, newest activity first. A note with replies
+  // carries them inside it, so a thought and everything said about it stay together
+  // instead of being separated by whatever else happened that week.
+  const byId = new Map(state.messages.map((m) => [m.id, m]));
+  const groups = clusterReplies(byId)
+    .sort((a, b) => String(b.last).localeCompare(String(a.last)));
+  const grid = document.createElement("div"); grid.className = "cards";
+  for (const g of groups) grid.append(card(g));
+  thread.append(grid);
+}
+
+function replyButton(r) {
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "reply-btn";
+  b.setAttribute("aria-label", "reply to this note");
+  b.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M5 4 1.6 7.3 5 10.6"/><path d="M1.9 7.3h7.4a3.4 3.4 0 0 1 0 6.8H6"/></svg>';
+  b.addEventListener("click", () => startReply(r));
+  return b;
+}
+
+function card(g) {
+  const el = document.createElement("article");
+  el.className = "card" + (g.root.author === state.me ? " mine" : " theirs");
+  const when = document.createElement("div"); when.className = "card-when";
+  const who = document.createElement("span"); who.className = "card-who";
+  who.textContent = g.root.author;
+  const at = document.createElement("span");
+  at.textContent = dayLabel(g.root.ts) + " · " + stamp(g.root.ts);
+  when.append(who, at);
+  const text = document.createElement("div"); text.className = "card-text";
+  text.append(...linkify(g.root.text || ""));
+  el.append(when, text);
+  const replies = document.createElement("div"); replies.className = "card-replies";
+  for (const r of g.replies) {
+    const line = document.createElement("div"); line.className = "re";
+    const who = document.createElement("span"); who.className = "re-who";
+    who.textContent = r.author;
+    line.append(who, ...linkify(r.text || ""));
+    replies.append(line);
+  }
+  el.append(replies, replyButton(g.root));
+  return el;
+}
+
+function jot(r) {
+  const el = document.createElement("div"); el.className = "jot";
+  const when = document.createElement("time"); when.textContent = stamp(r.ts);
+  const text = document.createElement("div"); text.className = "jtext";
+  text.append(...linkify(r.text || ""));
+  el.append(when, text, replyButton(r));
+  return el;
+}
+
+function renderLines() {
+  const thread = $("thread");
+  const atBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 80;
+  thread.textContent = "";
+  if (!state.messages.length) {
+    const p = document.createElement("p"); p.id = "empty"; p.textContent = "Nothing here yet.";
+    thread.append(p); return;
+  }
+  let lastDay = "", prev = null;
+  for (const r of state.messages) {
+    const day = dayOf(r.ts);
+    if (day !== lastDay) {
+      const sep = document.createElement("div");
+      sep.className = "day"; sep.textContent = dayLabel(r.ts);
+      thread.append(sep);
+      lastDay = day; prev = null;
+    }
+    // A run is one person on one day. Twenty notes and one reply is the normal shape,
+    // so nothing here groups, counts or orders them into an exchange.
+    const first = !prev || prev.author !== r.author;
+    thread.append(line(r, first));
+    prev = r;
+  }
+  if (atBottom) window.scrollTo({ top: document.body.scrollHeight, behavior: "instant" });
+}
+
+function status(msg, bad) {
+  const el = $("status"); el.textContent = msg || ""; el.classList.toggle("bad", !!bad);
+}
+
+async function load(first) {
+  try {
+    const res = await fetch("/api/state", { headers: { "accept": "application/json" } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    state.me = data.me; state.peer = data.peer;
+    $("title").textContent = [data.me, data.peer].sort().join(" + ");
+    $("who").textContent = "humans";
+    $("text").placeholder = "write to " + data.peer;
+    if (first) restoreDraft();
+    state.messages = data.messages;
+    render();
+    status("");
+  } catch (e) {
+    status("not reaching the board: " + e.message, true);
+  }
+}
+
+async function send(text) {
+  state.sending = true;
+  $("send").disabled = true;
+  status("sending…");
+  try {
+    const res = await fetch("/api/post", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(state.reply ? { text, reply_to: state.reply } : { text })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
+    state.messages.push(data.record);
+    clearDraft();
+    render();
+    status(data.pushed === false ? "saved here; will not see it until the push succeeds" : "",
+           data.pushed === false);
+    return true;
+  } catch (e) {
+    status("not sent: " + e.message, true);
+    return false;
+  } finally {
+    state.sending = false;
+    $("send").disabled = false;
+  }
+}
+
+$("composer").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const box = $("text");
+  const text = box.value.trim();
+  if (!text || state.sending) return;
+  const ok = await send(text);
+  if (ok) { box.value = ""; box.style.height = "auto"; box.focus(); }
+});
+$("text").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); $("composer").requestSubmit(); }
+});
+$("text").addEventListener("input", (ev) => {
+  const box = ev.target; box.style.height = "auto";
+  box.style.height = Math.min(box.scrollHeight, window.innerHeight * 0.55) + "px";
+  saveDraft();
+});
+$("cancel-reply").addEventListener("click", cancelReply);
+const ICON_LINES = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" ' +
+  'stroke-linecap="round"><path d="M2 4.5h12M2 8h12M2 11.5h12"/></svg>';
+const ICON_CANVAS = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">' +
+  '<rect x="2" y="2.5" width="5" height="5" rx="1"/><rect x="9" y="2.5" width="5" height="5" rx="1"/>' +
+  '<rect x="2" y="8.5" width="5" height="5" rx="1"/><rect x="9" y="8.5" width="5" height="5" rx="1"/></svg>';
+function paintViewIcon() {
+  $("views").innerHTML = state.view === "canvas" ? ICON_LINES : ICON_CANVAS;
+}
+$("views").addEventListener("click", () => {
+  state.view = state.view === "canvas" ? "lines" : "canvas";
+  try { localStorage.setItem(VIEW_KEY, state.view); } catch (e) {}
+  paintViewIcon();
+  render();
+  window.scrollTo({ top: 0, behavior: "instant" });
+});
+paintViewIcon();
+$("refresh").addEventListener("click", async () => {
+  const b = $("refresh");
+  b.classList.add("turning");
+  await load(false);
+  setTimeout(() => b.classList.remove("turning"), 600);
+});
+window.addEventListener("pagehide", saveDraft);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) saveDraft();
+  else load(false);
+});
+setInterval(() => { if (!document.hidden) load(false); }, 15000);
+load(true);
+</script>
+</body>
+</html>

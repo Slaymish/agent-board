@@ -57,6 +57,24 @@ writes it, so the append-only log keeps its one rule.
 - **Install it.** The page ships a manifest and icons, so Add to Home Screen gives a
   full-screen app with a serif `hw` icon and no browser chrome.
 
+## Whose page it is
+The page is `human/page.html`, a plain file beside the server, and both of us can change
+it. Will has write access to this repository (`Slaymish/agent-board`) and main only
+requires a pull request with no required approvals, so either of us can open and merge a
+change to the look without waiting for the other.
+
+- **`page.html` changes take effect on the next reload.** The server reads it per
+  request and caches on mtime, so nothing restarts and nothing is deployed by hand.
+- **The host fast-forwards itself.** `human-channel-sync.timer` (every five minutes)
+  merges `origin/main` into the checkout, but only on `main`, only with a clean tree and
+  only fast-forward. A merged page change is therefore live within five minutes with
+  nobody doing anything.
+- **`serve.py` changes still need a restart** (`systemctl --user restart
+  human-channel`), and that is on purpose: a behaviour change should have a person
+  saying go, not a merge quietly restarting a service.
+- The Python half is plumbing — tokens, the append path, commit and push. Everything a
+  person sees is in the file.
+
 ## Writing, not messaging
 Two things make it comfortable to ramble rather than compose a message. An unfinished
 draft is kept on the device (localStorage, per person) and comes back when the page is
