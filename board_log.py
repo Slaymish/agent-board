@@ -252,8 +252,10 @@ def cmd_read(a) -> None:
     for r in rs:
         links = []
         for k in ("reply_to", "amends", "answers"):
-            if r.get(k):
-                links.append(f"{k}={r[k]}")
+            v = r.get(k)
+            if v:
+                # answers may bind several asks; print them the way they are read.
+                links.append(f"{k}=" + (",".join(map(str, v)) if isinstance(v, list) else str(v)))
         if r.get("ask_to"):
             links.append(f"ask_to={r['ask_to']}")
         head = f"{r.get('id','?')}  {r.get('ts','?')}  {r.get('author','?')}"
@@ -291,8 +293,22 @@ def cmd_post(a) -> None:
                 "room": room, "via": via}
     for k in ("reply_to", "amends", "ask_to", "answers"):
         v = getattr(a, k, None)
-        if v:
-            rec_body[k] = v
+        if not v:
+            continue
+        if k == "answers":
+            # One record can settle several asks. Store a list only when there is
+            # more than one id, so every existing record keeps the shape it was
+            # written with and a single answer still reads as a string.
+            ids: list[str] = []
+            for chunk in (v if isinstance(v, list) else [v]):
+                ids.extend(x.strip() for x in str(chunk).split(",") if x.strip())
+            seen: set[str] = set()
+            ids = [i for i in ids if not (i in seen or seen.add(i))]
+            if not ids:
+                continue
+            rec_body[k] = ids if len(ids) > 1 else ids[0]
+            continue
+        rec_body[k] = v
 
     path = own_file(a.author)
     path.touch(exist_ok=True)
@@ -382,15 +398,21 @@ def cmd_verify(a) -> None:
         rid = r.get("id")
         for k in ("reply_to", "answers"):
             target = r.get(k)
-            if target and str(target) not in owner:
-                print(f"{name}: {rid} {k}={target} does not exist")
-                ok = False
-            elif target and k == "reply_to":
-                mine, theirs = room_of.get(str(rid), "shared"), room_of.get(str(target), "shared")
-                if mine != theirs:
-                    print(f"{name}: {rid} replies across rooms ({mine} -> {theirs}); "
-                          f"a reply stays in its parent's room")
+            if not target:
+                continue
+            # `answers` may bind several asks in one record (a comma list or a
+            # repeated flag on post). Each element is a separate claim, so each is
+            # checked: a list is not a licence to name an id that is not there.
+            for t in (target if isinstance(target, list) else [target]):
+                if str(t) not in owner:
+                    print(f"{name}: {rid} {k}={t} does not exist")
                     ok = False
+                elif k == "reply_to":
+                    mine, theirs = room_of.get(str(rid), "shared"), room_of.get(str(t), "shared")
+                    if mine != theirs:
+                        print(f"{name}: {rid} replies across rooms ({mine} -> {theirs}); "
+                              f"a reply stays in its parent's room")
+                        ok = False
         amends = r.get("amends")
         if amends:
             if str(amends) not in owner:
@@ -654,7 +676,10 @@ def main() -> None:
     w.add_argument("--via", choices=VIAS,
                    help="whose voice wrote it; default human for a person, agent otherwise")
     for k in ("reply_to", "amends", "ask_to", "answers"):
-        w.add_argument("--" + k.replace("_", "-"), dest=k)
+        w.add_argument("--" + k.replace("_", "-"), dest=k,
+                       action="append" if k == "answers" else "store",
+                       help="answering record: one ask id, a comma list, or repeat the flag"
+                       if k == "answers" else None)
     w.add_argument("--no-push", action="store_true")
     w.add_argument("--allow-foreign-author", action="store_true",
                    help="permit writing a log this machine is not pinned to")
