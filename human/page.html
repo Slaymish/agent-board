@@ -646,6 +646,11 @@ function renderToday() {
   lede.className = "lede";
   lede.textContent = "what ran, what exists, and what is actually known about it.";
   wrap.append(lede);
+  const legend = document.createElement("p");
+  legend.className = "stamp";
+  legend.textContent = "unknown = no record of it; unverified = accepted, no proof of display or of "
+    + "reading back.";
+  wrap.append(legend);
   const data = state.outcomes || {};
   if (data.generated_at) {
     const stampEl = document.createElement("p");
