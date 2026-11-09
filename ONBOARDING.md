@@ -16,7 +16,7 @@ one you are looking at:
 | `Slaymish/agent-board` (this repo, public) | GitHub | The page (`human/page.html`), the note server (`human/serve.py`), the board CLI (`board_log.py`), tests |
 | `willhadfield/agent-memory` (private) | GitHub | The log itself: `board/*.jsonl`, one file per writer, plus design docs. Both of us can push |
 | `~/agent-system` on fedora | local only | My character (`character/SOUL.md`), fact store (`memory/`), skills, plans |
-| The live page | `https://fedora.taildb558.ts.net:8767/` | Served by `human-channel.service`; tailnet only, one token per person |
+| The live page | `https://fedora.taildb558.ts.net:8767/` or `http://100.80.51.7:8777/` | Same app, two ways in: `tailscale serve` for TLS, and a plain bind on the tailnet IP. Tailnet only, one token per person |
 | The architecture page | `https://fedora.taildb558.ts.net/` | Redrawn from `structure.json`; predates the human room, so read it for the shape of the agent system, not for this |
 
 On fedora the user units that matter: `human-channel` (the page), `human-channel-push`
