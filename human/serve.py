@@ -54,6 +54,9 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="hamish + will">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="theme-color" content="#111111" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#f6f3ec" media="(prefers-color-scheme: light)">
 <title>hamish + will</title>
@@ -318,19 +321,32 @@ def _now() -> str:
 class App:
     """Everything the handler needs, resolved once at start-up."""
 
-    def __init__(self, board: Path, human: str, token: str, *, git: bool = True,
-                 pull_every: int = 45) -> None:
+    def __init__(self, board: Path, tokens: dict[str, str], *, local_human: str = "hamish",
+                 git: bool = True, pull_every: int = 45) -> None:
         self.board = board
-        self.human = human
-        self.token = token
+        self.tokens = {t: h for h, t in tokens.items() if t}
+        self.local_human = local_human
         self.git = git
         self.pull_every = pull_every
         self.write_lock = threading.Lock()
         self.pulling = threading.Lock()
         board_log.set_dir(board)
 
-    def peer(self) -> str:
-        return "will" if self.human == "hamish" else "hamish"
+    def who(self, token: str) -> str | None:
+        """The person this token belongs to, or None.
+
+        The author of a post is derived here and never taken from the request body:
+        a page that let the client name the author would make `via: human` mean
+        nothing at all, which is the whole thing it is meant to establish.
+        """
+        for known, human in self.tokens.items():
+            if token and hmac.compare_digest(token, known):
+                return human
+        return None
+
+    def peer(self, human: str | None = None) -> str:
+        human = human or self.local_human
+        return "will" if human == "hamish" else "hamish"
 
     def humans(self) -> list[dict]:
         out = [r for r in board_log.all_records()
@@ -348,23 +364,23 @@ class App:
         finally:
             self.pulling.release()
 
-    def post(self, text: str, topic: str = "note") -> dict:
+    def post(self, human: str, text: str, topic: str = "note") -> dict:
         text = text.strip()
         if not text:
             raise ValueError("empty message")
         if len(text) > MAX_TEXT:
             raise ValueError(f"text is {len(text)} chars; the limit is {MAX_TEXT}")
-        problem = board_log.room_voice_problem(self.human, ROOM, "human")
+        problem = board_log.room_voice_problem(human, ROOM, "human")
         if problem:                      # configuration error, not the writer's fault
             raise RuntimeError(problem)
         with self.write_lock:
-            rec = board_log._append_record(self.human, {
-                "ts": _now(), "author": self.human, "topic": topic, "text": text,
+            rec = board_log._append_record(human, {
+                "ts": _now(), "author": human, "topic": topic, "text": text,
                 "room": ROOM, "via": "human",
             })
             pushed = None
             if self.git:
-                path = board_log.own_file(self.human)
+                path = board_log.own_file(human)
                 board_log.git("add", str(path.relative_to(board_log.REPO)))
                 board_log.git("commit", "-q", "-m", f"board: {rec['id']} {topic}".strip())
                 pushed = board_log.git("push", check=False).returncode == 0
@@ -402,13 +418,16 @@ def make_handler(app: App):
             morsel = jar.get(COOKIE)
             return morsel.value if morsel else ""
 
-        def _authed(self) -> bool:
+        def _token(self) -> str:
             given = self._cookie_token()
             if not given:
                 auth = self.headers.get("authorization", "")
                 if auth.lower().startswith("bearer "):
                     given = auth[7:].strip()
-            return bool(given) and hmac.compare_digest(given, app.token)
+            return given
+
+        def _authed(self) -> bool:
+            return app.who(self._token()) is not None
 
         def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> None:
             self.send_response(code)
@@ -429,10 +448,25 @@ def make_handler(app: App):
         # --- routes ----------------------------------------------------------
         def do_GET(self) -> None:
             url = urlparse(self.path)
+            if url.path in ("/manifest.webmanifest", "/icon-180.png", "/icon-192.png",
+                            "/icon-512.png"):
+                # Icons and the manifest carry nothing secret, and the browser fetches
+                # them before the cookie exists on a fresh install.
+                name = url.path.lstrip("/")
+                path = HERE / "static" / name
+                if not path.exists():
+                    self._json(404, {"ok": False, "error": "no such asset"})
+                    return
+                ctype = ("application/manifest+json" if name.endswith(".webmanifest")
+                         else "image/png")
+                self._send(200, path.read_bytes(), ctype,
+                           {"cache-control": "public, max-age=86400"})
+                return
             if url.path == "/health":
                 ok, detail = app.verify()
                 self._json(200 if ok else 500,
-                           {"ok": ok, "human": app.human, "room": ROOM,
+                           {"ok": ok, "local_human": app.local_human, "room": ROOM,
+                            "people": sorted(set(app.tokens.values())),
                             "board": str(app.board), "detail": detail.splitlines()[0]})
                 return
             if url.path == "/api/state":
@@ -444,14 +478,15 @@ def make_handler(app: App):
                 if since:
                     ids = [r.get("id") for r in rows]
                     rows = rows[ids.index(since) + 1:] if since in ids else rows
-                self._json(200, {"ok": True, "me": app.human, "peer": app.peer(),
+                me = app.who(self._token())
+                self._json(200, {"ok": True, "me": me, "peer": app.peer(me),
                                  "messages": rows, "server_time": _now()})
                 return
             if url.path in ("/", "/index.html"):
                 q = parse_qs(url.query)
                 key = (q.get("k") or [""])[0]
-                if key and hmac.compare_digest(key, app.token):
-                    cookie = (f"{COOKIE}={app.token}; Path=/; HttpOnly; SameSite=Lax; "
+                if key and app.who(key) is not None:
+                    cookie = (f"{COOKIE}={key}; Path=/; HttpOnly; SameSite=Lax; "
                               f"Max-Age=31536000")
                     self._send(302, b"", "text/plain", {"location": "/",
                                                         "set-cookie": cookie})
@@ -490,8 +525,12 @@ def make_handler(app: App):
             except (json.JSONDecodeError, UnicodeDecodeError):
                 self._json(400, {"ok": False, "error": "body is not JSON"})
                 return
+            human = app.who(self._token())
+            if human is None:
+                self._json(401, {"ok": False, "error": "needs the channel link"})
+                return
             try:
-                out = app.post(text, topic)
+                out = app.post(human, text, topic)
             except ValueError as e:
                 self._json(400, {"ok": False, "error": str(e)})
                 return
@@ -503,16 +542,34 @@ def make_handler(app: App):
     return Handler
 
 
-def token_from(path: Path) -> str:
+def people_from(path: Path, local_human: str) -> dict[str, str]:
+    """human -> token, one per person, created once.
+
+    A single token was enough when the page was one person's viewer. Two tokens are
+    what make the author derivable: the server decides who is writing from the token
+    that opened the page, so nobody has to pick a name and no request can claim one.
+    The old single-token file, if present, becomes the local person's token so a link
+    already on a phone keeps working.
+    """
     if path.exists():
-        tok = path.read_text().strip()
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data, dict) and data:
+                return {str(k): str(v) for k, v in data.items() if v}
+        except json.JSONDecodeError:
+            pass
+    legacy = path.parent / "human-channel-token"
+    people: dict[str, str] = {}
+    if legacy.exists():
+        tok = legacy.read_text().strip()
         if tok:
-            return tok
+            people[local_human] = tok
+    for human in board_log.HUMAN_AUTHORS:
+        people.setdefault(human, secrets.token_urlsafe(24))
     path.parent.mkdir(parents=True, exist_ok=True)
-    tok = secrets.token_urlsafe(24)
-    path.write_text(tok + "\n")
+    path.write_text(json.dumps(people, indent=1) + "\n")
     path.chmod(0o600)
-    return tok
+    return people
 
 
 def main() -> None:
@@ -523,7 +580,8 @@ def main() -> None:
                    help="the person on this machine (hamish or will)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8767)
-    p.add_argument("--token-file", default=str(Path.home() / ".hermes/human-channel-token"))
+    p.add_argument("--token-file", default=str(Path.home() / ".hermes/human-channels.json"),
+                   help="human -> token; created on first start")
     p.add_argument("--no-git", action="store_true", help="write the file only; no commit or push")
     p.add_argument("--pull", type=int, default=45, metavar="SECONDS",
                    help="how often to pull the other side's records (0 = never)")
@@ -534,15 +592,16 @@ def main() -> None:
         sys.exit(f"no board directory at {board}")
     if board_log.is_human_author(a.author) is False:
         sys.exit(f"--author must be one of {', '.join(board_log.HUMAN_AUTHORS)}")
-    token = token_from(Path(a.token_file).expanduser())
-    app = App(board, a.author, token, git=not a.no_git, pull_every=a.pull)
+    people = people_from(Path(a.token_file).expanduser(), a.author)
+    app = App(board, people, local_human=a.author, git=not a.no_git, pull_every=a.pull)
     stop = threading.Event()
     if not a.no_git and a.pull:
         threading.Thread(target=app.pull_forever, args=(stop,), daemon=True).start()
 
     httpd = ThreadingHTTPServer((a.host, a.port), make_handler(app))
-    print(f"human channel: {board} as {a.author} on http://{a.host}:{a.port}/")
-    print(f"link: http://{a.host}:{a.port}/?k={token}")
+    print(f"human channel: {board} on http://{a.host}:{a.port}/")
+    for human, token in people.items():
+        print(f"  {human}: /?k={token}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

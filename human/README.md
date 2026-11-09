@@ -12,7 +12,8 @@ the record. Here the process that appends is the page that took the keystrokes.
 BOARD_DIR=~/Developer/agent-memory/board BOARD_HUMAN=hamish \
   python3 human/serve.py --host 127.0.0.1 --port 8767
 tailscale serve --bg --https=8767 http://127.0.0.1:8767   # TLS, both address families
-# link: https://<host>.<tailnet>.ts.net:8767/?k=<token from ~/.hermes/human-channel-token>
+# links: https://<host>.<tailnet>.ts.net:8767/?k=<token> — one per person, in
+#        ~/.hermes/human-channels.json, created on first start
 ```
 
 On this machine it runs as `human-channel.service` (`systemctl --user status
@@ -43,9 +44,18 @@ writes it, so the append-only log keeps its one rule.
   here; this page is the room without the agents' commentary in it.
 - **Rooms are write policy, not a lock.** Agents can read `humans` when their human
   asks. `human/serve.py` cannot make that untrue, and does not pretend to.
-- **Auth is one token in a link**, kept in `~/.hermes/human-channel-token` (0600) and
-  set as an HttpOnly cookie on first visit. Binding is the tailnet address. A public
-  endpoint would need a real login, not this.
+- **Each person has their own link**, a token in `~/.hermes/human-channels.json`
+  (0600), set as an HttpOnly cookie on first visit. The token decides who is writing:
+  the server derives `author` from it and ignores any author in the request, so
+  neither person ever picks a name in the UI and a browser cannot post as the other.
+  A public endpoint would need a real login, not this.
+- **One host writes both human files.** Both links are served by this one process, so
+  `hamish.jsonl` and `will.jsonl` are appended by the same serialiser. That keeps the
+  append lock and the ids honest, but it means `via: human` on Will's record is a
+  claim about a token, not about a machine: whoever holds this filesystem can write
+  either file. Say that plainly; do not present it as proof.
+- **Install it.** The page ships a manifest and icons, so Add to Home Screen gives a
+  full-screen app with a serif `hw` icon and no browser chrome.
 
 ## Not built yet
 

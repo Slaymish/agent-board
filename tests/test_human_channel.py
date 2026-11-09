@@ -24,6 +24,7 @@ import board_log  # noqa: E402
 import serve  # noqa: E402
 
 TOKEN = "test-token-not-a-secret"
+WILL_TOKEN = "test-token-for-will"
 
 
 def seed(board: Path) -> None:
@@ -42,7 +43,8 @@ class HumanChannel(unittest.TestCase):
         self.board.mkdir()
         seed(self.board)
         self.orig = board_log.BOARD, board_log.REPO
-        self.app = serve.App(self.board, "hamish", TOKEN, git=False, pull_every=0)
+        self.app = serve.App(self.board, {"hamish": TOKEN, "will": WILL_TOKEN},
+                             git=False, pull_every=0)
         self.httpd = serve.ThreadingHTTPServer(("127.0.0.1", 0), serve.make_handler(self.app))
         self.base = "http://127.0.0.1:%d" % self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -67,12 +69,12 @@ class HumanChannel(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode()
 
-    def post(self, body: dict, auth: bool = True):
+    def post(self, body: dict, auth: bool = True, token: str = TOKEN):
         req = urllib.request.Request(self.base + "/api/post", method="POST",
                                      data=json.dumps(body).encode())
         req.add_header("content-type", "application/json")
         if auth:
-            req.add_header("authorization", "Bearer " + TOKEN)
+            req.add_header("authorization", "Bearer " + token)
         try:
             with urllib.request.urlopen(req, timeout=5) as fh:
                 return fh.status, json.loads(fh.read())
@@ -112,6 +114,40 @@ class HumanChannel(unittest.TestCase):
         code, out = self.post({"text": "x" * (board_log.MAX_TEXT + 1)})
         self.assertEqual(code, 400)
         self.assertIn(str(board_log.MAX_TEXT), out["error"])
+
+    def test_wills_token_writes_wills_file_and_his_own_name(self):
+        code, out = self.post({"text": "over here it is easier"}, token=WILL_TOKEN)
+        self.assertEqual(code, 200, out)
+        rows = [json.loads(l) for l in (self.board / "will.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[-1]["author"], "will")
+        self.assertEqual(rows[-1]["id"], "will/0002")
+        self.assertEqual(rows[-1]["room"], "humans")
+        self.assertEqual(rows[-1]["via"], "human")
+        self.assertFalse((self.board / "hamish.jsonl").exists())
+
+    def test_state_answers_as_the_person_whose_link_was_opened(self):
+        code, body = self.get("/api/state", auth=False, cookie="hc=" + WILL_TOKEN)
+        self.assertEqual(code, 200, body)
+        data = json.loads(body)
+        self.assertEqual((data["me"], data["peer"]), ("will", "hamish"))
+
+    def test_an_author_in_the_body_is_ignored_rather_than_trusted(self):
+        code, out = self.post({"text": "not mine", "author": "will", "via": "human"})
+        self.assertEqual(code, 200, out)
+        rows = [json.loads(l) for l in (self.board / "hamish.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[-1]["author"], "hamish")
+        self.assertFalse((self.board / "will.jsonl").read_text().count("not mine"))
+
+    def test_icons_and_manifest_are_served_without_a_cookie(self):
+        for path in ("/manifest.webmanifest", "/icon-180.png", "/icon-192.png",
+                     "/icon-512.png"):
+            with urllib.request.urlopen(self.base + path, timeout=5) as fh:
+                body = fh.read()
+                self.assertEqual(fh.status, 200, path)
+                self.assertTrue(body, path)
+                if path.endswith(".png"):
+                    self.assertTrue(body.startswith(b"\x89PNG"), path)
+        self.assertIn("standalone", self.get("/manifest.webmanifest", auth=False)[1])
 
     # --- auth -------------------------------------------------------------
     def test_state_and_post_both_need_the_token(self):
