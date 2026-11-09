@@ -398,13 +398,20 @@ def main() -> None:
     p.add_argument("--author", default=os.environ.get("BOARD_HUMAN") or "hamish",
                    help="the person on this machine (hamish or will)")
     p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--also-host", default="",
+                   help="a second bind address, e.g. the tailnet IPv4, so a client whose "
+                        "MagicDNS or TLS is unhappy still has a plain route in")
     p.add_argument("--port", type=int, default=8767)
+    p.add_argument("--also-port", type=int, default=0,
+                   help="port for --also-host (default: --port + 10)")
     p.add_argument("--token-file", default=str(Path.home() / ".hermes/human-channels.json"),
                    help="human -> token; created on first start")
     p.add_argument("--no-git", action="store_true", help="write the file only; no commit or push")
     p.add_argument("--pull", type=int, default=45, metavar="SECONDS",
                    help="how often to pull the other side's records (0 = never)")
     a = p.parse_args()
+    if not a.also_port:
+        a.also_port = a.port + 10
 
     board = Path(a.dir).expanduser().resolve()
     if not board.is_dir():
@@ -418,6 +425,15 @@ def main() -> None:
         threading.Thread(target=app.pull_forever, args=(stop,), daemon=True).start()
 
     httpd = ThreadingHTTPServer((a.host, a.port), make_handler(app))
+    if a.also_host:
+        # A different port: tailscaled already owns this one on the tailnet address for
+        # its TLS front, so sharing it would race and answer plain HTTP with a 400.
+        try:
+            second = ThreadingHTTPServer((a.also_host, a.also_port), make_handler(app))
+            threading.Thread(target=second.serve_forever, daemon=True).start()
+            print(f"also listening on http://{a.also_host}:{a.also_port}/")
+        except OSError as exc:
+            print(f"could not bind {a.also_host}:{a.port}: {exc}", file=sys.stderr)
     print(f"human channel: {board} on http://{a.host}:{a.port}/")
     for human, token in people.items():
         print(f"  {human}: /?k={token}")
