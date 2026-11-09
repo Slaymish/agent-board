@@ -61,13 +61,15 @@
   h1 {
     font-family: var(--sans); font-size: 13px; line-height: 1;
     letter-spacing: .14em; text-transform: lowercase; font-weight: 600; margin: 0;
+    white-space: nowrap; flex: none;
   }
+  h1 .short { display: none; }
   .who {
     font-family: var(--mono); font-size: 11px; line-height: 1; color: var(--quiet);
     letter-spacing: .02em; margin-left: auto;
   }
   .icon {
-    width: 36px; height: 36px; display: grid; place-items: center;
+    width: 36px; height: 36px; display: grid; place-items: center; flex: none;
     border: 0; border-radius: 8px; padding: 0; margin: 0;
     background: none; color: var(--quiet); line-height: 0; cursor: pointer;
   }
@@ -88,6 +90,30 @@
   .tab[aria-selected="true"]::after {
     content: ""; position: absolute; left: 6px; right: 6px; bottom: -9px;
     height: 2px; background: var(--ink);
+  }
+  /* On a phone two rooms fit; the host's own rooms live behind one control rather than
+     squeezing five labels and two icons into 375px. */
+  #more { display: none; }
+  .menu {
+    position: fixed; top: calc(46px + env(safe-area-inset-top)); right: var(--gutter);
+    z-index: 5; min-width: 132px; padding: 5px;
+    background: var(--paper); border: 1px solid var(--rule); border-radius: 10px;
+    box-shadow: 0 10px 26px rgba(40, 34, 24, .14); display: grid; gap: 2px;
+  }
+  .menu button {
+    text-align: left; border: 0; background: none; color: var(--ink);
+    padding: 10px 12px; border-radius: 7px; cursor: pointer;
+    font: 600 12px/1.2 var(--sans); letter-spacing: .08em; text-transform: lowercase;
+  }
+  .menu button[aria-current="true"] { background: rgba(127, 118, 100, .14); }
+  @media (max-width: 599px) {
+    .tabs .tab.more-only { display: none !important; }
+    #more { display: grid; }
+    .tab { padding: 0 7px; }
+  }
+  @media (max-width: 419px) {
+    h1 .long { display: none; }
+    h1 .short { display: inline; }
   }
 
   /* ---------- one control row under the tabs: layout, or who ---------- */
@@ -361,19 +387,25 @@
 </head>
 <body>
 <header>
-  <h1 id="title">hamish + will</h1>
+  <h1 id="title"><span class="long">hamish + will</span><span class="short">h + w</span></h1>
   <nav class="tabs" role="tablist" aria-label="rooms">
     <button class="tab" id="tab-human" type="button" role="tab" aria-selected="true">human</button>
     <button class="tab" id="tab-work" type="button" role="tab" aria-selected="false">work</button>
-    <button class="tab" id="tab-today" type="button" role="tab" aria-selected="false" hidden>today</button>
-    <button class="tab" id="tab-review" type="button" role="tab" aria-selected="false" hidden>review</button>
-    <button class="tab" id="tab-reports" type="button" role="tab" aria-selected="false" hidden>reports</button>
+    <button class="tab more-only" id="tab-today" type="button" role="tab" aria-selected="false" hidden>today</button>
+    <button class="tab more-only" id="tab-review" type="button" role="tab" aria-selected="false" hidden>review</button>
+    <button class="tab more-only" id="tab-reports" type="button" role="tab" aria-selected="false" hidden>reports</button>
   </nav>
+  <button class="icon" id="more" type="button" aria-label="more rooms" aria-expanded="false" title="more"></button>
   <div class="tools">
     <button class="icon" id="search-open" type="button" aria-label="search" title="search"></button>
     <button class="icon" id="refresh" type="button" aria-label="check for new notes" title="check for new notes"></button>
   </div>
 </header>
+<div class="menu" id="menu" hidden role="menu" aria-label="more rooms">
+  <button type="button" role="menuitem" data-tab="today">today</button>
+  <button type="button" role="menuitem" data-tab="review">review</button>
+  <button type="button" role="menuitem" data-tab="reports">reports</button>
+</div>
 <div class="subbar">
   <div class="seg" id="seg-layout" role="group" aria-label="layout">
     <button type="button" id="seg-lines" aria-pressed="true">lines</button>
@@ -455,6 +487,7 @@ const ICON_CANVAS = () => icon([], [
 ]);
 const ICON_REFRESH = () => icon(["M13.4 6.6A5.6 5.6 0 1 0 13 10.4", "M13.6 2.7v4h-4"]);
 const ICON_SEARCH = () => icon(["M6.7 2.2a4.5 4.5 0 1 0 0 9 4.5 4.5 0 0 0 0-9", "M10.1 10.1 14 14"]);
+const ICON_MORE = () => icon(["M4 6.4 8 10.4 12 6.4"]);
 const ICON_WORK = () => icon([], [
   { x: 2, y: 3, width: 3, height: 3, rx: 1 },
   { x: 3.5, y: 7.5, width: 8, height: 2, rx: 1 },
@@ -1034,7 +1067,6 @@ async function load(first) {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     state.me = data.me; state.peer = data.peer; state.host = !!data.host;
-    $("title").textContent = [data.me, data.peer].sort().join(" + ");
     $("text").placeholder = "write to " + data.peer;
     if (first) restoreDraft();
     state.messages = data.messages;
@@ -1104,6 +1136,12 @@ function syncChrome() {
   }
   $("seg-layout").hidden = tab !== "human";
   $("seg-who").hidden = tab !== "work";
+  // Without the host's own rooms there is nothing behind "more", so it stays absent.
+  $("more").hidden = !state.host;
+  for (const b of $("menu").querySelectorAll("button")) {
+    b.setAttribute("aria-current", b.dataset.tab === tab ? "true" : "false");
+    b.hidden = !state.host;
+  }
   $("seg-lines").setAttribute("aria-pressed", state.view === "lines" ? "true" : "false");
   $("seg-canvas").setAttribute("aria-pressed", state.view === "canvas" ? "true" : "false");
   for (const b of $("seg-who").querySelectorAll("button")) {
@@ -1188,6 +1226,32 @@ $("tab-work").onclick = () => showTab("work");
 $("tab-today").onclick = () => showTab("today");
 $("tab-review").onclick = () => showTab("review");
 $("tab-reports").onclick = () => showTab("reports");
+
+// A phone fits two rooms; the rest live behind one control instead of a squeezed strip.
+function closeMenu() {
+  $("menu").hidden = true;
+  $("more").setAttribute("aria-expanded", "false");
+}
+$("more").addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  const opening = $("menu").hidden;
+  $("menu").hidden = !opening;
+  $("more").setAttribute("aria-expanded", opening ? "true" : "false");
+});
+$("menu").addEventListener("click", (ev) => {
+  const b = ev.target.closest && ev.target.closest("button[data-tab]");
+  if (!b) return;
+  closeMenu();
+  showTab(b.dataset.tab);
+});
+if (typeof document.addEventListener === "function") {
+  document.addEventListener("click", (ev) => {
+    if ($("menu").hidden) return;
+    if ($("menu").contains && $("menu").contains(ev.target)) return;
+    if (ev.target === $("more")) return;
+    closeMenu();
+  });
+}
 $("seg-lines").onclick = () => setLayout("lines");
 $("seg-canvas").onclick = () => setLayout("canvas");
 $("seg-who").onclick = (ev) => {
@@ -1328,6 +1392,7 @@ listen();
 setInterval(() => { if (!document.hidden) load(false); }, 30000);
 $("refresh").replaceChildren(ICON_REFRESH());
 $("search-open").replaceChildren(ICON_SEARCH());
+$("more").replaceChildren(ICON_MORE());
 syncChrome();
 load(true);
 if (state.view === "work") loadWork().then(render);
