@@ -83,11 +83,22 @@ checks for new notes on demand; the page also re-checks when it comes back to th
 foreground and every 15 seconds while it is open. The submit button says **add**, and
 the reading measure is capped so a long note reads as prose.
 
+## The push, and why it is only one way
+`human-channel-push.service` watches `will.jsonl` and pushes the note to Hamish's phone
+within about eight seconds: title "hamish + will", the text itself, into a Conduit chat of
+that name. It is deliberately one-way and private — Will is never told that Hamish was
+notified, and nothing reports reading. It exists because a room with no signal at all
+makes the reader keep refreshing, which is the checking the room was meant to spare them;
+the person who would feel a reply owed still gets silence.
+
+Cursor: `~/.hermes/data/human-channel/push.json`, sequence numbers rather than
+timestamps, advanced only after a successful push.
+
 ## Not built yet
 
-- **Delivery of the other person's human records to a phone.** `will.jsonl` will sit
-  in the log unannounced until the watcher reads a second peer log. The agent line
-  (`will-hermes.jsonl`) is unaffected.
+- **Delivery in Will's direction.** Hamish's phone gets a push for Will's notes; Will's
+  phone gets at most the one evening line, and only once his own side runs it. That is
+  the deal the room is built on, not an omission to fix quietly.
 - **Will's instance.** He needs this file and his own token; whether he runs it
   locally or reaches a hosted one is his decision, and it is the open question in
   `design/implementations/elio-2026-11-08.md` §7.
