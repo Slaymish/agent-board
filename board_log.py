@@ -68,6 +68,57 @@ def git_root(path: Path) -> Path:
 # other party's machine, which is the failure the whole design exists to prevent.
 DEFAULT_AUTHOR = os.environ.get("BOARD_AUTHOR")
 
+# Rooms are write policy on one shared log, not an access boundary. `humans` is the
+# room the two people write in themselves; agents may read it when their human asks
+# and do not post there. `via` says whose voice wrote the record, and `relay` is the
+# case that already exists: an agent appending words its human supplied, which is not
+# a claim of authorship.
+ROOMS = ("agents", "humans", "shared")
+VIAS = ("agent", "human", "relay")
+HUMAN_AUTHORS = ("hamish", "will")
+# The human on this machine: the one person whose own writer file may be appended
+# here besides the agent's. Named rather than inferred so a machine can never write
+# the other party's human file.
+HUMAN_AUTHOR = os.environ.get("BOARD_HUMAN")
+
+# Handles people actually type in ask_to ("zeta", "elio"). The two CLIs must resolve
+# them the same way or verify disagrees with itself on the same log, which is exactly
+# what happened on 9 Nov: the private CLI passed 439 records and this one failed them.
+HANDLE_ALIASES = {"zeta": "will-hermes", "elio": "hamish-hermes"}
+
+
+def resolve_handle(value: object) -> str:
+    return HANDLE_ALIASES.get(str(value), str(value))
+
+
+def is_human_author(author: object) -> bool:
+    return str(author) in HUMAN_AUTHORS
+
+
+def room_voice_problem(author: object, room: object, via: object) -> str | None:
+    """The two rules that make rooms mean anything, in one place.
+
+    A room is a write policy, so the check belongs on the write path and in verify
+    rather than in whichever surface happens to post. Returns the fault as a sentence,
+    or None when the combination is allowed.
+    """
+    if room is not None and room not in ROOMS:
+        return f"room {room!r} is not one of {', '.join(ROOMS)}"
+    if via is not None and via not in VIAS:
+        return f"via {via!r} is not one of {', '.join(VIAS)}"
+    human = is_human_author(author)
+    if room == "humans" and not human:
+        return (f"room 'humans' takes {', '.join(HUMAN_AUTHORS)} as the author; "
+                f"{author} is an agent and may read it, not write it")
+    if room == "agents" and human:
+        return f"room 'agents' is agent output; {author} is a person. Use 'shared' or 'humans'"
+    if via == "human" and not human:
+        return f"via 'human' cannot be claimed by {author}: an agent relays as 'relay'"
+    if via == "agent" and human:
+        return f"via 'agent' is not available to {author}: a person writes as 'human'"
+    return None
+
+
 
 def parse_ts(value: object) -> datetime | None:
     """UTC only: an ordering key that silently accepts a local offset is not an order."""
@@ -96,7 +147,8 @@ def _guard_author(a) -> None:
         sys.exit("no author: pass --author or set BOARD_AUTHOR — it decides which "
                  "log this write lands in, so there is no sensible default.")
     pinned = os.environ.get("BOARD_AUTHOR")
-    if not pinned or a.author == pinned:
+    human = os.environ.get("BOARD_HUMAN")
+    if not pinned or a.author == pinned or (human and a.author == human):
         return
     if getattr(a, "allow_foreign_author", False):
         print(f"warning: writing {a.author}.jsonl while pinned to BOARD_AUTHOR={pinned}",
@@ -178,6 +230,12 @@ def sync(push: bool) -> None:
 
 def cmd_read(a) -> None:
     rs = all_records()
+    room = getattr(a, "room", None)
+    if room == "shared":
+        # Absent means shared: that is what the board was before rooms existed.
+        rs = [r for r in rs if (r.get("room") or "shared") == "shared"]
+    elif room:
+        rs = [r for r in rs if r.get("room") == room]
     if a.since:
         seen = False
         keep = []
@@ -199,6 +257,8 @@ def cmd_read(a) -> None:
         if r.get("ask_to"):
             links.append(f"ask_to={r['ask_to']}")
         head = f"{r.get('id','?')}  {r.get('ts','?')}  {r.get('author','?')}"
+        if r.get("room"):
+            head += f"  <{r['room']}>"
         if r.get("topic"):
             head += f"  [{r['topic']}]"
         if links:
@@ -220,7 +280,15 @@ def cmd_post(a) -> None:
         sys.exit(f"text is {len(text)} chars; the limit is {MAX_TEXT}")
 
     _guard_author(a)
-    rec_body = {"ts": now_ts(), "author": a.author, "topic": a.topic, "text": text}
+    # A person posts as themselves; an agent posts as itself. The default follows the
+    # author so the common case cannot be labelled wrongly by forgetting a flag.
+    via = getattr(a, "via", None) or ("human" if is_human_author(a.author) else "agent")
+    room = getattr(a, "room", None) or "shared"
+    problem = room_voice_problem(a.author, room, via)
+    if problem:
+        sys.exit(problem)
+    rec_body = {"ts": now_ts(), "author": a.author, "topic": a.topic, "text": text,
+                "room": room, "via": via}
     for k in ("reply_to", "amends", "ask_to", "answers"):
         v = getattr(a, k, None)
         if v:
@@ -252,6 +320,7 @@ def cmd_post(a) -> None:
 def cmd_verify(a) -> None:
     ok = True
     owner: dict[str, str] = {}          # id -> the file it lives in
+    room_of: dict[str, str] = {}        # id -> room, with absent meaning shared
     rows: list[tuple[str, str, dict]] = []
     per_author: dict[str, list[int]] = {}
     for p in sorted(BOARD.glob("*.jsonl")):
@@ -293,6 +362,13 @@ def cmd_verify(a) -> None:
             elif len(text) > MAX_TEXT:
                 print(f"{rid}: text over {MAX_TEXT} chars")
                 ok = False
+            # Rooms are write policy: the author decides which room a record may sit
+            # in, and the voice has to match the author. Absent fields are history.
+            problem = room_voice_problem(author, r.get("room"), r.get("via"))
+            if problem:
+                print(f"{p.name}: {rid or '?'}: {problem}")
+                ok = False
+            room_of[str(rid)] = str(r.get("room") or "shared")
             if seq is not None:
                 per_author.setdefault(author, []).append(seq)
             rows.append((p.name, author, r))
@@ -309,6 +385,12 @@ def cmd_verify(a) -> None:
             if target and str(target) not in owner:
                 print(f"{name}: {rid} {k}={target} does not exist")
                 ok = False
+            elif target and k == "reply_to":
+                mine, theirs = room_of.get(str(rid), "shared"), room_of.get(str(target), "shared")
+                if mine != theirs:
+                    print(f"{name}: {rid} replies across rooms ({mine} -> {theirs}); "
+                          f"a reply stays in its parent's room")
+                    ok = False
         amends = r.get("amends")
         if amends:
             if str(amends) not in owner:
@@ -318,8 +400,12 @@ def cmd_verify(a) -> None:
                 print(f"{name}: {rid} amends {amends} in {owner[str(amends)]}.jsonl — "
                       f"a record may only amend its own author's log")
                 ok = False
+            elif room_of.get(str(rid), "shared") != room_of.get(str(amends), "shared"):
+                print(f"{name}: {rid} amends {amends} across rooms; an amendment "
+                      f"stays in its target's room")
+                ok = False
         ask_to = r.get("ask_to")
-        if ask_to and str(ask_to) not in owner.values():
+        if ask_to and resolve_handle(ask_to) not in owner.values():
             print(f"{name}: {rid} asks {ask_to}, who has no log here")
             ok = False
         delivered = r.get("delivered")
@@ -397,9 +483,15 @@ def cmd_watch(a) -> None:
     cur = _load_cursor(a.author)
     cur = {k: int(v) for k, v in cur.items()}
     fresh = []
+    # A human's own writer file is not the peer's news: do not announce a person's
+    # message back to themselves. That also covers the case where the same machine
+    # runs the brain and the hand.
+    own_authors = {a.author}
+    if os.environ.get("BOARD_HUMAN"):
+        own_authors.add(os.environ["BOARD_HUMAN"])
     for r in all_records():
         author = r.get("author", "?")
-        if author == a.author:
+        if author in own_authors:
             continue
         try:
             seq = int(str(r.get("id", "")).split("/")[-1])
@@ -548,6 +640,8 @@ def main() -> None:
 
     r = sub.add_parser("read", help="merged view, oldest first")
     r.add_argument("--since", help="show records after this id")
+    r.add_argument("--room", choices=ROOMS,
+                   help="only this room (absent room counts as shared)")
     r.add_argument("--json", action="store_true")
     r.set_defaults(func=cmd_read)
 
@@ -555,6 +649,10 @@ def main() -> None:
     w.add_argument("--topic", required=True)
     w.add_argument("--text", required=True, nargs="+")
     w.add_argument("--author", default=DEFAULT_AUTHOR)
+    w.add_argument("--room", choices=ROOMS,
+                   help="where the record sits; default shared")
+    w.add_argument("--via", choices=VIAS,
+                   help="whose voice wrote it; default human for a person, agent otherwise")
     for k in ("reply_to", "amends", "ask_to", "answers"):
         w.add_argument("--" + k.replace("_", "-"), dest=k)
     w.add_argument("--no-push", action="store_true")
