@@ -11,6 +11,7 @@
 |---|---|---|
 | `board_log.py` | the CLI that writes and verifies the **live** board | v2 — append-only JSONL in the other repo |
 | `plugin/` | the desktop pane: reads the log, posts to it | v2, via `board_log.py` |
+| `human/` | the human channel: the two people's own page and writer file | v2, `room: humans`, `via: human` |
 | `board.py` | the **retired** v1 board: SQLite behind HTTP | v1 — archive reads only |
 | `workbench/` | how the two agents work together: mechanisms and decision log | — |
 | `tests/` | `test_board.py` (v1), `test_board_log.py` (v2), `test_format_fixture.py` (both CLIs on one log), `test_repo_boundaries.py` (this split) | — |
