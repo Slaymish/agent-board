@@ -23,13 +23,15 @@ person's file. No dependencies: the standard library and ``board_log.py`` next t
 Saving and publishing are separate facts. The append is the note; the push is how the
 other person gets it. A failed commit or push therefore returns ``saved: true,
 published: false`` rather than an error, and a publisher loop retries pending commits
-every ``--publish-every`` seconds until one succeeds, so a note cannot sit silently in
+every ``--publish`` seconds until one succeeds, so a note cannot sit silently in
 a local commit waiting for unrelated traffic. A retry from the page carries the same
 ``client_id``, so a lost response cannot turn one note into two.
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
+from contextlib import contextmanager, nullcontext
 import hmac
 import json
 import os
@@ -94,14 +96,33 @@ class App:
         self.pull_every = pull_every
         self.publish_every = publish_every
         self.write_lock = threading.Lock()
-        self.pulling = threading.Lock()
-        self.publishing = threading.Lock()
-        # client_id -> the record it produced, so a retry after a lost response returns
-        # the note instead of appending a second one. Bounded: it is a response cache,
-        # not a second log.
-        self.recent: dict[str, dict] = {}
-        self.recent_lock = threading.Lock()
         board_log.set_dir(board)
+        self.repo = board_log.git_root(board)
+
+    def git_run(self, *args, check=True):
+        return subprocess.run(["git", "-C", str(self.repo), *args],
+                              capture_output=True, text=True, check=check, timeout=15,
+                              env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
+                                   "GIT_EDITOR": ":", "GIT_SEQUENCE_EDITOR": ":"})
+
+    @contextmanager
+    def repository_lock(self):
+        common = self.git_run("rev-parse", "--git-common-dir").stdout.strip()
+        path = (self.repo / common).resolve() / "human-channel.lock"
+        with path.open("a") as lock:
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("repository is busy")
+                    time.sleep(.05)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
     def who(self, token: str) -> str | None:
         """The person this token belongs to, or None.
@@ -161,18 +182,22 @@ class App:
             text = str(r.get("text") or "")
             out.append({"id": r.get("id"), "ts": r.get("ts"), "author": r.get("author"),
                         "topic": r.get("topic"), "reply_to": r.get("reply_to"),
-                        "text": text if len(text) <= 700 else text[:699] + "…"})
+                        "room": r.get("room") or "shared", "text": text})
         return out
 
+    def resolve(self, ident: str) -> dict | None:
+        for record in self.humans() + self.work(limit=10**9):
+            if record.get("id") == ident:
+                return record
+        return None
+
     def pull(self) -> None:
-        if not self.git or not self.pull_every:
-            return
-        if not self.pulling.acquire(blocking=False):
-            return
-        try:
-            board_log.git("pull", "--rebase", "--autostash", check=False)
-        finally:
-            self.pulling.release()
+        if self.git and self.pull_every:
+            try:
+                with self.repository_lock():
+                    self.git_run("pull", "--ff-only", check=False)
+            except (OSError, subprocess.SubprocessError):
+                pass
 
     def post(self, human: str, text: str, topic: str = "note",
              reply_to: str | None = None, client_id: str | None = None) -> dict:
@@ -194,67 +219,93 @@ class App:
                 raise ValueError(f"no note {reply_to} to reply to")
             if (parent.get("room") or "shared") != ROOM:
                 raise ValueError(f"{reply_to} is not in this room")
-        if client_id:
-            with self.recent_lock:
-                seen = self.recent.get(str(client_id))
-            if seen is not None:
-                return {"record": seen, "saved": True, "published": True, "repeated": True}
-        with self.write_lock:
-            body = {"ts": _now(), "author": human, "topic": topic, "text": text,
-                    "room": ROOM, "via": "human"}
-            if reply_to:
-                body["reply_to"] = str(reply_to)
-            rec = board_log._append_record(human, body)
-            if client_id:
-                with self.recent_lock:
-                    if len(self.recent) > 200:
-                        self.recent.pop(next(iter(self.recent)))
-                    self.recent[str(client_id)] = rec
-            published = True
-            error = None
-            if self.git:
-                path = board_log.own_file(human)
-                try:
-                    board_log.git("add", str(path.relative_to(board_log.REPO)))
-                    board_log.git("commit", "-q", "-m", f"board: {rec['id']} {topic}".strip())
-                except (subprocess.CalledProcessError, OSError) as e:
-                    # The note is on disk and fsynced. A commit failure is a publication
-                    # problem, not a reason to tell the writer their words were lost.
-                    published, error = False, str(e)
+        if client_id and len(client_id) > 128:
+            raise ValueError("client_id too long")
+        repeated = False
+        with self.repository_lock() if self.git else nullcontext(), self.write_lock:
+            path = self.board / f"{human}.jsonl"
+            with path.open("a+") as stream:
+                fcntl.flock(stream, fcntl.LOCK_EX)
+                stream.seek(0)
+                rows = [json.loads(line) for line in stream if line.strip()]
+                rec = next((r for r in rows if client_id and r.get("client_id") == client_id
+                            and r.get("author") == human), None)
+                if rec is not None:
+                    if (rec.get("text"), rec.get("topic"), rec.get("reply_to")) != (text, topic, reply_to):
+                        raise ValueError("client_id already used for a different payload")
+                    os.fsync(stream.fileno())
+                    repeated = True
                 else:
-                    published = self.publish()
-        return {"record": rec, "saved": True, "published": published,
-                **({"error": error} if error else {})}
+                    number = max([int(r["id"].split("/")[-1]) for r in rows] or [0]) + 1
+                    rec = {"id": f"{human}/{number:04d}", "ts": _now(), "author": human,
+                           "topic": topic, "text": text, "room": ROOM, "via": "human"}
+                    if reply_to:
+                        rec["reply_to"] = reply_to
+                    if client_id:
+                        rec["client_id"] = client_id
+                    stream.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        published = self.publish()
+        return {"record": rec, "saved": True, "published": published, "pushed": published,
+                "repeated": repeated}
 
     def publish(self) -> bool:
-        """Push pending commits. Safe to call from the request, the loop, or both.
-
-        A rejected push is usually a peer that got there first, so one rebase-and-retry
-        is the whole policy. Anything past that is left to the loop rather than holding
-        the writer's request open.
-        """
+        """Retry both uncommitted human logs and pending commits, under one repo lock."""
         if not self.git:
-            return True
-        if not self.publishing.acquire(blocking=False):
             return False
         try:
-            for _ in range(2):
-                if board_log.git("push", check=False).returncode == 0:
+            with self.repository_lock():
+                paths = [str((self.board / f"{human}.jsonl").relative_to(self.repo))
+                         for human in set(self.tokens.values())
+                         if (self.board / f"{human}.jsonl").exists()]
+                if paths:
+                    changed = self.git_run("status", "--porcelain", "--", *paths).stdout
+                    if changed:
+                        self.git_run("add", "--", *paths)
+                        self.git_run("commit", "--only", "-q", "-m", "board: human notes", "--", *paths)
+                # Never stash another writer's work or attempt conflict repairs.
+                if self.git_run("push", check=False).returncode == 0:
                     return True
-                board_log.git("pull", "--rebase", "--autostash", check=False)
+                if not self.reconcile_remote(paths):
+                    return False
+                return self.git_run("push", check=False).returncode == 0
+        except (OSError, subprocess.SubprocessError, ValueError):
             return False
-        finally:
-            self.publishing.release()
+
+    def reconcile_remote(self, human_paths: list[str]) -> bool:
+        """Rebase only clean, disjoint human commits; leave other cases pending."""
+        if self.git_run("status", "--porcelain").stdout:
+            return False
+        for marker in ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD"):
+            location = self.git_run("rev-parse", "--git-path", marker).stdout.strip()
+            if (self.repo / location).exists():
+                return False
+        self.git_run("fetch")
+        upstream = self.git_run("rev-parse", "--abbrev-ref", "@{upstream}").stdout.strip()
+        base = self.git_run("merge-base", "HEAD", upstream).stdout.strip()
+        own = set(filter(None, self.git_run("log", "--format=", "--no-renames", "--name-only",
+                                    f"{base}..HEAD").stdout.splitlines()))
+        remote = set(filter(None, self.git_run("log", "--format=", "--no-renames", "--name-only",
+                                       f"{base}..{upstream}").stdout.splitlines()))
+        if not own.issubset(set(human_paths)) or own & remote:
+            return False
+        return self.git_run("rebase", "--no-autostash", "--no-update-refs", upstream,
+                            check=False).returncode == 0
 
     def publish_forever(self, stop: threading.Event) -> None:
-        while not stop.wait(self.publish_every):
-            ahead = board_log.git("rev-list", "--count", "@{u}..HEAD", check=False)
-            if ahead.returncode == 0 and ahead.stdout.strip() not in ("", "0"):
+        while not stop.wait(max(.1, self.publish_every)):
+            try:
                 self.publish()
+            except Exception as exc:
+                print(f"publisher retry failed: {exc}", file=sys.stderr)
 
     def pull_forever(self, stop: threading.Event) -> None:
-        while not stop.wait(self.pull_every):
-            self.pull()
+        while not stop.wait(max(.1, self.pull_every)):
+            try:
+                self.pull()
+            except Exception as exc:
+                print(f"pull retry failed: {exc}", file=sys.stderr)
 
     def verify(self) -> tuple[bool, str]:
         done = subprocess.run([sys.executable, str(HERE.parent / "board_log.py"),
@@ -374,6 +425,16 @@ def make_handler(app: App):
                 self._json(200, {"ok": True, "me": me, "peer": app.peer(me),
                                  "messages": rows, "server_time": _now()})
                 return
+            if url.path == "/api/record":
+                if not self._authed():
+                    self._json(401, {"ok": False, "error": "needs the channel link"})
+                    return
+                ident = (parse_qs(url.query).get("id") or [""])[0]
+                record = app.resolve(ident)
+                self._json(200 if record else 404,
+                           {"ok": bool(record), "record": record,
+                            "error": None if record else "record unavailable"})
+                return
             if url.path == "/api/work":
                 if not self._authed():
                     self._json(401, {"ok": False, "error": "needs the channel link"})
@@ -427,7 +488,7 @@ def make_handler(app: App):
                 text = str(body.get("text") or "")
                 topic = str(body.get("topic") or "note")[:40] or "note"
                 reply_to = body.get("reply_to") or None
-                client_id = str(body.get("client_id") or "")[:64] or None
+                client_id = str(body.get("client_id") or "") or None
             except (json.JSONDecodeError, UnicodeDecodeError):
                 self._json(400, {"ok": False, "error": "body is not JSON"})
                 return
@@ -444,11 +505,8 @@ def make_handler(app: App):
             except RuntimeError as e:
                 self._json(500, {"ok": False, "error": str(e)})
                 return
-            except subprocess.CalledProcessError as e:
-                # Only reachable if a git call outside the guarded block fails. The note
-                # is already on disk, so say that rather than a bare 500.
-                self._json(200, {"ok": True, "saved": True, "published": False,
-                                 "error": str(e)})
+            except (OSError, subprocess.SubprocessError) as e:
+                self._json(500, {"ok": False, "error": str(e)})
                 return
             self._json(200, {"ok": True, **out})
 

@@ -35,6 +35,7 @@
             --mine: #8bc7a6; --theirs: #d9a47f; --warn: #e08a7c; }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   /* manipulation keeps pinch-zoom and scrolling, and removes the double-tap zoom that
      made every second tap on a note a viewport jump. */
   html, body { margin: 0; background: var(--paper); color: var(--ink);
@@ -252,7 +253,9 @@
 <body>
 <header>
   <h1 id="title">hamish + will</h1>
-  <span class="who" id="who">humans</span>
+  <span class="who" id="who">human room</span>
+  <button class="ref" id="rooms" type="button">work</button>
+  <button class="ref" id="return" type="button" hidden>return</button>
   <button class="icon" id="views" type="button" aria-label="switch between lines and canvas" title="lines or canvas"></button>
   <button class="icon" id="refresh" type="button" aria-label="check for new notes" title="check for new notes"></button>
 </header>
@@ -272,13 +275,14 @@
 </form>
 <script>
 const state = { me: "?", peer: "?", messages: [], sending: false, reply: null,
-                submission: null, work: [], focusWork: null,
+                submission: null, work: [], focusWork: null, roomView: "lines",
                 view: "lines" };
 const VIEW_KEY = "hc.view";
 try {
   const saved = localStorage.getItem(VIEW_KEY);
-  if (saved === "canvas" || saved === "work") state.view = saved;
+  if (saved === "canvas") state.view = saved;
 } catch (e) {}
+state.roomView = state.view;
 const $ = (id) => document.getElementById(id);
 
 // Icons are built as elements, not markup: nothing here takes a string from the log.
@@ -318,7 +322,6 @@ const ICON_WORK = () => icon([], [
   { x: 3.5, y: 7.5, width: 8, height: 2, rx: 1 },
   { x: 3.5, y: 11, width: 5.5, height: 2, rx: 1 }
 ]);
-const ID_RE = /\b(?:hamish-hermes|will-hermes|hamish|will)\/\d{4}\b/g;
 const AGENT_NAMES = { "hamish-hermes": "elio", "will-hermes": "zeta" };
 
 // A half-finished thought should survive closing the page, because nothing here is
@@ -327,12 +330,15 @@ const draftKey = () => "hc.draft." + (state.me || "?");
 let draftTimer = null;
 function saveDraft() {
   clearTimeout(draftTimer);
-  draftTimer = setTimeout(() => {
-    try { localStorage.setItem(draftKey(), $("text").value); } catch (e) {}
-  }, 250);
+  try { localStorage.setItem(draftKey(), $("text").value); } catch (e) {}
 }
 function restoreDraft() {
   try {
+    const pending = JSON.parse(localStorage.getItem(draftKey() + ".submission") || "null");
+    if (pending) {
+      state.submission = pending; state.reply = pending.reply_to || null; $("text").value = pending.text;
+      if (state.reply) { $("replying").classList.add("on"); $("replying-text").textContent = "replying to " + state.reply; }
+    }
     const saved = localStorage.getItem(draftKey());
     if (saved && !$("text").value) {
       $("text").value = saved;
@@ -380,7 +386,7 @@ function dayOf(ts) {
 
 function linkify(text) {
   const parts = String(text).split(
-    /(https?:\/\/[^\s<]+|(?:hamish-hermes|will-hermes|hamish|will)\/\d{4})/g);
+    /(https?:\/\/[^\s<]+|(?<![\w/-])(?:hamish-hermes|will-hermes|hamish|will)\/\d{4}(?![\w/-]))/g);
   return parts.map((p, i) => {
     if (i % 2 === 0) return document.createTextNode(p);
     if (/^https?:/.test(p)) {
@@ -469,6 +475,9 @@ function note(r, first) {
 // into conversations so a reply lands beside the thought it belongs to; work is the
 // agents' side, read-only, so a note can be followed to what it caused.
 function render() {
+  $("who").textContent = state.view === "work" ? "work · read only" : "human room";
+  $("rooms").textContent = state.view === "work" ? "human room" : "work";
+  $("views").hidden = state.view === "work";
   document.body.classList.toggle("view-work", state.view === "work");
   if (state.view === "work") { renderWork(); return; }
   if (state.view === "canvas") { renderCanvas(); return; }
@@ -510,7 +519,7 @@ function renderWork() {
     card.append(top, body);
     if ((r.text || "").length > 420) {
       const more = document.createElement("button");
-      more.type = "button"; more.className = "more"; more.textContent = "more";
+      more.type = "button"; more.className = "more"; more.textContent = state.focusWork === r.id ? "less" : "more";
       more.addEventListener("click", () => {
         const open = card.classList.toggle("open");
         more.textContent = open ? "less" : "more";
@@ -598,7 +607,7 @@ function card(g) {
   if (g.replies.length) {
     const replies = document.createElement("div"); replies.className = "card-replies";
     for (const r of g.replies) {
-      const line = document.createElement("div"); line.className = "re";
+      const line = document.createElement("div"); line.className = "re"; line.dataset.id = r.id;
       const w = document.createElement("span"); w.className = "re-who label";
       w.textContent = r.author;
       line.append(w, ...linkify(r.text || ""));
@@ -637,6 +646,7 @@ async function load(first) {
     $("text").placeholder = "write to " + data.peer;
     if (first) restoreDraft();
     state.messages = data.messages;
+    if (focusRecord) retainRecord(await resolveRecord(focusRecord));
     render();
     status("");
   } catch (e) {
@@ -651,20 +661,22 @@ async function send(text) {
   // One id per submission, kept until the server confirms it saved. A response lost on
   // the way back is retried with the same id and returns the note already written,
   // rather than appending the same words twice.
-  if (!state.submission) {
-    state.submission = (crypto.randomUUID && crypto.randomUUID()) ||
-      String(Date.now()) + Math.random().toString(36).slice(2);
+  const payload = {text, reply_to: state.reply || null};
+  if (!state.submission || state.submission.text !== text || state.submission.reply_to !== payload.reply_to) {
+    state.submission = {...payload, client_id: (crypto.randomUUID && crypto.randomUUID()) ||
+      String(Date.now()) + Math.random().toString(36).slice(2)};
   }
+  try { localStorage.setItem(draftKey() + ".submission", JSON.stringify(state.submission)); } catch (e) {}
   try {
     const res = await fetch("/api/post", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify(Object.assign({ text, client_id: state.submission },
-                                         state.reply ? { reply_to: state.reply } : {}))
+      body: JSON.stringify(state.submission)
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
     state.submission = null;
-    state.messages.push(data.record);
+    try { localStorage.removeItem(draftKey() + ".submission"); } catch (e) {}
+    if (!state.messages.some(r => r.id === data.record.id)) state.messages.push(data.record);
     clearDraft();
     cancelReply();
     render();
@@ -673,7 +685,7 @@ async function send(text) {
              : "", data.published === false);
     return true;
   } catch (e) {
-    status("not added: " + e.message, true);
+    status("save outcome unknown; retry identical words to check: " + e.message, true);
     return false;
   } finally {
     state.sending = false;
@@ -681,7 +693,7 @@ async function send(text) {
   }
 }
 
-const VIEW_NEXT = { lines: "canvas", canvas: "work", work: "lines" };
+const VIEW_NEXT = { lines: "canvas", canvas: "lines", work: "lines" };
 
 function paintViewIcon() {
   const next = VIEW_NEXT[state.view] || "canvas";
@@ -696,7 +708,9 @@ async function loadWork() {
     const res = await fetch("/api/work", { headers: { "accept": "application/json" } });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
+    const focused = state.work.find(r => r.id === state.focusWork);
     state.work = data.records || [];
+    if (focused && !state.work.some(r => r.id === focused.id)) state.work.unshift(focused);
   } catch (e) {
     status("not reaching the work: " + e.message, true);
   }
@@ -704,17 +718,72 @@ async function loadWork() {
 
 // Following a reference from a note: open the work view on that record. If it is older
 // than the window the page holds, say so rather than pretending nothing happened.
-async function openWork(id) {
-  state.focusWork = id;
-  state.view = "work";
-  try { localStorage.setItem(VIEW_KEY, "work"); } catch (e) {}
-  paintViewIcon();
-  await loadWork();
-  render();
-  const el = document.querySelector('.wcard[data-id="' + id + '"]');
-  if (el) el.scrollIntoView({ block: "center" });
-  else flash("older than the last 24 records");
+let navDepth = 0;
+let focusRecord = null;
+const roomScroll = {lines: 0, canvas: 0, work: 0};
+history.scrollRestoration = "manual";
+function rememberView() {
+  roomScroll[state.view] = scrollY;
+  history.replaceState({view: state.view, y: scrollY, focus: focusRecord,
+                        depth: navDepth, roomView: state.roomView, roomScroll: {...roomScroll}}, "");
+  $("return").hidden = navDepth === 0;
 }
+async function resolveRecord(id) {
+  const res = await fetch("/api/record?id=" + encodeURIComponent(id));
+  if (!res.ok) throw new Error(res.status === 404 ? "record unavailable: " + id : "HTTP " + res.status);
+  return (await res.json()).record;
+}
+function retainRecord(record) {
+  focusRecord = record?.id || null;
+  state.focusWork = record && record.room !== "humans" ? record.id : null;
+  if (record) {
+    const rows = record.room === "humans" ? state.messages : state.work;
+    if (!rows.some(r => r.id === record.id)) rows.unshift(record);
+  }
+}
+window.addEventListener("popstate", async ev => {
+  const saved = ev.state || {};
+  navDepth = saved.depth || 0;
+  state.view = saved.view || "lines";
+  state.roomView = saved.roomView || "lines";
+  Object.assign(roomScroll, saved.roomScroll || {});
+  try {
+    if (state.view === "work") await loadWork();
+    retainRecord(saved.focus ? await resolveRecord(saved.focus) : null);
+  } catch (e) { status(e.message, true); }
+  paintViewIcon(); render();
+  $("return").hidden = navDepth === 0;
+  requestAnimationFrame(() => scrollTo(0, saved.y || 0));
+});
+$("return").onclick = () => { if (navDepth > 0) history.back(); };
+$("rooms").onclick = async () => {
+  rememberView();
+  if (state.view !== "work") state.roomView = state.view;
+  state.view = state.view === "work" ? state.roomView : "work";
+  retainRecord(null);
+  if (state.view === "work") await loadWork();
+  navDepth++;
+  history.pushState({}, "");
+  paintViewIcon(); render(); scrollTo(0, roomScroll[state.view] || 0);
+  rememberView();
+};
+async function openWork(id) {
+  try {
+    const record = await resolveRecord(id);
+    rememberView();
+    if (state.view !== "work") state.roomView = state.view;
+    state.view = record.room === "humans" ? state.roomView : "work";
+    if (state.view === "work") await loadWork();
+    retainRecord(record);
+    navDepth++;
+    history.pushState({}, "");
+    paintViewIcon(); render();
+    const el = [...document.querySelectorAll("[data-id]")].find(el => el.dataset.id === id);
+    if (el) el.scrollIntoView({block: "center"});
+    rememberView();
+  } catch (e) { status(e.message, true); }
+}
+rememberView();
 
 $("composer").addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -736,7 +805,11 @@ $("refresh").addEventListener("click", async () => {
   const before = new Set(state.messages.map((m) => m.id));
   const t0 = performance.now();
   b.classList.add("turning");
-  await load(false);
+  if (state.view === "work") {
+    await loadWork(); render();
+    setTimeout(() => b.classList.remove("turning"), 450);
+    return;
+  } else await load(false);
   const fresh = state.messages.filter((m) => !before.has(m.id));
   const wait = Math.max(0, 450 - (performance.now() - t0));
   setTimeout(() => b.classList.remove("turning"), wait);
@@ -748,6 +821,8 @@ $("refresh").addEventListener("click", async () => {
   }
 });
 $("views").addEventListener("click", async () => {
+  rememberView();
+  retainRecord(null);
   state.view = VIEW_NEXT[state.view] || "lines";
   state.focusWork = null;
   try { localStorage.setItem(VIEW_KEY, state.view); } catch (e) {}
@@ -756,6 +831,8 @@ $("views").addEventListener("click", async () => {
   render();
   window.scrollTo({ top: state.view === "lines" ? document.body.scrollHeight : 0,
                     behavior: "instant" });
+  state.roomView = state.view;
+  rememberView();
 });
 window.addEventListener("pagehide", saveDraft);
 document.addEventListener("visibilitychange", () => {

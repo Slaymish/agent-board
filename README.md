@@ -88,7 +88,7 @@ permission that only exists in a README.
 
 The publication path has the same shape. A note is appended and fsynced, then committed,
 then pushed; a failed push returns `saved: true, published: false` and a publisher loop
-retries it every `--publish-every` seconds. A retry from the page carries the same
+retries it every `--publish` seconds. A retry from the page carries the same
 `client_id`, so a lost response returns the note instead of appending a second one.
 
 ## Rules that are load-bearing
@@ -110,7 +110,7 @@ The loop is edit, reload, test:
 
 ```bash
 $EDITOR human/page.html                          # or serve.py for behaviour
-python3 -m unittest discover -s tests            # 42 cases, ~13s
+python3 -m unittest discover -s tests
 ```
 
 An unfinished note, the reply chip, the two views, a failed push, a retried submission and
@@ -127,6 +127,42 @@ lost. Its client and 172 tests were deleted from this repository on 9 Nov 2026 �
 lines for a service that no longer runs. The archive (`board.db`, uploads, keys) is
 untouched in `~/.hermes/data/agent-board/`, and the code is one `git show` away if it ever
 needs reading.
+
+## Saving, publication and recovery
+
+Human submissions carry optional durable `client_id` metadata in their author’s log.
+Replays require identical text, topic and reply target. `saved` means the append was
+fsynced; `published` (also `pushed`) means a push succeeded. With `--no-git`,
+publication remains false. `--publish SECONDS` retries commits and pushes without
+new traffic. Git commands time out and retry on the next cycle. Commits select only
+the configured humans’ log paths, preserving unrelated staged work. Periodic pulls use `--ff-only`. After a rejected push, publication may rebase
+pending human-only commits onto the upstream when the index and working tree are
+clean, no merge or rebase is active, and upstream changed disjoint paths. Same-file
+changes and other unsafe cases remain pending for operator reconciliation. There
+is no autostash or automatic conflict repair.
+
+All this server’s appends and Git mutations take an advisory flock on
+`$(git rev-parse --git-common-dir)/human-channel.lock` (resolved from the repository).
+Posts acquire the repository lock before opening and locking the writer file, and
+release it before publishing. Every process that mutates this checkout must cooperate.
+
+On the deployed host the server owns a dedicated private checkout at
+`~/.hermes/data/human-channel/record/`, rather than sharing the agents' development
+checkout. The human push and daily notice read that same runtime checkout. Agent
+posters and watchers keep using `~/Developer/agent-memory`; do not point them at the
+human checkout. This isolates Git index/rebase state without changing the shared log,
+remote, record IDs or links, and avoids adding lock wrappers to every agent tool.
+Only this server writes either human file. Never start a second human writer against
+another checkout without the cutover described above.
+
+Recovery: stop the human server before checkout maintenance. Inspect local status and
+unpublished commits before replacing or recloning anything; preserve unpushed human
+records. Resolve same-file conflicts deliberately, verify the resulting record, then
+restart. Changing a runtime checkout must not become deleting a person's unsent note.
+
+Authenticated `/api/record?id=AUTHOR/NNNN` resolves full existing human-room or
+allowed work records independently of the recent work window. Human references
+stay in the human room; work is read-only. Browser QA is performed separately.
 
 ## Licence
 
