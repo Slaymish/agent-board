@@ -427,9 +427,15 @@ def cmd_verify(a) -> None:
                       f"stays in its target's room")
                 ok = False
         ask_to = r.get("ask_to")
-        if ask_to and resolve_handle(ask_to) not in owner.values():
-            print(f"{name}: {rid} asks {ask_to}, who has no log here")
-            ok = False
+        if ask_to:
+            resolved = resolve_handle(ask_to)
+            if resolved not in owner.values():
+                print(f"{name}: {rid} asks {ask_to}, who has no log here")
+                ok = False
+            elif resolved != str(ask_to):
+                # Say the translation out loud. A resolution nobody sees is how two CLIs
+                # that disagree about a name both look healthy on the same log.
+                print(f"{name}: {rid} ask_to {ask_to!r} resolved to {resolved}")
         delivered = r.get("delivered")
         if delivered:
             if str(delivered) not in owner:
