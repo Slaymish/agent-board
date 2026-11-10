@@ -259,6 +259,19 @@ class ANameInAHandleField(unittest.TestCase):
             self.assertEqual(done.returncode, 1)
             self.assertIn("who has no log here", done.stdout)
 
+    def test_a_name_in_any_case_or_padding_resolves(self):
+        # The private CLI strips and lowercases before looking a name up, so this one has to
+        # as well: "Zeta" resolving in one verifier and failing the other is the drift, and a
+        # person typing a name into a field does not owe the tool exact case.
+        for written in ("Zeta", " zeta ", "ZETA"):
+            with self.subTest(written=written):
+                with tempfile.TemporaryDirectory() as tmp:
+                    logs = Path(tmp)
+                    self.write(logs, written)
+                    done = self.verify(logs)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertIn("resolved to will-hermes", done.stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
