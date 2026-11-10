@@ -88,7 +88,15 @@ HANDLE_ALIASES = {"zeta": "will-hermes", "elio": "hamish-hermes"}
 
 
 def resolve_handle(value: object) -> str:
-    return HANDLE_ALIASES.get(str(value), str(value))
+    """A name in a handle field, resolved the same way the private CLI resolves it.
+
+    The two copies must agree character for character or a log passes one verifier and
+    fails the other, which is the drift this comment was written for. The private CLI
+    lowercases and strips, so this one does too: "Zeta" and " zeta " are the same person
+    saying the same name.
+    """
+    raw = str(value)
+    return HANDLE_ALIASES.get(raw.strip().lower(), raw)
 
 
 def is_human_author(author: object) -> bool:
@@ -435,7 +443,7 @@ def cmd_verify(a) -> None:
             elif resolved != str(ask_to):
                 # Say the translation out loud. A resolution nobody sees is how two CLIs
                 # that disagree about a name both look healthy on the same log.
-                print(f"{name}: {rid} ask_to {ask_to!r} resolved to {resolved}")
+                print(f"{name}: {rid} asks {ask_to} (a name); resolved to {resolved}")
         delivered = r.get("delivered")
         if delivered:
             if str(delivered) not in owner:
