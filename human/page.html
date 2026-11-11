@@ -130,8 +130,11 @@
     color: var(--quiet); cursor: pointer;
   }
   .seg button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
-  .subbar .who { margin-left: auto; }
-  .subbar .who[data-state="down"] { color: var(--warn); }
+  /* The connection state is chrome, not a control row: it sat at the end of the subbar,
+     which on the review tab left a whole bar whose only content was the word "live". */
+  .tools .who { margin-left: 0; padding-right: 6px; }
+  .tools .who[data-state="down"] { color: var(--warn); }
+  .tools .who[data-state="live"] { opacity: .45; }
 
   /* ---------- search: the same two rooms, found rather than scrolled ---------- */
   #search { position: fixed; inset: 0; z-index: 6; background: var(--paper);
@@ -173,12 +176,60 @@
   .ocard .meta { font: 11px/1.5 var(--mono); color: var(--quiet); letter-spacing: .02em; }
   .ocard .act { font: 12px/1.4 var(--sans); color: var(--ink); }
   .outs .stamp { font: 11px/1.4 var(--mono); color: var(--quiet); margin: 0 0 2px; }
-  .review { display: grid; gap: 26px; max-width: var(--measure); }
-  .rcard { border-left: 2px solid var(--rule); padding: 0 0 2px 12px; display: grid; gap: 7px; }
-  .rcard .why {
-    font: 11px/1.4 var(--mono); color: var(--quiet); letter-spacing: .02em;
+  /* ---------- review: a document with questions in it, not a form ----------
+     Obsidian's hierarchy, in this page's own palette: one reading column, section labels
+     in small letterspaced caps, content in the serif, metadata in the sans and always
+     quieter than the thing it describes. Hairline rules and space do the separating, so
+     there are no cards with borders on three sides and no pills. */
+  .review { display: grid; gap: 34px; max-width: 36em; }
+  .review .lede {
+    font: 400 16.5px/1.6 var(--serif); color: var(--quiet); margin: 0; max-width: 32em;
   }
-  .rcard .claim { font-size: 16px; line-height: 1.45; }
+
+  .ghead { display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+           border-bottom: 1px solid var(--rule); padding-bottom: 7px; }
+  .ghead h2 {
+    font: 600 11.5px/1.3 var(--sans); letter-spacing: .12em; text-transform: uppercase;
+    margin: 0; color: var(--quiet); white-space: nowrap;
+  }
+  .ghead button {
+    border: 0; background: none; color: var(--quiet); padding: 0 0 1px;
+    font: 500 12px/1.3 var(--sans); letter-spacing: .02em; cursor: pointer;
+    border-bottom: 1px solid var(--rule);
+  }
+  .ghead button:hover { color: var(--ink); border-color: var(--ink); }
+  .ghead button[disabled] { opacity: .5; }
+  .gnote { font: 400 13px/1.6 var(--sans); color: var(--quiet); margin: 0; }
+
+  .rcard { display: grid; gap: 9px; border-top: 1px solid var(--rule); padding-top: 26px; }
+  .rcard:first-of-type { border-top: 0; padding-top: 2px; }
+  .rcard .why {
+    font: 400 12.5px/1.5 var(--sans); color: var(--quiet); letter-spacing: .01em; margin: 0;
+  }
+  .rcard .claim { font: 400 19px/1.45 var(--serif); color: var(--ink); margin: 0; }
+
+  /* The generated options read down the page, not across it: a list of positions, each
+     with the consequence in a smaller quieter line, closed by a hairline. */
+  .opts { display: grid; border-top: 1px solid var(--rule); margin-top: 4px; }
+  .opt {
+    display: grid; gap: 3px; text-align: left; background: none; border: 0;
+    border-bottom: 1px solid var(--rule); padding: 14px 2px; cursor: pointer;
+    font: 400 16.5px/1.4 var(--serif); color: var(--ink); min-height: var(--tap);
+  }
+  .opt:hover, .opt:active { background: rgba(128, 128, 128, .07); }
+  .opt[disabled] { opacity: .45; }
+  .opt .does { font: 400 12.5px/1.45 var(--sans); color: var(--quiet); }
+
+  .otherbox { display: grid; gap: 9px; padding: 14px 2px; border-bottom: 1px solid var(--rule); }
+  .otherbox textarea { min-height: 66px; }
+  .otherrow { display: flex; gap: 8px; }
+  .otherrow button {
+    flex: 0 0 auto; border: 1px solid var(--rule); background: none; color: var(--ink);
+    border-radius: 6px; padding: 9px 14px; min-height: var(--tap);
+    font: 500 13px/1.2 var(--sans); cursor: pointer;
+  }
+  .otherrow button.go { border-color: var(--ink); }
+
   .rcard .choices { display: flex; gap: 6px; flex-wrap: wrap; }
   .rcard .choices button {
     border: 1px solid var(--rule); background: none; color: var(--ink);
@@ -189,36 +240,19 @@
     background: var(--ink); color: var(--paper); border-color: var(--ink);
   }
   .rcard textarea {
-    width: 100%; border: 1px solid var(--rule); border-radius: 8px;
-    background: none; color: var(--ink); font: 15px/1.45 var(--serif);
-    padding: 8px 10px; resize: vertical; min-height: 34px;
+    width: 100%; border: 1px solid var(--rule); border-radius: 6px;
+    background: none; color: var(--ink); font: 16px/1.5 var(--serif);
+    padding: 10px 11px; resize: vertical; min-height: 44px;
   }
+  .rcard textarea:focus { outline: 2px solid var(--quiet); outline-offset: 1px; }
   .review .send { justify-self: start; }
-  .rcard .does { font: 12px/1.35 var(--sans); color: var(--quiet); }
-  .rcard .opt {
-    text-align: left; border: 1px solid var(--rule); background: none; color: var(--ink);
-    border-radius: 10px; padding: 8px 11px; font: 400 15px/1.35 var(--serif);
-    cursor: pointer; display: grid; gap: 2px;
-  }
-  .rcard .opt:active { background: var(--rule); }
-  .rcard .opt[disabled] { opacity: .5; }
-  .ghead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
-  .ghead h2 {
-    font: 600 11.5px/1.3 var(--sans); letter-spacing: .08em; text-transform: lowercase;
-    margin: 0; color: var(--quiet);
-  }
-  .ghead button {
-    border: 0; background: none; color: var(--quiet); text-decoration: underline; padding: 0;
-    font: 600 11.5px/1.2 var(--sans); letter-spacing: .06em; text-transform: lowercase;
-    cursor: pointer;
-  }
-  .gnote { font: 11px/1.45 var(--mono); color: var(--quiet); margin: 0; }
-  details.ganswered { font: 11px/1.45 var(--mono); color: var(--quiet); }
-  details.ganswered summary { cursor: pointer; padding: 2px 0; letter-spacing: .02em; }
-  .gans { border-left: 2px solid var(--rule); padding-left: 12px; margin: 10px 0 0;
-          display: grid; gap: 2px; }
-  .gans .q { font: 11px/1.4 var(--mono); color: var(--quiet); }
-  .gans .a { font: 400 14px/1.4 var(--serif); color: var(--ink); }
+
+  details.ganswered { font: 400 12.5px/1.6 var(--sans); color: var(--quiet); }
+  details.ganswered summary { cursor: pointer; padding: 4px 0; letter-spacing: .02em; }
+  .gans { border-left: 1px solid var(--rule); padding-left: 14px; margin: 12px 0 0;
+          display: grid; gap: 3px; }
+  .gans .q { font: 400 12.5px/1.45 var(--sans); color: var(--quiet); }
+  .gans .a { font: 400 15px/1.45 var(--serif); color: var(--ink); }
 
   /* ---------- reports: what was written, readable ---------- */
   .rlist { display: grid; gap: 0; max-width: var(--measure); }
@@ -422,6 +456,7 @@
   </nav>
   <button class="icon" id="more" type="button" aria-label="more rooms" aria-expanded="false" title="more"></button>
   <div class="tools">
+    <span class="who" id="link" data-state="live">live</span>
     <button class="icon" id="search-open" type="button" aria-label="search" title="search"></button>
     <button class="icon" id="refresh" type="button" aria-label="check for new notes" title="check for new notes"></button>
   </div>
@@ -441,7 +476,6 @@
     <button type="button" data-who="hamish-hermes" aria-pressed="false">elio</button>
     <button type="button" data-who="will-hermes" aria-pressed="false">zeta</button>
   </div>
-  <span class="who" id="link" data-state="live">live</span>
 </div>
 <div id="search" hidden>
   <div class="bar">
@@ -473,11 +507,30 @@ const state = { me: "?", peer: "?", messages: [], sending: false, reply: null,
                 reports: [], openReport: null, outcomes: null,
                 view: "lines" };
 const VIEW_KEY = "hc.view";
+// A home-screen launch is a fresh navigation, so history.state is empty and only this
+// survives it. The host-only rooms are guarded on restore, not here.
+const TAB_KEY = "hc.tab";
+const HOST_ROOMS = ["today", "review", "reports"];
 try {
   const saved = localStorage.getItem(VIEW_KEY);
   if (saved === "canvas") state.view = saved;
 } catch (e) {}
 state.roomView = state.view;
+// Which room, and where in it, restored on load. The tab was only ever kept in
+// history.state, which survives back and forward but was never read at boot, so a refresh
+// dropped you in the human room wherever you had been.
+const BOOT = history.state || {};
+let savedTab = "";
+try { savedTab = localStorage.getItem(TAB_KEY) || ""; } catch (e) {}
+if (BOOT.view) {
+  state.view = BOOT.view;
+  state.roomView = BOOT.roomView || state.roomView;
+} else if (savedTab && savedTab !== "human") {
+  // No history state: a cold launch. Put him back in the room he left, unless the room
+  // was the human one, in which case the saved layout above already decides it.
+  state.view = savedTab === "canvas" ? "canvas" : savedTab;
+}
+
 const $ = (id) => document.getElementById(id);
 
 // Icons are built as elements, not markup: nothing here takes a string from the log.
@@ -936,8 +989,7 @@ function renderGenerated(wrap) {
     ctx.className = "why";
     ctx.textContent = q.context || "";
     const choices = document.createElement("div");
-    choices.style.display = "grid";
-    choices.style.gap = "6px";
+    choices.className = "opts";
     for (const option of (q.options || [])) {
       const b = document.createElement("button");
       b.type = "button";
@@ -951,7 +1003,12 @@ function renderGenerated(wrap) {
         does.textContent = option.does;
         b.append(does);
       }
-      b.addEventListener("click", () => answerGenerated(q, option, card));
+      // "None of these" is not an answer, it is the door to one. It opens a box instead
+      // of filing a tap that says he disagreed but not with what.
+      b.addEventListener("click", () => {
+        if (option.value === "other") { openOther(q, card, choices); }
+        else { answerGenerated(q, option, card); }
+      });
       choices.append(b);
     }
     card.append(why, claim, ctx, choices);
@@ -984,13 +1041,46 @@ function renderGenerated(wrap) {
   wrap.append(box);
 }
 
-async function answerGenerated(q, option, card) {
+function openOther(q, card, choices) {
+  if (card.querySelector(".otherbox")) return;
+  const box = document.createElement("div");
+  box.className = "otherbox";
+  const area = document.createElement("textarea");
+  area.rows = 2;
+  area.placeholder = "say it in your own words";
+  const row = document.createElement("div");
+  row.className = "otherrow";
+  const save = document.createElement("button");
+  save.type = "button"; save.className = "go"; save.textContent = "save";
+  const cancel = document.createElement("button");
+  cancel.type = "button"; cancel.textContent = "never mind";
+  cancel.addEventListener("click", () => {
+    box.remove();
+    choices.hidden = false;
+    card.querySelectorAll("button").forEach((b) => { b.disabled = false; });
+  });
+  save.addEventListener("click", () => {
+    const text = area.value.trim();
+    if (!text) { area.focus(); return; }
+    save.disabled = true; cancel.disabled = true;
+    answerGenerated(q, { value: "other", label: text }, card, text);
+  });
+  row.append(save, cancel);
+  box.append(area, row);
+  choices.hidden = true;
+  card.append(box);
+  area.focus();
+}
+
+async function answerGenerated(q, option, card, text) {
+  const choices = card.querySelector(".opts");
+  const other = card.querySelector(".otherbox");
   card.querySelectorAll("button").forEach((b) => { b.disabled = true; });
   try {
     const res = await fetch("/api/review/generated", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ batch: (state.generated || {}).batch_id || "", id: q.id,
-                             value: option.value })
+                             value: option.value, text: text || "" })
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
@@ -998,6 +1088,10 @@ async function answerGenerated(q, option, card) {
     flash(data.verdict || "noted");
     render();
   } catch (e) {
+    // Put the card back exactly as it was: a failed save must not strand a hidden list
+    // behind a text box he can no longer get out of.
+    if (other) other.remove();
+    if (choices) choices.hidden = false;
     card.querySelectorAll("button").forEach((b) => { b.disabled = false; });
     status("not saved: " + e.message, true);
   }
@@ -1283,6 +1377,12 @@ async function load(first) {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     state.me = data.me; state.peer = data.peer; state.host = !!data.host;
+    // A restored room he is not allowed in is not a room: the other person's link must
+    // not open on a review that is not his.
+    if (HOST_ROOMS.includes(state.view) && !state.host) {
+      state.view = state.roomView || "lines";
+      try { localStorage.setItem(TAB_KEY, state.view); } catch (e) {}
+    }
     $("text").placeholder = "write to " + data.peer;
     if (first) restoreDraft();
     state.messages = data.messages;
@@ -1352,6 +1452,12 @@ function syncChrome() {
   }
   $("seg-layout").hidden = tab !== "human";
   $("seg-who").hidden = tab !== "work";
+  // A bar with nothing in it is not a bar. On review and reports both segments are
+  // hidden, and the row stayed for its own sake.
+  const subbar = document.querySelector(".subbar");
+  if (subbar) {
+    subbar.hidden = Array.from(subbar.children).every((el) => el.hidden);
+  }
   // Without the host's own rooms there is nothing behind "more", so it stays absent.
   $("more").hidden = !state.host;
   for (const b of $("menu").querySelectorAll("button")) {
@@ -1391,6 +1497,9 @@ async function loadWork() {
 // than the window the page holds, say so rather than pretending nothing happened.
 let focusRecord = null;
 const roomScroll = {lines: 0, canvas: 0, work: 0};
+// Applied here, not where BOOT is read: roomScroll is declared at this point in the file
+// and touching it earlier is a temporal-dead-zone error that takes the whole page down.
+if (BOOT.roomScroll) Object.assign(roomScroll, BOOT.roomScroll);
 history.scrollRestoration = "manual";
 function rememberView() {
   roomScroll[state.view] = scrollY;
@@ -1427,6 +1536,7 @@ async function showTab(name) {
   if (state.view !== "work") state.roomView = state.view === "canvas" ? "canvas" : "lines";
   if (name === "human") state.view = state.roomView || "lines";
   else state.view = name;
+  try { localStorage.setItem(TAB_KEY, state.view); } catch (e) {}
   retainRecord(null);
   if (state.view === "work") await loadWork();
   if (state.view === "today") await loadOutcomes(false);
@@ -1615,6 +1725,7 @@ if (state.view === "work") loadWork().then(render);
 if (state.view === "today") loadOutcomes(false).then(render);
 if (state.view === "review") loadReview().then(render);
 if (state.view === "reports") loadReports().then(render);
+if (BOOT.y) requestAnimationFrame(() => scrollTo(0, BOOT.y));
 </script>
 </body>
 </html>
