@@ -194,6 +194,25 @@
     padding: 8px 10px; resize: vertical; min-height: 34px;
   }
   .review .send { justify-self: start; }
+  .rcard .does { font: 12px/1.35 var(--sans); color: var(--quiet); }
+  .rcard .opt {
+    text-align: left; border: 1px solid var(--rule); background: none; color: var(--ink);
+    border-radius: 10px; padding: 8px 11px; font: 400 15px/1.35 var(--serif);
+    cursor: pointer; display: grid; gap: 2px;
+  }
+  .rcard .opt:active { background: var(--rule); }
+  .rcard .opt[disabled] { opacity: .5; }
+  .ghead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .ghead h2 {
+    font: 600 11.5px/1.3 var(--sans); letter-spacing: .08em; text-transform: lowercase;
+    margin: 0; color: var(--quiet);
+  }
+  .ghead button {
+    border: 0; background: none; color: var(--quiet); text-decoration: underline; padding: 0;
+    font: 600 11.5px/1.2 var(--sans); letter-spacing: .06em; text-transform: lowercase;
+    cursor: pointer;
+  }
+  .gnote { font: 11px/1.45 var(--mono); color: var(--quiet); margin: 0; }
 
   /* ---------- reports: what was written, readable ---------- */
   .rlist { display: grid; gap: 0; max-width: var(--measure); }
@@ -444,6 +463,7 @@
 const state = { me: "?", peer: "?", messages: [], sending: false, reply: null,
                 submission: null, work: [], focusWork: null, roomView: "lines",
                 whoFilter: "all", host: false, review: [], answers: {}, reviewNote: "",
+                generated: {}, genNote: "", genBusy: false,
                 reports: [], openReport: null, outcomes: null,
                 view: "lines" };
 const VIEW_KEY = "hc.view";
@@ -743,6 +763,7 @@ function renderReview() {
   lede.className = "lede";
   lede.textContent = "what i think i know about you, and how sure i am. one tap, or say it properly.";
   wrap.append(lede);
+  renderGenerated(wrap);
   if (!state.review.length) {
     const p = document.createElement("p");
     p.id = "empty";
@@ -824,7 +845,137 @@ function renderReview() {
   thread.append(wrap);
 }
 
+// ---------- review, generated: questions written from his own conversations ----------
+// The first pass over this tab showed the ledger's stale claims. The generated batch is the
+// other half: what the agent thinks it understood, phrased so a wrong reading is visible
+// before it becomes a stored fact. One tap per question; every option says what it changes.
+function renderGenerated(wrap) {
+  const box = document.createElement("div");
+  box.style.display = "grid";
+  box.style.gap = "18px";
+
+  const head = document.createElement("div");
+  head.className = "ghead";
+  const title = document.createElement("h2");
+  const batch = state.generated || {};
+  const questions = (batch.questions || []).filter((q) => !q.answered);
+  title.textContent = questions.length
+    ? "what i picked up (" + questions.length + ")"
+    : "what i picked up";
+  const ask = document.createElement("button");
+  ask.type = "button";
+  ask.textContent = state.genBusy ? "reading…" : "ask me new ones";
+  ask.disabled = !!state.genBusy;
+  ask.addEventListener("click", generateQuestions);
+  head.append(title, ask);
+  box.append(head);
+
+  const note = document.createElement("p");
+  note.className = "gnote";
+  note.textContent = state.genNote || (batch.asked_at ? "" : "nothing generated yet.");
+  if (note.textContent) box.append(note);
+
+  if (!questions.length && !state.genBusy) {
+    const p = document.createElement("p");
+    p.className = "gnote";
+    p.textContent = "ask me new ones and i'll read back through your last few days. "
+      + "it takes about half a minute.";
+    box.append(p);
+  }
+
+  for (const q of questions) {
+    const card = document.createElement("article");
+    card.className = "rcard";
+    const why = document.createElement("div");
+    why.className = "why";
+    why.textContent = [q.kind, q.about].filter(Boolean).join(" · ");
+    const claim = document.createElement("div");
+    claim.className = "claim";
+    claim.textContent = q.question;
+    const ctx = document.createElement("div");
+    ctx.className = "why";
+    ctx.textContent = q.context || "";
+    const choices = document.createElement("div");
+    choices.style.display = "grid";
+    choices.style.gap = "6px";
+    for (const option of (q.options || [])) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "opt";
+      const label = document.createElement("span");
+      label.textContent = option.label;
+      b.append(label);
+      if (option.does) {
+        const does = document.createElement("span");
+        does.className = "does";
+        does.textContent = option.does;
+        b.append(does);
+      }
+      b.addEventListener("click", () => answerGenerated(q, option, card));
+      choices.append(b);
+    }
+    card.append(why, claim, ctx, choices);
+    box.append(card);
+  }
+  wrap.append(box);
+}
+
+async function answerGenerated(q, option, card) {
+  card.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+  try {
+    const res = await fetch("/api/review/generated", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ batch: (state.generated || {}).batch_id || "", id: q.id,
+                             value: option.value })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
+    q.answered = data.verdict || "noted";
+    flash(data.verdict || "noted");
+    render();
+  } catch (e) {
+    card.querySelectorAll("button").forEach((b) => { b.disabled = false; });
+    status("not saved: " + e.message, true);
+  }
+}
+
+async function generateQuestions() {
+  if (state.genBusy) return;
+  state.genBusy = true;
+  state.genNote = "reading back through your last few days. about half a minute.";
+  render();
+  try {
+    const res = await fetch("/api/review/generated", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ generate: true })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
+    state.genNote = data.count
+      ? data.count + (data.count === 1 ? " question" : " questions") + ", from your last few conversations."
+      : (data.note || "nothing new worth asking about just now.");
+    await loadGenerated();
+  } catch (e) {
+    state.genNote = "could not generate: " + e.message;
+  } finally {
+    state.genBusy = false;
+    render();
+  }
+}
+
+async function loadGenerated() {
+  try {
+    const res = await fetch("/api/review/generated");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    state.generated = (await res.json()).batch || {};
+  } catch (e) {
+    state.generated = {};
+    state.genNote = "the generated questions are unreachable: " + e.message;
+  }
+}
+
 async function loadReview() {
+  await loadGenerated();
   try {
     const res = await fetch("/api/review?limit=5");
     if (!res.ok) throw new Error("HTTP " + res.status);

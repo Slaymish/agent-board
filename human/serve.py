@@ -57,6 +57,11 @@ MAX_TEXT = board_log.MAX_TEXT
 
 # The review and the reports are this person's own material, not the shared room's.
 FACT_REVIEW = Path.home() / ".hermes" / "scripts" / "facts-review.py"
+# The generated half: questions written from his own recent conversations. It imports
+# dream.py for the model call, and dream.py needs PyYAML, which this service's interpreter
+# does not have. Same trap the facts page hit, so the interpreter is named rather than
+# inherited: /usr/bin/python3 is the one with yaml on this host.
+REVIEW_QUESTIONS = Path.home() / ".hermes" / "scripts" / "review-questions.py"
 REPORT_DIRS = [
     Path.home() / "agent-system" / "plans" / "reviews",
     Path.home() / ".hermes" / "data" / "lottery-scanner",
@@ -289,6 +294,44 @@ class App:
                 os.unlink(path)
             except OSError:
                 pass
+
+
+    def _review_python(self) -> str:
+        candidate = Path("/usr/bin/python3")
+        return str(candidate) if candidate.exists() else sys.executable
+
+    def review_generated(self) -> dict:
+        """The current generated batch. Reading it must never generate one."""
+        done = subprocess.run([self._review_python(), str(REVIEW_QUESTIONS), "latest"],
+                              capture_output=True, text=True, timeout=30)
+        if done.returncode != 0:
+            raise RuntimeError((done.stderr or done.stdout).strip()[:400] or "questions unavailable")
+        return json.loads(done.stdout or "{}")
+
+    def review_generate(self) -> dict:
+        """One model call over the last few days of conversation. Slow by nature."""
+        done = subprocess.run([self._review_python(), str(REVIEW_QUESTIONS), "generate"],
+                              capture_output=True, text=True, timeout=280)
+        if done.returncode != 0:
+            raise RuntimeError((done.stderr or done.stdout).strip()[:400] or "could not generate")
+        batch = json.loads(done.stdout or "{}")
+        return {"count": len(batch.get("questions") or []),
+                "batch_id": batch.get("batch_id"), "note": batch.get("note")}
+
+    def review_generated_answer(self, batch: str, qid: str, value: str) -> dict:
+        """Apply one tap. Exit 4 is a refusal with a reason, not a broken server."""
+        args = [self._review_python(), str(REVIEW_QUESTIONS), "answer", "--id", qid,
+                "--value", value]
+        if batch:
+            args += ["--batch", batch]
+        done = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        try:
+            outcome = json.loads(done.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError((done.stderr or done.stdout).strip()[:400] or str(exc)) from exc
+        if outcome.get("result") != "answered":
+            raise ValueError(outcome.get("why") or "that answer did not apply")
+        return outcome
 
     def reports(self) -> list[dict]:
         out = []
@@ -583,6 +626,19 @@ def make_handler(app: App):
                 except (RuntimeError, ValueError) as e:
                     self._json(503, {"ok": False, "error": str(e)})
                 return
+            if url.path == "/api/review/generated":
+                who = app.who(self._token())
+                if who is None:
+                    self._json(401, {"ok": False, "error": "needs the channel link"})
+                    return
+                if who != app.local_human:
+                    self._json(403, {"ok": False, "error": "this review belongs to the host"})
+                    return
+                try:
+                    self._json(200, {"ok": True, "batch": app.review_generated()})
+                except (RuntimeError, ValueError) as e:
+                    self._json(503, {"ok": False, "error": str(e)})
+                return
             if url.path == "/api/outcomes":
                 who = app.who(self._token())
                 if who is None:
@@ -694,6 +750,49 @@ def make_handler(app: App):
                     self._json(200, {"ok": True, **app.review_apply(answers)})
                 except RuntimeError as e:
                     self._json(503, {"ok": False, "error": str(e)})
+                return
+            if url.path == "/api/review/generated":
+                who = app.who(self._token())
+                if who is None:
+                    self._json(401, {"ok": False, "error": "needs the channel link"})
+                    return
+                if who != app.local_human:
+                    self._json(403, {"ok": False, "error": "this review belongs to the host"})
+                    return
+                if "application/json" not in (self.headers.get("content-type") or ""):
+                    self._json(415, {"ok": False, "error": "send JSON"})
+                    return
+                length = int(self.headers.get("content-length") or 0)
+                if length <= 0 or length > 8_000:
+                    self._json(413, {"ok": False, "error": "body missing or too large"})
+                    return
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    self._json(400, {"ok": False, "error": str(e) or "body is not JSON"})
+                    return
+                if body.get("generate"):
+                    try:
+                        self._json(200, {"ok": True, **app.review_generate()})
+                    except (RuntimeError, ValueError) as e:
+                        self._json(503, {"ok": False, "error": str(e)})
+                    return
+                qid = str(body.get("id") or "").strip()
+                value = str(body.get("value") or "").strip()
+                batch = str(body.get("batch") or "").strip()
+                if not qid or not value or len(value) > 32:
+                    self._json(400, {"ok": False, "error": "id and value are required"})
+                    return
+                try:
+                    outcome = app.review_generated_answer(batch, qid, value)
+                except ValueError as e:
+                    # A refused answer is not a broken server: say why in the writer's words.
+                    self._json(409, {"ok": False, "error": str(e)})
+                    return
+                except RuntimeError as e:
+                    self._json(503, {"ok": False, "error": str(e)})
+                    return
+                self._json(200, {"ok": True, "verdict": outcome.get("verdict")})
                 return
             if url.path != "/api/post":
                 self._json(404, {"ok": False, "error": "no such path"})
