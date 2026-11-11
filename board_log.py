@@ -199,12 +199,17 @@ def _guard_author_name(author: str) -> None:
                           f"BOARD_AUTHOR={pinned}")
 
 
-def append_once(author: str, body: dict, client_id: str | None = None) -> tuple[dict, bool]:
+def append_once(author: str, body: dict, client_id: str | None = None,
+                allow_pinned_other: bool = False) -> tuple[dict, bool]:
     """Append one record, unless this client already produced one.
 
     Returns ``(record, repeated)``. A repeat with the same client id and the same payload
     returns the original record and appends nothing; the same id with a *different*
-    payload raises, because that is a client bug rather than a retry.
+    payload raises, because that is a client bug rather than a retry. "Same payload" means
+    ``text``, ``topic`` and ``reply_to``: a retry that changes ``room`` or ``via`` gets the
+    original record back with those fields untouched, silently, which is what a retry
+    should do. The id is always computed here, so a body carrying its own id cannot point
+    two records at one number.
 
     The check and the append happen under the one write lock, which is what makes a retry
     of an uncertain save safe: without it, a lost acknowledgement and a second tap look
@@ -213,7 +218,10 @@ def append_once(author: str, body: dict, client_id: str | None = None) -> tuple[
     """
     if client_id and len(str(client_id)) > 128:
         raise ValueError("client_id too long")
-    _guard_author_name(author)
+    # The pin stops an agent writing the other party's log. A human-facing channel is the
+    # person themselves, authenticated by their own token, so it may write either file.
+    if not allow_pinned_other:
+        _guard_author_name(author)
     path = own_file(author)
     path.touch(exist_ok=True)
     with path.open("a+") as stream:
@@ -242,7 +250,7 @@ def append_once(author: str, body: dict, client_id: str | None = None) -> tuple[
                 tail = str(row.get("id") or "").split("/")[-1]
                 if tail.isdigit():
                     numbers.append(int(tail))
-            record = {"id": f"{author}/{max(numbers) + 1 if numbers else 1:04d}", **body}
+            record = {**body, "id": f"{author}/{max(numbers) + 1 if numbers else 1:04d}"}
             if client_id:
                 record["client_id"] = client_id
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")

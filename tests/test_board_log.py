@@ -332,6 +332,17 @@ class AppendOnce(unittest.TestCase):
         self.assertTrue(repeated)
         self.assertEqual(len(self.rows()), 1)
 
+    def test_a_body_carrying_its_own_id_cannot_force_a_duplicate(self):
+        # A "save this again" path hands back a record it built itself, id included. The
+        # computed id must win, or the log gains two lines under one id and the lock has
+        # protected nothing. (Zeta, PR #37 review, 11 Nov 2026.)
+        first, _ = self.mod.append_once("hamish", {"text": "first"})
+        again, _ = self.mod.append_once("hamish", {**first, "text": "second"})
+        self.assertNotEqual(first["id"], again["id"])
+        ids = [row["id"] for row in self.rows()]
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(len(set(ids)), 2)
+
     def test_an_overlong_id_is_refused(self):
         with self.assertRaises(ValueError):
             self.mod.append_once("hamish", {"text": "x"}, "z" * 200)
