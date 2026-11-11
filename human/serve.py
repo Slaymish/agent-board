@@ -55,19 +55,39 @@ ROOM = "humans"
 COOKIE = "hc"
 MAX_TEXT = board_log.MAX_TEXT
 
+# The review, the outcomes and the reports are THIS MACHINE's own material, not the shared
+# room's. Every path below is home-relative and env-overridable, because the same file runs
+# on either person's machine: on Will's box Path.home() is his home and the tabs become
+# Zeta's review, his routines and his reports. Nothing here may name a person.
+def _env_path(name: str, default: Path) -> Path:
+    raw = (os.environ.get(name) or "").strip()
+    return Path(raw).expanduser() if raw else default
+
+
+def _env_paths(name: str, defaults: list) -> list:
+    raw = (os.environ.get(name) or "").strip()
+    return [Path(p).expanduser() for p in raw.split(":") if p.strip()] if raw else defaults
+
+
 # The review and the reports are this person's own material, not the shared room's.
-FACT_REVIEW = Path.home() / ".hermes" / "scripts" / "facts-review.py"
+FACT_REVIEW = _env_path("HC_FACTS_REVIEW",
+                        Path.home() / ".hermes" / "scripts" / "facts-review.py")
 # The generated half: questions written from his own recent conversations. It imports
 # dream.py for the model call, and dream.py needs PyYAML, which this service's interpreter
 # does not have. Same trap the facts page hit, so the interpreter is named rather than
 # inherited: /usr/bin/python3 is the one with yaml on this host.
-REVIEW_QUESTIONS = Path.home() / ".hermes" / "scripts" / "review-questions.py"
-REPORT_DIRS = [
+REVIEW_QUESTIONS = _env_path("HC_REVIEW_QUESTIONS",
+                             Path.home() / ".hermes" / "scripts" / "review-questions.py")
+OUTCOMES_SCRIPT = _env_path("HC_OUTCOMES", Path.home() / ".hermes" / "scripts" / "outcomes.py")
+OUTCOMES_JSON = _env_path("HC_OUTCOMES_JSON",
+                          Path.home() / ".hermes" / "data" / "outcomes.json")
+# Colon-separated, in the order they should read on the page.
+REPORT_DIRS = _env_paths("HC_REPORT_DIRS", [
     Path.home() / "agent-system" / "plans" / "reviews",
     Path.home() / ".hermes" / "data" / "lottery-scanner",
     Path.home() / ".hermes" / "data" / "journal-clearance",
     Path.home() / ".hermes" / "data" / "recs",
-]
+])
 REPORT_MAX = 200_000
 
 # The page is deliberately one file with no assets and no framework: it has to open on
@@ -247,7 +267,7 @@ class App:
         The generator is read-only over cron's own records and the routines' artefacts;
         this method only decides when to run it and returns what it wrote.
         """
-        path = Path.home() / ".hermes" / "data" / "outcomes.json"
+        path = OUTCOMES_JSON
         stale = True
         try:
             stale = (time.time() - path.stat().st_mtime) > 600
@@ -255,8 +275,7 @@ class App:
             pass
         if force or stale:
             try:
-                subprocess.run([sys.executable, str(Path.home() / ".hermes" / "scripts"
-                                                  / "outcomes.py")],
+                subprocess.run([sys.executable, str(OUTCOMES_SCRIPT)],
                                capture_output=True, text=True, timeout=30)
             except (OSError, subprocess.SubprocessError):
                 pass
@@ -266,12 +285,25 @@ class App:
             return {"generated_at": None, "routines": [],
                     "error": "no outcome snapshot yet"}
 
+    @staticmethod
+    def _require(path: Path, env: str, what: str) -> None:
+        """A missing piece is a configuration answer, not a stack trace.
+
+        This file runs on two machines with different layouts. The failure that matters is
+        the one where a tab silently has nothing in it, so the message names the path and
+        the variable rather than saying "unavailable".
+        """
+        if not path.exists():
+            raise RuntimeError(f"{what} is not installed on this machine: looked for {path}. "
+                              f"Set {env}=/path/to/it, or leave that tab alone.")
+
     def review_pick(self, limit: int = 5) -> dict:
         """The review queue, from the script that already owns the selection rules.
 
         This is a form over an existing decision procedure, not a second one: which
         claims are worth a person's attention is `facts-review.py`'s job.
         """
+        self._require(FACT_REVIEW, "HC_FACTS_REVIEW", "the facts review script")
         done = subprocess.run([sys.executable, str(FACT_REVIEW), "pick", "--limit", str(limit)],
                               capture_output=True, text=True, timeout=60)
         if done.returncode != 0:
@@ -280,6 +312,7 @@ class App:
 
     def review_apply(self, answers: list[dict]) -> dict:
         """Apply one batch, bound to the revision each question was asked against."""
+        self._require(FACT_REVIEW, "HC_FACTS_REVIEW", "the facts review script")
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
             json.dump({"answers": answers}, fh)
             path = fh.name
@@ -297,11 +330,16 @@ class App:
 
 
     def _review_python(self) -> str:
-        candidate = Path("/usr/bin/python3")
-        return str(candidate) if candidate.exists() else sys.executable
+        # HC_PYTHON wins if it exists, then the interpreter known to have PyYAML on this
+        # host, then whatever is running this service.
+        for candidate in (os.environ.get("HC_PYTHON"), "/usr/bin/python3"):
+            if candidate and Path(candidate).exists():
+                return candidate
+        return sys.executable
 
     def review_generated(self) -> dict:
         """The current generated batch. Reading it must never generate one."""
+        self._require(REVIEW_QUESTIONS, "HC_REVIEW_QUESTIONS", "the question generator")
         done = subprocess.run([self._review_python(), str(REVIEW_QUESTIONS), "latest"],
                               capture_output=True, text=True, timeout=30)
         if done.returncode != 0:
@@ -310,6 +348,7 @@ class App:
 
     def review_generate(self) -> dict:
         """One model call over the last few days of conversation. Slow by nature."""
+        self._require(REVIEW_QUESTIONS, "HC_REVIEW_QUESTIONS", "the question generator")
         done = subprocess.run([self._review_python(), str(REVIEW_QUESTIONS), "generate"],
                               capture_output=True, text=True, timeout=280)
         if done.returncode != 0:
@@ -321,6 +360,7 @@ class App:
     def review_generated_answer(self, batch: str, qid: str, value: str,
                                 text: str = "") -> dict:
         """Apply one tap. Exit 4 is a refusal with a reason, not a broken server."""
+        self._require(REVIEW_QUESTIONS, "HC_REVIEW_QUESTIONS", "the question generator")
         args = [self._review_python(), str(REVIEW_QUESTIONS), "answer", "--id", qid,
                 "--value", value]
         if batch:
@@ -873,6 +913,25 @@ def people_from(path: Path, local_human: str) -> dict[str, str]:
     return people
 
 
+def capabilities() -> list:
+    """What this instance can actually serve.
+
+    The same file runs on either machine, so "which tabs work here" is a question about
+    paths, not about people. This answers it without starting a server.
+    """
+    rows = [("the claims i already hold", "review", "HC_FACTS_REVIEW", FACT_REVIEW),
+            ("questions from conversations", "review", "HC_REVIEW_QUESTIONS", REVIEW_QUESTIONS),
+            ("what the routines did", "today", "HC_OUTCOMES", OUTCOMES_SCRIPT)]
+    out = []
+    for what, tab, env, path in rows:
+        out.append({"what": what, "tab": tab, "env": env, "path": str(path),
+                    "present": path.exists()})
+    for directory in REPORT_DIRS:
+        out.append({"what": "reports on disk", "tab": "reports", "env": "HC_REPORT_DIRS",
+                    "path": str(directory), "present": directory.is_dir()})
+    return out
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="The human channel: your own writer file, from a browser")
     p.add_argument("--dir", default=os.environ.get("BOARD_DIR")
@@ -893,7 +952,17 @@ def main() -> None:
                    help="how often to pull the other side's records (0 = never)")
     p.add_argument("--publish", type=int, default=30, metavar="SECONDS",
                    help="how often to retry commits that did not reach the remote (0 = never)")
+    p.add_argument("--doctor", action="store_true",
+                   help="say which tabs this machine can serve, then exit")
     a = p.parse_args()
+    if a.doctor:
+        print(f"this instance: {a.author} on {Path.home()}")
+        for row in capabilities():
+            mark = "ok  " if row["present"] else "MISS"
+            print(f"  {mark}  {row['tab']:<8} {row['path']}")
+            if not row["present"]:
+                print(f"          {row['what']}: set {row['env']}")
+        return
     if not a.also_port:
         a.also_port = a.port + 10
 

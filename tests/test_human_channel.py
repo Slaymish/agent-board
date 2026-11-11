@@ -655,6 +655,26 @@ class ReviewAndReports(ServerCase):
         self.assertEqual(self.get("/api/review", token=WILL_TOKEN)[0], 403)
         self.assertEqual(self.get("/api/reports", token=WILL_TOKEN)[0], 403)
 
+    def test_a_missing_review_script_names_the_variable_to_set(self):
+        """The same file runs on two machines. A tab that cannot work here has to say why
+        in the words of whoever is running it, not 503 into the void."""
+        old = serve.FACT_REVIEW
+        serve.FACT_REVIEW = Path("/nonexistent/facts-review.py")
+        try:
+            code, body = self.get("/api/review")
+            self.assertEqual(code, 503)
+            self.assertIn("not installed on this machine", body)
+            self.assertIn("HC_FACTS_REVIEW", body)
+        finally:
+            serve.FACT_REVIEW = old
+
+    def test_the_doctor_names_what_each_tab_needs(self):
+        rows = serve.capabilities()
+        self.assertEqual({r["tab"] for r in rows}, {"review", "today", "reports"})
+        for row in rows:
+            self.assertTrue(row["env"].startswith("HC_"), row)
+            self.assertTrue(row["path"].startswith("/"), row)
+
     def test_review_pick_and_apply_go_through_the_script(self):
         script = self.board.parent / "fake-review.py"
         script.write_text(
