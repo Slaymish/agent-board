@@ -183,6 +183,84 @@ def _append_record(author: str, body: dict) -> dict:
     return rec
 
 
+def _guard_author_name(author: str) -> None:
+    """The same pin check as _guard_author, for callers that pass a name, not a Namespace.
+
+    A library call must raise rather than exit: sys.exit inside a request would kill the
+    worker instead of the write, and the caller needs to answer with a refusal.
+    """
+    if not author:
+        raise ValueError("no author: it decides which log this write lands in")
+    pinned = os.environ.get("BOARD_AUTHOR")
+    human = os.environ.get("BOARD_HUMAN")
+    if not pinned or author == pinned or (human and author == human):
+        return
+    raise PermissionError(f"refusing to write {author}.jsonl: this machine is pinned to "
+                          f"BOARD_AUTHOR={pinned}")
+
+
+def append_once(author: str, body: dict, client_id: str | None = None,
+                allow_pinned_other: bool = False) -> tuple[dict, bool]:
+    """Append one record, unless this client already produced one.
+
+    Returns ``(record, repeated)``. A repeat with the same client id and the same payload
+    returns the original record and appends nothing; the same id with a *different*
+    payload raises, because that is a client bug rather than a retry. "Same payload" means
+    ``text``, ``topic`` and ``reply_to``: a retry that changes ``room`` or ``via`` gets the
+    original record back with those fields untouched, silently, which is what a retry
+    should do. The id is always computed here, so a body carrying its own id cannot point
+    two records at one number.
+
+    The check and the append happen under the one write lock, which is what makes a retry
+    of an uncertain save safe: without it, a lost acknowledgement and a second tap look
+    identical to this function, and the append-only history gains a duplicate nobody can
+    remove.
+    """
+    if client_id and len(str(client_id)) > 128:
+        raise ValueError("client_id too long")
+    # The pin stops an agent writing the other party's log. A human-facing channel is the
+    # person themselves, authenticated by their own token, so it may write either file.
+    if not allow_pinned_other:
+        _guard_author_name(author)
+    path = own_file(author)
+    path.touch(exist_ok=True)
+    with path.open("a+") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            stream.seek(0)
+            rows = []
+            for line in stream:
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            if client_id:
+                found = next((r for r in rows if r.get("client_id") == client_id
+                              and r.get("author") == author), None)
+                if found is not None:
+                    same = all(found.get(key) == body.get(key)
+                               for key in ("text", "topic", "reply_to"))
+                    if not same:
+                        raise ValueError("client_id already used for a different payload")
+                    return found, True
+            numbers = []
+            for row in rows:
+                tail = str(row.get("id") or "").split("/")[-1]
+                if tail.isdigit():
+                    numbers.append(int(tail))
+            record = {**body, "id": f"{author}/{max(numbers) + 1 if numbers else 1:04d}"}
+            if client_id:
+                record["client_id"] = client_id
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+            return record, False
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def records(path: Path) -> list[dict]:
     if not path.exists():
         return []

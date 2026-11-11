@@ -275,3 +275,74 @@ class ANameInAHandleField(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class AppendOnce(unittest.TestCase):
+    """The retry contract: one client id produces one record, and only once."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.logs = Path(self.tmp.name) / "logs"
+        self.logs.mkdir()
+        # The machine's own pin (BOARD_AUTHOR / BOARD_HUMAN in this shell) would refuse a
+        # test author; these tests are about the retry contract, not the pin.
+        self.saved = {k: os.environ.pop(k) for k in ("BOARD_AUTHOR", "BOARD_HUMAN")
+                      if k in os.environ}
+        self.mod = load(self.logs)
+
+    def tearDown(self):
+        os.environ.update(self.saved)
+        self.tmp.cleanup()
+
+    def rows(self, author="hamish"):
+        path = self.logs / f"{author}.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def test_a_retry_returns_the_first_record_and_appends_nothing(self):
+        body = {"room": "humans", "author": "hamish", "via": "human",
+                "ts": "2026-11-11T09:00:00Z", "text": "same words"}
+        first, repeated = self.mod.append_once("hamish", body, "abc-123")
+        again, repeated_again = self.mod.append_once("hamish", body, "abc-123")
+        self.assertFalse(repeated)
+        self.assertTrue(repeated_again)
+        self.assertEqual(first["id"], again["id"])
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_repeating_the_same_words_without_an_id_is_two_notes(self):
+        # Intentional repetition is a normal thing to do; it must not be deduplicated.
+        body = {"room": "humans", "author": "hamish", "via": "human",
+                "ts": "2026-11-11T09:00:00Z", "text": "yes"}
+        self.mod.append_once("hamish", body)
+        self.mod.append_once("hamish", body)
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_the_same_id_with_different_words_is_refused(self):
+        base = {"room": "humans", "author": "hamish", "via": "human", "ts": "t"}
+        self.mod.append_once("hamish", {**base, "text": "first"}, "abc-123")
+        with self.assertRaises(ValueError):
+            self.mod.append_once("hamish", {**base, "text": "different"}, "abc-123")
+
+    def test_the_id_is_stored_so_a_restart_can_still_match_it(self):
+        body = {"room": "humans", "author": "hamish", "via": "human", "ts": "t", "text": "x"}
+        self.mod.append_once("hamish", body, "abc-123")
+        fresh = load(self.logs)                     # a new process, same directory
+        again, repeated = fresh.append_once("hamish", body, "abc-123")
+        self.assertTrue(repeated)
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_a_body_carrying_its_own_id_cannot_force_a_duplicate(self):
+        # A "save this again" path hands back a record it built itself, id included. The
+        # computed id must win, or the log gains two lines under one id and the lock has
+        # protected nothing. (Zeta, PR #37 review, 11 Nov 2026.)
+        first, _ = self.mod.append_once("hamish", {"text": "first"})
+        again, _ = self.mod.append_once("hamish", {**first, "text": "second"})
+        self.assertNotEqual(first["id"], again["id"])
+        ids = [row["id"] for row in self.rows()]
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(len(set(ids)), 2)
+
+    def test_an_overlong_id_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.mod.append_once("hamish", {"text": "x"}, "z" * 200)
