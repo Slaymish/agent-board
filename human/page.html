@@ -213,6 +213,12 @@
     cursor: pointer;
   }
   .gnote { font: 11px/1.45 var(--mono); color: var(--quiet); margin: 0; }
+  details.ganswered { font: 11px/1.45 var(--mono); color: var(--quiet); }
+  details.ganswered summary { cursor: pointer; padding: 2px 0; letter-spacing: .02em; }
+  .gans { border-left: 2px solid var(--rule); padding-left: 12px; margin: 10px 0 0;
+          display: grid; gap: 2px; }
+  .gans .q { font: 11px/1.4 var(--mono); color: var(--quiet); }
+  .gans .a { font: 400 14px/1.4 var(--serif); color: var(--ink); }
 
   /* ---------- reports: what was written, readable ---------- */
   .rlist { display: grid; gap: 0; max-width: var(--measure); }
@@ -754,6 +760,24 @@ function renderToday() {
 }
 
 // ---------- review: the fact store's questions, answerable here ----------
+// The store's own words are not his words. "dream-summary" is a field name, and a raw
+// ISO date under a label that says "last confirmed" is a different fact from the one the
+// record holds: that field is when the review was due, not when it was confirmed.
+const ORIGIN_WORDS = {
+  "user-stated": "you told me this",
+  "agent-observed": "i noticed this",
+  "dream-summary": "i worked this out from earlier notes",
+};
+
+function niceDate(iso) {
+  const m = String(iso || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return String(iso || "");
+  const months = ["jan", "feb", "mar", "apr", "may", "jun",
+                  "jul", "aug", "sep", "oct", "nov", "dec"];
+  const month = months[parseInt(m[2], 10) - 1] || m[2];
+  return parseInt(m[3], 10) + " " + month + " " + m[1];
+}
+
 function renderReview() {
   const thread = $("thread");
   thread.textContent = "";
@@ -761,9 +785,18 @@ function renderReview() {
   wrap.className = "review";
   const lede = document.createElement("p");
   lede.className = "lede";
-  lede.textContent = "what i think i know about you, and how sure i am. one tap, or say it properly.";
+  lede.textContent = "what i picked up from our conversations, and the claims i already "
+    + "hold. one tap each, or say it in your own words.";
   wrap.append(lede);
   renderGenerated(wrap);
+  if (state.review.length) {
+    const head = document.createElement("div");
+    head.className = "ghead";
+    const title = document.createElement("h2");
+    title.textContent = "claims i already hold";
+    head.append(title);
+    wrap.append(head);
+  }
   if (!state.review.length) {
     const p = document.createElement("p");
     p.id = "empty";
@@ -781,7 +814,8 @@ function renderReview() {
     card.className = "rcard";
     const why = document.createElement("div");
     why.className = "why";
-    why.textContent = [q.why, q.origin, q.last_confirmed ? "last confirmed " + q.last_confirmed : ""]
+    why.textContent = [ORIGIN_WORDS[q.origin] || q.origin || "",
+                       q.last_confirmed ? "review was due " + niceDate(q.last_confirmed) : ""]
       .filter(Boolean).join(" · ");
     const claim = document.createElement("div");
     claim.className = "claim";
@@ -801,7 +835,7 @@ function renderReview() {
     }
     const box = document.createElement("textarea");
     box.rows = 1;
-    box.placeholder = "or say it properly";
+    box.placeholder = "or say it in your own words";
     box.value = (state.answers[q.slug] || {}).text || "";
     box.addEventListener("input", () => {
       const entry = state.answers[q.slug] || {};
@@ -859,9 +893,8 @@ function renderGenerated(wrap) {
   const title = document.createElement("h2");
   const batch = state.generated || {};
   const questions = (batch.questions || []).filter((q) => !q.answered);
-  title.textContent = questions.length
-    ? "what i picked up (" + questions.length + ")"
-    : "what i picked up";
+  title.textContent = "what i picked up"
+    + (questions.length && !state.genBusy ? " (" + questions.length + ")" : "");
   const ask = document.createElement("button");
   ask.type = "button";
   ask.textContent = state.genBusy ? "reading…" : "ask me new ones";
@@ -870,16 +903,23 @@ function renderGenerated(wrap) {
   head.append(title, ask);
   box.append(head);
 
-  const note = document.createElement("p");
-  note.className = "gnote";
-  note.textContent = state.genNote || (batch.asked_at ? "" : "nothing generated yet.");
-  if (note.textContent) box.append(note);
+  if (state.genNote) {
+    const note = document.createElement("p");
+    note.className = "gnote";
+    note.textContent = state.genNote;
+    box.append(note);
+  }
 
+  // Three different empty states, said differently: nothing generated yet, everything
+  // answered, and nothing new worth asking. One message for all three reads as a bug.
+  const answered = (batch.questions || []).filter((q) => q.answered).length;
   if (!questions.length && !state.genBusy) {
     const p = document.createElement("p");
     p.className = "gnote";
-    p.textContent = "ask me new ones and i'll read back through your last few days. "
-      + "it takes about half a minute.";
+    p.textContent = answered
+      ? "that was everything i had. nothing else waiting."
+      : "ask me new ones and i'll read back through your last few days. "
+        + "it takes about half a minute, and you can leave the page while it runs.";
     box.append(p);
   }
 
@@ -917,6 +957,30 @@ function renderGenerated(wrap) {
     card.append(why, claim, ctx, choices);
     box.append(card);
   }
+
+  // What he settled today, kept visible. A new batch replaces the questions, so this is
+  // read from every batch of the day rather than from the one on screen.
+  const history = (batch.answered_today || []).filter((row) => row && row.question);
+  if (history.length) {
+    const det = document.createElement("details");
+    det.className = "ganswered";
+    const sum = document.createElement("summary");
+    sum.textContent = "answered today (" + history.length + ")";
+    det.append(sum);
+    for (const row of history) {
+      const line = document.createElement("div");
+      line.className = "gans";
+      const q = document.createElement("span");
+      q.className = "q";
+      q.textContent = row.question;
+      const a = document.createElement("span");
+      a.className = "a";
+      a.textContent = (row.label || "") + (row.verdict ? " — " + row.verdict : "");
+      line.append(q, a);
+      det.append(line);
+    }
+    box.append(det);
+  }
   wrap.append(box);
 }
 
@@ -942,7 +1006,8 @@ async function answerGenerated(q, option, card) {
 async function generateQuestions() {
   if (state.genBusy) return;
   state.genBusy = true;
-  state.genNote = "reading back through your last few days. about half a minute.";
+  state.genNote = "reading back through your last few days. about half a minute. "
+    + "you can leave this page; it keeps going without you.";
   render();
   try {
     const res = await fetch("/api/review/generated", {
