@@ -77,7 +77,9 @@
   .icon:active { background: rgba(127, 118, 100, .12); color: var(--ink); }
   .icon.turning svg { animation: turn .6s ease; }
   @keyframes turn { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-  .tools { margin-left: auto; display: flex; gap: 2px; }
+  /* The tools row has no align-items, so its children stretched to the 36px icons and the
+     status text sat at the top of its own box instead of on the nav's line. */
+  .tools { margin-left: auto; display: flex; align-items: center; gap: 2px; }
 
   /* ---------- tabs: two rooms, visibly two rooms ---------- */
   .tabs { display: flex; gap: 2px; margin-left: 12px; }
