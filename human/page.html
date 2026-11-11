@@ -1763,6 +1763,20 @@ if (state.view === "work") loadWork().then(render);
 if (state.view === "today") loadOutcomes(false).then(render);
 if (state.view === "review") loadReview().then(render);
 if (state.view === "reports") loadReports().then(render);
+
+// A link that opens one report: #reports/<name>, where name is what /api/reports returns
+// (for example "reviews/human-channel-inventory-2026-11-11.md"). Without this a document
+// on the reports tab has no address to send anyone.
+const HASH_REPORT = location.hash.startsWith("#reports/")
+  ? decodeURIComponent(location.hash.slice("#reports/".length)) : "";
+if (HASH_REPORT && typeof openReport === "function") {
+  state.view = "reports";
+  try { localStorage.setItem("hc.tab", "reports"); } catch (e) {}
+  loadReports()
+    .then(() => openReport(HASH_REPORT))
+    .then(() => render())
+    .catch(() => render());
+}
 if (BOOT.y) requestAnimationFrame(() => scrollTo(0, BOOT.y));
 </script>
 </body>
