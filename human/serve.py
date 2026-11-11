@@ -318,12 +318,15 @@ class App:
         return {"count": len(batch.get("questions") or []),
                 "batch_id": batch.get("batch_id"), "note": batch.get("note")}
 
-    def review_generated_answer(self, batch: str, qid: str, value: str) -> dict:
+    def review_generated_answer(self, batch: str, qid: str, value: str,
+                                text: str = "") -> dict:
         """Apply one tap. Exit 4 is a refusal with a reason, not a broken server."""
         args = [self._review_python(), str(REVIEW_QUESTIONS), "answer", "--id", qid,
                 "--value", value]
         if batch:
             args += ["--batch", batch]
+        if text:
+            args += ["--text", text[:600]]
         done = subprocess.run(args, capture_output=True, text=True, timeout=60)
         try:
             outcome = json.loads(done.stdout or "{}")
@@ -780,11 +783,12 @@ def make_handler(app: App):
                 qid = str(body.get("id") or "").strip()
                 value = str(body.get("value") or "").strip()
                 batch = str(body.get("batch") or "").strip()
+                text = str(body.get("text") or "").strip()[:600]
                 if not qid or not value or len(value) > 32:
                     self._json(400, {"ok": False, "error": "id and value are required"})
                     return
                 try:
-                    outcome = app.review_generated_answer(batch, qid, value)
+                    outcome = app.review_generated_answer(batch, qid, value, text)
                 except ValueError as e:
                     # A refused answer is not a broken server: say why in the writer's words.
                     self._json(409, {"ok": False, "error": str(e)})
