@@ -29,6 +29,40 @@
     --sheet: 960px;
     --measure: 34em;
     --tap: 44px;
+
+    /* ---------- the system ----------
+       One job, one spec. Everything below is a token, and a component may only vary
+       within what is written here. Two faces: serif carries content, sans carries
+       interface, mono carries machine text (times, ids, counts) and never prose.
+
+       Type (five steps)
+         --t-cap    10.5px  machine text, letterspaced, quiet
+         --t-ui     12px    interface labels, buttons, tabs: sans 600, .10em
+         --t-meta   13px    prose asides: sans 400
+         --t-body   17px    content in a column: serif
+         --t-row    15px    content in a list row: serif
+         --t-lead   19px    the one line that matters on screen: serif
+       Space: --s1 4 · --s2 8 · --s3 12 · --s4 18 · --s5 26 · --s6 34
+       Radius: --r1 6 fields · --r2 8 controls · --r3 10 surfaces · --r-pill 999
+
+       Two label registers, deliberately:
+         document labels (.ghead h2, .day) are UPPERCASE and letterspaced .12em
+         interface labels (.tab, .seg, .menu, .label) are lowercase and .10em
+       Three button families:
+         .icon  36px square, r2, no border, quiet until pressed
+         pill   bordered, r-pill, --t-ui (segments, choices)
+         text   borderless, underlined hairline (links and inline actions)
+       Hairlines are 1px var(--rule). A 2px left rule is reserved for a status card
+       (.ocard), because that one is telling you something is wrong.
+    */
+    --t-cap: 10.5px;
+    --t-ui: 12px;
+    --t-meta: 13px;
+    --t-body: 17px;
+    --t-row: 15px;
+    --t-lead: 19px;
+    --s1: 4px; --s2: 8px; --s3: 12px; --s4: 18px; --s5: 26px; --s6: 34px;
+    --r1: 6px; --r2: 8px; --r3: 10px; --r-pill: 999px;
   }
   @media (prefers-color-scheme: dark) {
     :root { --ink: #ece7dc; --quiet: #a09988; --paper: #141312; --rule: #2e2b27;
@@ -41,7 +75,7 @@
   html, body { margin: 0; background: var(--paper); color: var(--ink);
                touch-action: manipulation; }
   body {
-    font-family: var(--serif); font-size: 17px; line-height: 1.5;
+    font-family: var(--serif); font-size: var(--t-body); line-height: 1.5;
     min-height: 100dvh; display: flex; flex-direction: column;
     -webkit-text-size-adjust: 100%;
     -webkit-tap-highlight-color: transparent;
@@ -65,12 +99,12 @@
   }
   h1 .short { display: none; }
   .who {
-    font-family: var(--mono); font-size: 11px; line-height: 1; color: var(--quiet);
+    font-family: var(--mono); font-size: var(--t-cap); line-height: 1; color: var(--quiet);
     letter-spacing: .02em; margin-left: auto;
   }
   .icon {
     width: 36px; height: 36px; display: grid; place-items: center; flex: none;
-    border: 0; border-radius: 8px; padding: 0; margin: 0;
+    border: 0; border-radius: var(--r2); padding: 0; margin: 0;
     background: none; color: var(--quiet); line-height: 0; cursor: pointer;
   }
   .icon svg { width: 15px; height: 15px; display: block; }
@@ -85,7 +119,7 @@
   .tabs { display: flex; gap: 2px; margin-left: 12px; }
   .tab {
     position: relative; border: 0; background: none; padding: 0 9px;
-    height: 40px; font: 600 12px/1 var(--sans); letter-spacing: .10em;
+    height: 40px; font: 600 var(--t-ui)/1 var(--sans); letter-spacing: .10em;
     text-transform: lowercase; color: var(--quiet); cursor: pointer;
   }
   .tab[aria-selected="true"] { color: var(--ink); }
@@ -99,13 +133,14 @@
   .menu {
     position: fixed; top: calc(46px + env(safe-area-inset-top)); right: var(--gutter);
     z-index: 5; min-width: 132px; padding: 5px;
-    background: var(--paper); border: 1px solid var(--rule); border-radius: 10px;
+    background: var(--paper); border: 1px solid var(--rule); border-radius: var(--r3);
     box-shadow: 0 10px 26px rgba(40, 34, 24, .14); display: grid; gap: 2px;
   }
   .menu button {
     text-align: left; border: 0; background: none; color: var(--ink);
-    padding: 10px 12px; border-radius: 7px; cursor: pointer;
-    font: 600 12px/1.2 var(--sans); letter-spacing: .08em; text-transform: lowercase;
+    padding: 10px 12px; border-radius: var(--r2); cursor: pointer;
+    font: 600 var(--t-ui)/1.2 var(--sans); letter-spacing: .10em;
+    text-transform: lowercase;
   }
   .menu button[aria-current="true"] { background: rgba(127, 118, 100, .14); }
   @media (max-width: 599px) {
@@ -125,11 +160,11 @@
     display: flex; align-items: center; gap: 10px;
     padding: 7px var(--gutter); min-height: 39px;
   }
-  .seg { display: flex; border: 1px solid var(--rule); border-radius: 999px; padding: 1px; }
+  .seg { display: flex; border: 1px solid var(--rule); border-radius: var(--r-pill); padding: 1px; }
   .seg button {
-    border: 0; background: none; border-radius: 999px; padding: 4px 11px;
-    font: 600 11px/1.2 var(--sans); letter-spacing: .10em; text-transform: lowercase;
-    color: var(--quiet); cursor: pointer;
+    border: 0; background: none; border-radius: var(--r-pill); padding: 4px 11px;
+    font: 600 var(--t-ui)/1.2 var(--sans); letter-spacing: .10em;
+    text-transform: lowercase; color: var(--quiet); cursor: pointer;
   }
   .seg button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
   /* The connection state is chrome, not a control row: it sat at the end of the subbar,
@@ -155,10 +190,10 @@
   .result {
     display: block; width: 100%; text-align: left; border: 0; background: none;
     border-bottom: 1px solid var(--rule); padding: 11px 0; cursor: pointer;
-    color: var(--ink); font: 15px/1.45 var(--serif);
+    color: var(--ink); font: var(--t-row)/1.45 var(--serif);
   }
   .result .meta {
-    display: block; font: 11px/1.5 var(--mono); color: var(--quiet); letter-spacing: .02em;
+    display: block; font: var(--t-cap)/1.5 var(--mono); color: var(--quiet); letter-spacing: .02em;
   }
   .result .snip { display: block; margin-top: 2px; color: var(--quiet); font-size: 14px; }
   .result b { font-weight: 600; background: rgba(127, 118, 100, .16); border-radius: 2px; }
@@ -169,29 +204,29 @@
   .ocard .head { display: flex; gap: 8px; align-items: baseline; }
   .ocard .name { font: 600 13px/1.3 var(--sans); letter-spacing: .04em; }
   .ocard .state {
-    font: 600 10.5px/1.4 var(--mono); letter-spacing: .08em; text-transform: lowercase;
+    font: 600 var(--t-cap)/1.4 var(--mono); letter-spacing: .08em; text-transform: lowercase;
     color: var(--quiet);
   }
   .ocard .state[data-s="ok"] { color: var(--mine); }
   .ocard .state[data-s="failed"], .ocard .state[data-s="incident"] { color: var(--warn); }
-  .ocard .detail { font-size: 15px; line-height: 1.45; }
-  .ocard .meta { font: 11px/1.5 var(--mono); color: var(--quiet); letter-spacing: .02em; }
+  .ocard .detail { font-size: var(--t-row); line-height: 1.45; }
+  .ocard .meta { font: var(--t-cap)/1.5 var(--mono); color: var(--quiet); letter-spacing: .02em; }
   .ocard .act { font: 12px/1.4 var(--sans); color: var(--ink); }
-  .outs .stamp { font: 11px/1.4 var(--mono); color: var(--quiet); margin: 0 0 2px; }
+  .outs .stamp { font: var(--t-cap)/1.4 var(--mono); color: var(--quiet); margin: 0 0 2px; }
   /* ---------- review: a document with questions in it, not a form ----------
      Obsidian's hierarchy, in this page's own palette: one reading column, section labels
      in small letterspaced caps, content in the serif, metadata in the sans and always
      quieter than the thing it describes. Hairline rules and space do the separating, so
      there are no cards with borders on three sides and no pills. */
-  .review { display: grid; gap: 34px; max-width: 36em; }
+  .review { display: grid; gap: 34px; max-width: var(--measure); }
   .review .lede {
-    font: 400 16.5px/1.6 var(--serif); color: var(--quiet); margin: 0; max-width: 32em;
+    font: 400 var(--t-body)/1.6 var(--serif); color: var(--quiet); margin: 0; max-width: 32em;
   }
 
   .ghead { display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
            border-bottom: 1px solid var(--rule); padding-bottom: 7px; }
   .ghead h2 {
-    font: 600 11.5px/1.3 var(--sans); letter-spacing: .12em; text-transform: uppercase;
+    font: 600 var(--t-ui)/1.3 var(--sans); letter-spacing: .12em; text-transform: uppercase;
     margin: 0; color: var(--quiet); white-space: nowrap;
   }
   .ghead button {
@@ -201,14 +236,14 @@
   }
   .ghead button:hover { color: var(--ink); border-color: var(--ink); }
   .ghead button[disabled] { opacity: .5; }
-  .gnote { font: 400 13px/1.6 var(--sans); color: var(--quiet); margin: 0; }
+  .gnote { font: 400 var(--t-meta)/1.6 var(--sans); color: var(--quiet); margin: 0; }
 
   .rcard { display: grid; gap: 9px; border-top: 1px solid var(--rule); padding-top: 26px; }
   .rcard:first-of-type { border-top: 0; padding-top: 2px; }
   .rcard .why {
-    font: 400 12.5px/1.5 var(--sans); color: var(--quiet); letter-spacing: .01em; margin: 0;
+    font: 400 var(--t-meta)/1.5 var(--sans); color: var(--quiet); letter-spacing: .01em; margin: 0;
   }
-  .rcard .claim { font: 400 19px/1.45 var(--serif); color: var(--ink); margin: 0; }
+  .rcard .claim { font: 400 var(--t-lead)/1.45 var(--serif); color: var(--ink); margin: 0; }
 
   /* The generated options read down the page, not across it: a list of positions, each
      with the consequence in a smaller quieter line, closed by a hairline. */
@@ -216,18 +251,18 @@
   .opt {
     display: grid; gap: 3px; text-align: left; background: none; border: 0;
     border-bottom: 1px solid var(--rule); padding: 14px 2px; cursor: pointer;
-    font: 400 16.5px/1.4 var(--serif); color: var(--ink); min-height: var(--tap);
+    font: 400 var(--t-body)/1.4 var(--serif); color: var(--ink); min-height: var(--tap);
   }
   .opt:hover, .opt:active { background: rgba(128, 128, 128, .07); }
   .opt[disabled] { opacity: .45; }
-  .opt .does { font: 400 12.5px/1.45 var(--sans); color: var(--quiet); }
+  .opt .does { font: 400 var(--t-meta)/1.45 var(--sans); color: var(--quiet); }
 
   .otherbox { display: grid; gap: 9px; padding: 14px 2px; border-bottom: 1px solid var(--rule); }
   .otherbox textarea { min-height: 66px; }
   .otherrow { display: flex; gap: 8px; }
   .otherrow button {
     flex: 0 0 auto; border: 1px solid var(--rule); background: none; color: var(--ink);
-    border-radius: 6px; padding: 9px 14px; min-height: var(--tap);
+    border-radius: var(--r1); padding: 9px 14px; min-height: var(--tap);
     font: 500 13px/1.2 var(--sans); cursor: pointer;
   }
   .otherrow button.go { border-color: var(--ink); }
@@ -235,35 +270,35 @@
   .rcard .choices { display: flex; gap: 6px; flex-wrap: wrap; }
   .rcard .choices button {
     border: 1px solid var(--rule); background: none; color: var(--ink);
-    border-radius: 999px; padding: 6px 12px; font: 600 11.5px/1.2 var(--sans);
-    letter-spacing: .06em; text-transform: lowercase; cursor: pointer;
+    border-radius: var(--r-pill); padding: 6px 12px; font: 600 var(--t-ui)/1.2 var(--sans);
+    letter-spacing: .10em; text-transform: lowercase; cursor: pointer;
   }
   .rcard .choices button[aria-pressed="true"] {
     background: var(--ink); color: var(--paper); border-color: var(--ink);
   }
   .rcard textarea {
-    width: 100%; border: 1px solid var(--rule); border-radius: 6px;
+    width: 100%; border: 1px solid var(--rule); border-radius: var(--r1);
     background: none; color: var(--ink); font: 16px/1.5 var(--serif);
     padding: 10px 11px; resize: vertical; min-height: 44px;
   }
   .rcard textarea:focus { outline: 2px solid var(--quiet); outline-offset: 1px; }
   .review .send { justify-self: start; }
 
-  details.ganswered { font: 400 12.5px/1.6 var(--sans); color: var(--quiet); }
+  details.ganswered { font: 400 var(--t-meta)/1.6 var(--sans); color: var(--quiet); }
   details.ganswered summary { cursor: pointer; padding: 4px 0; letter-spacing: .02em; }
   .gans { border-left: 1px solid var(--rule); padding-left: 14px; margin: 12px 0 0;
           display: grid; gap: 3px; }
-  .gans .q { font: 400 12.5px/1.45 var(--sans); color: var(--quiet); }
-  .gans .a { font: 400 15px/1.45 var(--serif); color: var(--ink); }
+  .gans .q { font: 400 var(--t-meta)/1.45 var(--sans); color: var(--quiet); }
+  .gans .a { font: 400 var(--t-row)/1.45 var(--serif); color: var(--ink); }
 
   /* ---------- reports: what was written, readable ---------- */
   .rlist { display: grid; gap: 0; max-width: var(--measure); }
   .rlist button {
     text-align: left; border: 0; border-bottom: 1px solid var(--rule);
     background: none; color: var(--ink); padding: 12px 0; cursor: pointer;
-    font: 15.5px/1.4 var(--serif); display: grid; gap: 2px;
+    font: var(--t-row)/1.4 var(--serif); display: grid; gap: 2px;
   }
-  .rlist .meta { font: 11px/1.4 var(--mono); color: var(--quiet); letter-spacing: .02em; }
+  .rlist .meta { font: var(--t-cap)/1.4 var(--mono); color: var(--quiet); letter-spacing: .02em; }
   .reader { max-width: var(--measure); }
   .reader pre {
     white-space: pre-wrap; overflow-wrap: anywhere; font: 14.5px/1.55 var(--mono);
@@ -277,16 +312,16 @@
     padding: 4px var(--gutter) 24px;
   }
   .label {
-    font-family: var(--sans); font-size: 10.5px; line-height: 1.2;
-    letter-spacing: .12em; text-transform: lowercase; font-weight: 600;
+    font-family: var(--sans); font-size: var(--t-ui); line-height: 1.2;
+    letter-spacing: .10em; text-transform: lowercase; font-weight: 600;
   }
   .day {
-    font-family: var(--mono); font-size: 10.5px; letter-spacing: .08em;
+    font-family: var(--mono); font-size: var(--t-cap); letter-spacing: .08em;
     text-transform: uppercase; color: var(--quiet);
     margin: 26px 0 2px; padding-bottom: 6px; border-bottom: 1px solid var(--rule);
   }
   .day:first-child { margin-top: 10px; }
-  #empty { color: var(--quiet); font-size: 15px; margin: 28px 0 0; }
+  #empty { color: var(--quiet); font-size: var(--t-meta); margin: 28px 0 0; }
 
   /* One column, not two sides: a reply is not what this is for, so nothing is aligned
      left or right and a run of notes reads as one person writing. The time sits in the
@@ -298,7 +333,7 @@
   }
   .note.first { margin-top: 16px; }
   .note .when {
-    font-family: var(--mono); font-size: 10px; line-height: 1.2; color: var(--quiet);
+    font-family: var(--mono); font-size: var(--t-cap); line-height: 1.2; color: var(--quiet);
     text-align: right; padding-top: 6px; font-variant-numeric: tabular-nums;
   }
   .note .name { margin: 0 0 2px; overflow-wrap: anywhere; }
@@ -314,7 +349,7 @@
   .reply-btn {
     align-self: start; justify-self: end;
     width: 36px; height: var(--tap); display: grid; place-items: center;
-    border: 0; border-radius: 8px; padding: 0; margin: -10px 0 0 0;
+    border: 0; border-radius: var(--r2); padding: 0; margin: -10px 0 0 0;
     background: none; color: var(--quiet); opacity: .4; cursor: pointer; line-height: 0;
   }
   .reply-btn svg { width: 14px; height: 14px; display: block; }
@@ -1383,7 +1418,7 @@ async function load(first) {
     // not open on a review that is not his.
     if (HOST_ROOMS.includes(state.view) && !state.host) {
       state.view = state.roomView || "lines";
-      try { localStorage.setItem(TAB_KEY, state.view); } catch (e) {}
+      try { localStorage.setItem("hc.tab", state.view); } catch (e) {}
     }
     $("text").placeholder = "write to " + data.peer;
     if (first) restoreDraft();
@@ -1499,9 +1534,10 @@ async function loadWork() {
 // than the window the page holds, say so rather than pretending nothing happened.
 let focusRecord = null;
 const roomScroll = {lines: 0, canvas: 0, work: 0};
-// Applied here, not where BOOT is read: roomScroll is declared at this point in the file
-// and touching it earlier is a temporal-dead-zone error that takes the whole page down.
-if (BOOT.roomScroll) Object.assign(roomScroll, BOOT.roomScroll);
+// Read from history again rather than from BOOT: this block is exercised on its own by
+// the navigation test, which has no BOOT and a stub history. Same value either way.
+const bootScroll = (history.state || {}).roomScroll;
+if (bootScroll) Object.assign(roomScroll, bootScroll);
 history.scrollRestoration = "manual";
 function rememberView() {
   roomScroll[state.view] = scrollY;
@@ -1538,7 +1574,7 @@ async function showTab(name) {
   if (state.view !== "work") state.roomView = state.view === "canvas" ? "canvas" : "lines";
   if (name === "human") state.view = state.roomView || "lines";
   else state.view = name;
-  try { localStorage.setItem(TAB_KEY, state.view); } catch (e) {}
+  try { localStorage.setItem("hc.tab", state.view); } catch (e) {}
   retainRecord(null);
   if (state.view === "work") await loadWork();
   if (state.view === "today") await loadOutcomes(false);

@@ -117,6 +117,27 @@ composer — `replying to will · the first few words` — and the note you add 
 it; nothing nests, nothing indents and no count appears anywhere. The server checks the
 target exists and sits in the humans room, so a reply cannot cross into the agent line.
 
+## The visual system
+
+The page is one file with no framework, so the system lives in the `:root` block of
+`page.html` and the comment above it. The rules that keep it consistent:
+
+- **Three faces, one job each.** Serif is content, sans is interface, mono is machine
+  text (times, ids, counts) and never prose. A new element picks its face from what it
+  is, not from what looks nice next to it.
+- **Five type steps**: `--t-cap` 10.5, `--t-ui` 12, `--t-row` 15, `--t-body` 17,
+  `--t-lead` 19. A size that is not one of those is a bug unless the token block is
+  changed to say why.
+- **Two label registers, on purpose.** Document labels (`.ghead h2`, `.day`) are
+  uppercase and letterspaced .12em; interface labels (`.tab`, `.seg`, `.menu`, `.label`)
+  are lowercase and .10em. That is the variation, not an inconsistency.
+- **Three button families**: `.icon` (36px square, r2, borderless), pill (bordered,
+  `--r-pill`, ui label), text (borderless, hairline underline). A fourth needs a reason.
+- **Radii are tokens**: `--r1` 6 fields, `--r2` 8 controls, `--r3` 10 surfaces,
+  `--r-pill`. No literal radii.
+- **Hairlines are 1px `--rule`.** A 2px left rule is reserved for a status card, because
+  that is the one telling you something is wrong.
+
 ## Tests
 
 ```bash
